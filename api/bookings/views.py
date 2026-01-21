@@ -1,13 +1,18 @@
+from datetime import timedelta
+from django.utils import timezone
 from django.shortcuts import get_object_or_404
 from rest_framework.decorators import api_view
 from rest_framework.response import Response
 from rest_framework import status
 from django.db import transaction
 
+from api.bookings.services.shipment_transition_function import InvalidShipmentTransition, transition_shipment
 from api.serviceProvidersDB.models import ProviderService
 
-from .models import BookingItem, NegotiationRound, OrderService, Negotiation, Shipment, ShipmentRoute
+from .models import BookingItem, NegotiationRound, OrderService, Negotiation, Session, SessionToken, Shipment, ShipmentRoute
 from .serializers import (
+    ConfirmCheckinResponseSerializer,
+    ConfirmCheckinSerializer,
     NegotiationRoundWriteSerializer,
     OrderServiceReadSerializer,
     OrderServiceWriteSerializer,
@@ -16,6 +21,7 @@ from .serializers import (
     NegotiationClientCounterSerializer,
     BookingItemReadSerializer,
     NegotiationRoundReadSerializer,
+    SessionTokenReadSerializer,
     ShipmentReadSerializer,
     ShipmentRouteReadSerializer,
     ShipmentRouteWriteSerializer,
@@ -407,6 +413,36 @@ def get_shipments_by_client(request, client_email):
     serializer = ShipmentReadSerializer(shipments, many=True)
     return Response(serializer.data, status=status.HTTP_200_OK)
 
+@api_view(["POST"])
+def change_shipment_status(request, shipment_id):
+    shipment = get_object_or_404(Shipment, pk=shipment_id)
+
+    new_status = request.data.get("status")
+
+    if not new_status:
+        return Response(
+            {"error": "Status is required"},
+            status=status.HTTP_400_BAD_REQUEST
+        )
+
+    if shipment.shipment_status == new_status:
+        return Response(
+            {"detail": f"Shipment already '{new_status}'"},
+            status=status.HTTP_200_OK
+        )
+
+    try:
+        transition_shipment(shipment, new_status)
+    except InvalidShipmentTransition as e:
+        return Response({"error": str(e)}, status=400)
+
+    return Response(
+        ShipmentReadSerializer(shipment).data,
+        status=status.HTTP_200_OK
+    )
+
+
+
 
 
 @api_view(["GET", "POST"])
@@ -448,3 +484,101 @@ def shipment_routes_view(request, shipment_id):
             serializer.errors,
             status=status.HTTP_400_BAD_REQUEST,
         )
+    
+@api_view(["POST"])
+def confirm_shipment(request, shipment_id):
+    shipment = get_object_or_404(Shipment, shipment_id=shipment_id)
+
+    if shipment.shipment_confirmation:
+        return Response(
+            {"detail": "Shipment already confirmed"},
+            status=status.HTTP_400_BAD_REQUEST
+        )
+
+    shipment.shipment_confirmation = True
+    shipment.save(update_fields=["shipment_confirmation"])
+
+    
+    if shipment.shipment_status == "arrived":
+        
+        transition_shipment(shipment, "delivered")
+
+    serializer = ShipmentReadSerializer(shipment)
+    return Response(serializer.data, status=status.HTTP_200_OK)
+
+@api_view(["GET"])
+def get_checkin_token(request, shipment_id):
+    """
+    Client requests a QR code token for a delivered shipment.
+    Auto-refresh token if expired.
+    """
+    try:
+        shipment = Shipment.objects.select_related(
+            "service_ordered__order"
+        ).get(pk=shipment_id)
+    except Shipment.DoesNotExist:
+        return Response(
+            {"detail": "Shipment not found"},
+            status=status.HTTP_404_NOT_FOUND
+        )
+
+    if shipment.shipment_status != "delivered":
+        return Response(
+            {"detail": "Shipment not delivered yet"},
+            status=status.HTTP_400_BAD_REQUEST
+        )
+
+    # 🔍 Get latest token (if any)
+    token = (
+        SessionToken.objects
+        .filter(shipment=shipment, session__isnull=True)
+        .order_by("-created_at")
+        .first()
+    )
+
+    # 🔁 Create new token if none or expired
+    if not token or not token.is_valid():
+        token = SessionToken.objects.create(
+            shipment=shipment,
+            token_expiry=timezone.now() + timedelta(minutes=15)
+        )
+
+    serializer = SessionTokenReadSerializer(token)
+    return Response(serializer.data, status=status.HTTP_200_OK)
+
+
+
+
+
+
+@api_view(["POST"])
+@transaction.atomic
+def confirm_checkin(request):
+    serializer = ConfirmCheckinSerializer(data=request.data)
+    serializer.is_valid(raise_exception=True)
+
+    token = serializer.token_instance
+    shipment = token.shipment
+
+    # 🔒 Ensure token is not reused
+    if token.session:
+        return Response(
+            {"detail": "This token has already been used."},
+            status=status.HTTP_400_BAD_REQUEST
+        )
+
+    # ✅ Get or create session SAFELY
+    try:
+        session = shipment.session
+    except Session.DoesNotExist:
+        session = Session.objects.create(
+            shipment=shipment,
+            checkin_location=request.data.get("checkin_location", {})
+        )
+
+    # 🔗 Attach token to session
+    token.session = session
+    token.save(update_fields=["session"])
+
+    response_serializer = ConfirmCheckinResponseSerializer(session)
+    return Response(response_serializer.data, status=status.HTTP_200_OK)

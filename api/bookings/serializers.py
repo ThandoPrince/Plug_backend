@@ -1,6 +1,6 @@
 from rest_framework import serializers
 from django.utils import timezone
-from .models import Negotiation, NegotiationRound, OrderService, BookingItem, ServicePicture, Shipment, ShipmentRoute
+from .models import Negotiation, NegotiationRound, OrderService, BookingItem, ServicePicture, Session, SessionToken, Shipment, ShipmentRoute
 from api.serviceProvidersDB.serializers import ProviderSeviceSerializer, ServiceSerializer
 from api.clientsDB.serializers import AddressOnlySerializer, ClientSerializer
 from api.clientsDB.models import ClientDetails, ClientAuth, Address
@@ -324,4 +324,115 @@ class ShipmentRouteReadSerializer(serializers.ModelSerializer):
         model = ShipmentRoute
         fields = '__all__'
 
+        
 
+class SessionTokenReadSerializer(serializers.ModelSerializer):
+    """
+    Send token info to the client for QR display
+    """
+    shipment = ShipmentReadSerializer(read_only=True)
+
+    class Meta:
+        model = SessionToken
+        fields = [
+            "token_id",
+            "checkin_token",
+            "token_expiry",
+            "shipment",
+            "created_at",
+        ]
+        read_only_fields = fields
+
+
+
+# -------------------------------
+# Session Serializer
+# -------------------------------
+class SessionReadSerializer(serializers.ModelSerializer):
+    shipment = ShipmentReadSerializer(read_only=True)
+    duration = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Session
+        fields = [
+            "session_id",
+            "Shipment",
+            "checkin_time",
+            "checkin_location",
+            "checkout_time",
+            "checkout_location",
+            "duration",
+        ]
+        read_only_fields = fields
+
+    def get_duration(self, obj):
+        return obj.duration().total_seconds()  
+    
+
+
+# Optional: SessionWriteSerializer (for checkout maybe)
+class SessionWriteSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Session
+        fields = [
+            "shipment",
+            "checkin_time",
+            "checkin_location",
+            "checkout_time",
+            "checkout_location",
+        ]
+        read_only_fields = ["checkin_time"]
+
+
+
+
+class ConfirmCheckinSerializer(serializers.Serializer):
+    checkin_token = serializers.UUIDField()
+
+    def validate_checkin_token(self, value):
+        try:
+            token = SessionToken.objects.select_related("shipment", "session").get(
+                checkin_token=value
+            )
+        except SessionToken.DoesNotExist:
+            raise serializers.ValidationError({
+                "detail": "Invalid token."
+            })
+
+        if not token.is_valid():
+            # 🔄 Auto-create new token
+            new_token = SessionToken.create_new(
+                shipment=token.shipment,
+                session=token.session
+            )
+
+            raise serializers.ValidationError({
+                "detail": "Token expired.",
+                "new_token": str(new_token.checkin_token),
+                "expires_at": new_token.token_expiry,
+            })
+
+        # ✅ Store for view usage
+        self.token_instance = token
+        return value
+
+
+class ConfirmCheckinResponseSerializer(serializers.ModelSerializer):
+    shipment = ShipmentReadSerializer(read_only=True)
+    duration = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Session
+        fields = [
+            "session_id",
+            "shipment",            # ✅ FIXED (lowercase, matches declared field)
+            "checkin_time",
+            "checkin_location",
+            "checkout_time",
+            "checkout_location",
+            "duration",
+        ]
+
+    def get_duration(self, obj):
+        duration = obj.duration()
+        return duration.total_seconds() if duration else None

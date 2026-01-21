@@ -63,6 +63,13 @@ urlpatterns = [
     path('api/bookings/get_shipment/by_sp_email/<str:provider_email>/', booking_views.get_shipments_by_provider, name='get_shipments_by_provider_email'),
     path('api/bookings/get_shipment/by_client_email/<str:client_email>/', booking_views.get_shipments_by_client, name='get_shipments_by_client_email'),
     path('api/bookings/shipment/<int:shipment_id>/route/', booking_views.shipment_routes_view, name='shipment_routes'),
+    path('api/bookings/shipment/<int:shipment_id>/change_status/', booking_views.change_shipment_status, name='change_shipment_status'),
+    path('api/bookings/shipment/<int:shipment_id>/confirm/', booking_views.confirm_shipment, name='confirm_shipment'),
+
+     # Session Check-in endpoints
+    path('api/bookings/sessions/confirm_checkin/', booking_views.confirm_checkin, name='confirm_checkin'),
+    path('api/bookings/sessions/get_checkin_token/<int:shipment_id>/', booking_views.get_checkin_token, name='get_checkin_token'),
+  
 
     # Provider & Client endpoints
     path('api/bookings/sp_active_orders/<str:email>/', booking_views.bookings_by_invited_provider, name='sp_active_orders'),

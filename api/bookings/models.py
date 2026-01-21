@@ -3,7 +3,7 @@ from django.utils import timezone
 import uuid
 from django.conf import settings
 from django.db import models
-from .utils.choices import ORDER_STATUS, SHIPMENT_STATUS, PAYMENT_STATUS
+from .utils.choices import ORDER_STATUS, SESSION_STATUS, SHIPMENT_STATUS, PAYMENT_STATUS
 
 
 class OrderService(models.Model):
@@ -218,27 +218,6 @@ class NegotiationRound(models.Model):
 class BookingItem(models.Model):
     item_id = models.AutoField(primary_key=True)
     order = models.ForeignKey(OrderService, on_delete=models.CASCADE, related_name='booking_items',)
-    
-    checked_in = models.BooleanField(default=False, null=True, blank=True)
-    checkin_time = models.DateTimeField(null=True, blank=True)
-    checkin_location = models.JSONField(null=True, blank=True)
-    checkin_token = models.CharField(max_length=255, null=True, blank=True, unique=True)
-    token_expiry = models.DateTimeField(null=True, blank=True)
-    checked_out = models.BooleanField(default=False, null=True, blank=True)
-    check_out_time = models.DateTimeField(null=True, blank=True)
-    check_out_location = models.JSONField(null=True, blank=True)
-    duration = models.DurationField(null=True, blank=True)
-
-    def work_duration(self):
-        if self.checkin_time and self.check_out_time:
-            return self.check_out_time - self.checkin_time
-        return None
-
-    def generate_checkin_token(self):
-        self.checkin_token = uuid.uuid4().hex
-        self.token_expiry = timezone.now() + timedelta(minutes=30)
-        self.save()
-
     def __str__(self):
         service_name = self.order.service_required.service_name if self.order.service_required else 'N/A'
         provider_name = str(self.order.provider_for_service) if self.order.provider_for_service else 'N/A'
@@ -267,10 +246,8 @@ class Shipment(models.Model):
 
         super().save(*args, **kwargs)
 
-        # If shipment status changed to 'Delivered', trigger check-in token generation
-        if self.shipment_status.lower() == 'delivered' and old_status != 'Delivered':
-            for item in self.service_ordered.booking_items.all():
-                item.generate_checkin_token()
+        
+     
     
 
 
@@ -374,6 +351,101 @@ class ShipmentRoute(models.Model):
 
     def __str__(self):
         return f"Route {self.route_id} | Shipment {self.shipment.shipment_id}"
+class Session(models.Model):
+    session_id = models.AutoField(primary_key=True)
+
+    shipment = models.OneToOneField(
+        Shipment,
+        on_delete=models.CASCADE,
+        related_name="session"  # IMPORTANT
+    )
+
+    checkin_time = models.DateTimeField(auto_now_add=True)
+    checkin_location = models.JSONField()
+
+    checkout_time = models.DateTimeField(null=True, blank=True)
+    checkout_location = models.JSONField(null=True, blank=True)
+
+    session_status = models.CharField(
+        max_length=50,
+        choices=SESSION_STATUS,
+        default="in_progress"
+    )
+
+    date_created = models.DateTimeField(auto_now_add=True)
+
+    def duration(self):
+        if self.checkout_time:
+            return self.checkout_time - self.checkin_time
+        return timezone.now() - self.checkin_time
+
+    def __str__(self):
+        return f"Session {self.session_id} | Shipment {self.shipment.shipment_id}"
+
+    
+
+
+
+class SessionToken(models.Model):
+    checkin_token = models.UUIDField(
+        default=uuid.uuid4,
+        unique=True,
+        editable=False
+    )
+
+    token_expiry = models.DateTimeField(null=True, blank=True)
+    token_id = models.AutoField(primary_key=True)
+
+    session = models.ForeignKey(
+        'Session',
+        on_delete=models.CASCADE,
+        related_name='tokens',
+        null=True,
+        blank=True
+    )
+
+    shipment = models.ForeignKey(
+        'Shipment', on_delete=models.CASCADE, related_name='tokens', null=True, blank=True
+        
+    )
+
+    created_at = models.DateTimeField(auto_now_add=True, null=True)
+
+    TOKEN_LIFETIME_MINUTES = 15  
+
+    def is_valid(self):
+        return timezone.now() < self.token_expiry
+
+    @classmethod
+    def create_new(cls, shipment, session=None):
+        """Always creates a fresh token"""
+        return cls.objects.create(
+            shipment=shipment,
+            session=session,
+            token_expiry=timezone.now() + timedelta(minutes=cls.TOKEN_LIFETIME_MINUTES)
+        )
+
+    @classmethod
+    def get_or_refresh_token(cls, shipment, session=None):
+        """
+        Returns active token.
+        If expired → auto-create a new one.
+        """
+        token = (
+            cls.objects
+            .filter(shipment=shipment)
+            .order_by("-created_at")
+            .first()
+        )
+
+        if token and token.is_valid():
+            return token
+
+        return cls.create_new(shipment=shipment, session=session)
+
+    def __str__(self):
+        return f"SessionToken {self.token_id} | Expires at {self.token_expiry}"
+
 
     
 class OrderHistory(models.Model):

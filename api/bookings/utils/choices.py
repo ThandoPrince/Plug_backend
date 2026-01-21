@@ -15,14 +15,14 @@ ORDER_STATUS = [
     ('awaiting_review', 'Awaiting Review'),
     ('awaiting_rating', 'Awaiting Rating'),
     ('awaiting_service', 'Awaiting Service'),
-    ('awaiting_feedback', 'Awaiting Feedback'),
+    ('in_progress', 'In Progress'),
     ('awaiting_approval', 'Awaiting Approval'),
 ]
 
 SHIPMENT_STATUS = [
     ('pending', 'Pending'),
     ('shipped', 'Shipped'),
-    ('sheduled', 'Scheduled'),
+    ('scheduled', 'Scheduled'),
     ('delivered', 'Delivered'),
     ('failed', 'Failed'),
     ('resheduled', 'Rescheduled'),
@@ -32,9 +32,17 @@ SHIPMENT_STATUS = [
     ('returned_to_sender', 'Returned back home'),
     ('delayed', 'Delayed'),
     ('awaiting_pickup', 'Awaiting Pickup'),
-    ('delayed', 'Delayed'),
+    ('arrived', 'Arrived'),
     ('returned', 'Returned'),
 ]
+
+SESSION_STATUS = [
+    ('on_break', 'On Break'),
+    ('in_progress', 'In Progress'),
+    ('completed', 'Completed'),
+    ('canceled', 'Canceled'),
+]
+
 PAYMENT_STATUS = [
     ('pending', 'Pending'),
     ('paid', 'Paid'),
