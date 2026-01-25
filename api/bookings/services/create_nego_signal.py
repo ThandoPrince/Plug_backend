@@ -1,6 +1,6 @@
 from django.db.models.signals import post_save, m2m_changed
 from django.dispatch import receiver
-from .models import BookingItem, OrderService, Negotiation, NegotiationRound, Shipment
+from ..models import BookingItem, OrderService, Negotiation, NegotiationRound, Shipment
 from api.serviceProvidersDB.models import ProviderService
 
 

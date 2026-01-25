@@ -138,3 +138,8 @@ MEDIA_ROOT = BASE_DIR / 'media'
 # https://docs.djangoproject.com/en/5.2/ref/settings/#default-auto-field
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
+
+
+SESSION_GEOFENCE_RADIUS_METERS = 120    
+SESSION_GEOFENCE_GRACE_SECONDS = 120
+SESSION_GEOFENCE_PING_INTERVAL_SECONDS = 20

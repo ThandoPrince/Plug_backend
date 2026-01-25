@@ -6,4 +6,4 @@ class BookingsConfig(AppConfig):
     name = 'api.bookings'
     
     def ready(self):
-        import api.bookings.signals 
+        import api.bookings.services.create_nego_signal 

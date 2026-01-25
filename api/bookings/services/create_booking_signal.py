@@ -1,6 +1,6 @@
 from django.db.models.signals import post_save
 from django.dispatch import receiver
-from ..audits.models import Negotiation, BookingItem
+from ...audits.models import Negotiation, BookingItem
 
 @receiver(post_save, sender=Negotiation)
 def create_booking_item_on_accept(sender, instance, created, **kwargs):

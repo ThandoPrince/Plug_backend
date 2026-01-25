@@ -1,4 +1,5 @@
 from datetime import timedelta
+from django.conf import settings
 from django.utils import timezone
 from django.shortcuts import get_object_or_404
 from rest_framework.decorators import api_view
@@ -6,10 +7,11 @@ from rest_framework.response import Response
 from rest_framework import status
 from django.db import transaction
 
+from api.bookings.services.calculate_distance_meters import calculate_distance_meters
 from api.bookings.services.shipment_transition_function import InvalidShipmentTransition, transition_shipment
 from api.serviceProvidersDB.models import ProviderService
 
-from .models import BookingItem, NegotiationRound, OrderService, Negotiation, Session, SessionToken, Shipment, ShipmentRoute
+from .models import BookingItem, NegotiationRound, OrderService, Negotiation, Session, SessionLocationPing, SessionToken, Shipment, ShipmentRoute
 from .serializers import (
     ConfirmCheckinResponseSerializer,
     ConfirmCheckinSerializer,
@@ -21,6 +23,9 @@ from .serializers import (
     NegotiationClientCounterSerializer,
     BookingItemReadSerializer,
     NegotiationRoundReadSerializer,
+    SessionLocationPingReadSerializer,
+    SessionLocationPingWriteSerializer,
+    SessionReadSerializer,
     SessionTokenReadSerializer,
     ShipmentReadSerializer,
     ShipmentRouteReadSerializer,
@@ -374,7 +379,11 @@ def get_shipments_by_provider(request, provider_email):
     booking_items = BookingItem.objects.filter(order__in=provider_orders)
 
     # 4️⃣ Get all shipments linked to these booking items
-    shipments = Shipment.objects.filter(service_ordered__in=booking_items)
+    shipments = (
+        Shipment.objects
+        .filter(service_ordered__in=booking_items)
+        .order_by('-created_at')  # ✅ newest first
+    )
 
     # 5️⃣ Serialize and return
     serializer = ShipmentReadSerializer(shipments, many=True)
@@ -557,28 +566,148 @@ def confirm_checkin(request):
     serializer = ConfirmCheckinSerializer(data=request.data)
     serializer.is_valid(raise_exception=True)
 
-    token = serializer.token_instance
-    shipment = token.shipment
+    # 🔄 Expired token path
+    if "expired_token" in serializer.validated_data:
+        old_token = serializer.validated_data["expired_token"]
 
-    # 🔒 Ensure token is not reused
-    if token.session:
+        new_token = SessionToken.create_new(
+            shipment=old_token.shipment,
+            session=old_token.session
+        )
+
         return Response(
-            {"detail": "This token has already been used."},
+            {
+                "detail": "Token expired.",
+                "new_token": str(new_token.checkin_token),
+                "expires_at": new_token.token_expiry,
+            },
+            status=status.HTTP_409_CONFLICT
+        )
+
+    # ✅ Valid token path
+    token = serializer.validated_data["token_instance"]
+    shipment = token.shipment
+    checkin_location = serializer.validated_data["checkin_location"]
+
+    session, created = Session.objects.get_or_create(
+        shipment=shipment,
+        defaults={
+            "checkin_location": checkin_location,
+            "checkin_time": timezone.now(),
+        }
+    )
+
+    if not created and not session.checkin_location:
+        session.checkin_location = checkin_location
+        session.save(update_fields=["checkin_location"])
+
+    token.session = session
+    token.token_expiry = timezone.now()  # 🔒 burn token
+    token.save(update_fields=["session", "token_expiry"])
+
+    return Response(
+        ConfirmCheckinResponseSerializer(session).data,
+        status=status.HTTP_200_OK
+    )
+
+
+@api_view(["GET"])
+def get_session_by_shipment(request, shipment_id):
+    """
+    Retrieve the session associated with a shipment.
+    Includes shipment details and session duration.
+    """
+    try:
+        session = Session.objects.get(shipment_id=shipment_id)
+    except Session.DoesNotExist:
+        return Response(
+            {"detail": "Session not found for this shipment."},
+            status=status.HTTP_404_NOT_FOUND
+        )
+
+    serializer = SessionReadSerializer(session)
+    return Response(serializer.data, status=status.HTTP_200_OK)
+
+
+@api_view(['POST'])
+
+def session_geofence_check(request, session_id):
+    """
+    Check if the provider is inside the geofence for a session
+    and record the location ping.
+    """
+    lat = request.data.get("latitude")
+    lng = request.data.get("longitude")
+
+    if lat is None or lng is None:
+        return Response(
+            {"detail": "latitude and longitude are required"},
             status=status.HTTP_400_BAD_REQUEST
         )
 
-    # ✅ Get or create session SAFELY
+    # Convert to float safely
     try:
-        session = shipment.session
-    except Session.DoesNotExist:
-        session = Session.objects.create(
-            shipment=shipment,
-            checkin_location=request.data.get("checkin_location", {})
+        lat = float(lat)
+        lng = float(lng)
+    except ValueError:
+        return Response(
+            {"detail": "latitude and longitude must be numbers"},
+            status=status.HTTP_400_BAD_REQUEST
         )
 
-    # 🔗 Attach token to session
-    token.session = session
-    token.save(update_fields=["session"])
+    session = get_object_or_404(Session, session_id=session_id)
 
-    response_serializer = ConfirmCheckinResponseSerializer(session)
-    return Response(response_serializer.data, status=status.HTTP_200_OK)
+    # Geofence center (client address)
+    address = session.shipment.service_ordered.order.delivery_address
+    center_lat = address.latitude
+    center_lng = address.longitude
+
+    # Calculate distance
+    distance = calculate_distance_meters(center_lat, center_lng, lat, lng)
+    inside_geofence = distance <= getattr(settings, "SESSION_GEOFENCE_RADIUS_METERS", 50)
+
+    # Save location ping
+    ping = SessionLocationPing.objects.create(
+        session=session,
+        latitude=lat,
+        longitude=lng,
+        distance_from_site_meters=distance,
+        inside_geofence=inside_geofence
+    )
+
+    serializer = SessionLocationPingWriteSerializer(ping)
+
+    return Response(serializer.data, status=status.HTTP_201_CREATED)
+
+
+
+@api_view(['GET'])
+# @permission_classes([IsAuthenticated])
+def session_location_pings(request, session_id):
+    """
+    GET all location pings for a given session.
+    URL: /api/sessions/<session_id>/pings/
+    """
+    pings = SessionLocationPing.objects.filter(session__session_id=session_id)
+    serializer = SessionLocationPingReadSerializer(pings, many=True)
+    return Response(serializer.data)
+
+@api_view(['GET'])
+# @permission_classes([IsAuthenticated])
+def session_latest_ping(request, session_id):
+    """
+    GET the latest location ping for a given session.
+    URL: /api/sessions/<session_id>/latest-ping/
+    """
+    ping = (
+        SessionLocationPing.objects
+        .filter(session__session_id=session_id)
+        .order_by('-created_at')
+        .first()
+    )
+
+    if not ping:
+        return Response({"detail": "No pings found"}, status=404)
+
+    serializer = SessionLocationPingReadSerializer(ping)
+    return Response(serializer.data)

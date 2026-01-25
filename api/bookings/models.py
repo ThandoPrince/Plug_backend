@@ -446,6 +446,37 @@ class SessionToken(models.Model):
     def __str__(self):
         return f"SessionToken {self.token_id} | Expires at {self.token_expiry}"
 
+class SessionLocationPing(models.Model):
+    ping_id = models.AutoField(primary_key=True)
+
+    session = models.ForeignKey(
+        Session,
+        on_delete=models.CASCADE,
+        related_name="location_pings"
+    )
+
+    latitude = models.FloatField()
+    longitude = models.FloatField()
+
+    accuracy = models.FloatField(null=True, blank=True)
+
+    inside_geofence = models.BooleanField(default=True)
+
+    distance_from_site_meters = models.FloatField(null=True, blank=True)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["created_at"]
+
+    def __str__(self):
+        return (
+            f"Ping {self.ping_id} | "
+            f"Session {self.session.session_id} | "
+            f"{'Inside' if self.inside_geofence else 'Outside'}"
+        )
+
+
 
     
 class OrderHistory(models.Model):

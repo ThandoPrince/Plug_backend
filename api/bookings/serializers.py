@@ -1,6 +1,6 @@
 from rest_framework import serializers
 from django.utils import timezone
-from .models import Negotiation, NegotiationRound, OrderService, BookingItem, ServicePicture, Session, SessionToken, Shipment, ShipmentRoute
+from .models import Negotiation, NegotiationRound, OrderService, BookingItem, ServicePicture, Session, SessionLocationPing, SessionToken, Shipment, ShipmentRoute
 from api.serviceProvidersDB.serializers import ProviderSeviceSerializer, ServiceSerializer
 from api.clientsDB.serializers import AddressOnlySerializer, ClientSerializer
 from api.clientsDB.models import ClientDetails, ClientAuth, Address
@@ -350,23 +350,15 @@ class SessionTokenReadSerializer(serializers.ModelSerializer):
 # -------------------------------
 class SessionReadSerializer(serializers.ModelSerializer):
     shipment = ShipmentReadSerializer(read_only=True)
-    duration = serializers.SerializerMethodField()
+    duration_seconds = serializers.SerializerMethodField()
 
     class Meta:
         model = Session
-        fields = [
-            "session_id",
-            "Shipment",
-            "checkin_time",
-            "checkin_location",
-            "checkout_time",
-            "checkout_location",
-            "duration",
-        ]
-        read_only_fields = fields
+        fields = '__all__'
 
-    def get_duration(self, obj):
-        return obj.duration().total_seconds()  
+    def get_duration_seconds(self, obj):
+        return int(obj.duration().total_seconds())
+
     
 
 
@@ -388,33 +380,32 @@ class SessionWriteSerializer(serializers.ModelSerializer):
 
 class ConfirmCheckinSerializer(serializers.Serializer):
     checkin_token = serializers.UUIDField()
+    checkin_location = serializers.JSONField()
 
-    def validate_checkin_token(self, value):
+    def validate(self, data):
         try:
-            token = SessionToken.objects.select_related("shipment", "session").get(
-                checkin_token=value
-            )
+            token = SessionToken.objects.select_related(
+                "shipment", "session"
+            ).get(checkin_token=data["checkin_token"])
         except SessionToken.DoesNotExist:
             raise serializers.ValidationError({
                 "detail": "Invalid token."
             })
 
-        if not token.is_valid():
-            # 🔄 Auto-create new token
-            new_token = SessionToken.create_new(
-                shipment=token.shipment,
-                session=token.session
-            )
-
+        # 🔒 Already used
+        if token.session:
             raise serializers.ValidationError({
-                "detail": "Token expired.",
-                "new_token": str(new_token.checkin_token),
-                "expires_at": new_token.token_expiry,
+                "detail": "This token has already been used."
             })
 
-        # ✅ Store for view usage
-        self.token_instance = token
-        return value
+        # ⏱ Expired → mark for refresh
+        if not token.is_valid():
+            data["expired_token"] = token
+            return data
+
+        # ✅ Valid token
+        data["token_instance"] = token
+        return data
 
 
 class ConfirmCheckinResponseSerializer(serializers.ModelSerializer):
@@ -436,3 +427,16 @@ class ConfirmCheckinResponseSerializer(serializers.ModelSerializer):
     def get_duration(self, obj):
         duration = obj.duration()
         return duration.total_seconds() if duration else None
+    
+class SessionLocationPingReadSerializer(serializers.ModelSerializer):
+    session = SessionReadSerializer(read_only=True)
+    class Meta:
+        model = SessionLocationPing
+        fields = '__all__'
+        
+
+class SessionLocationPingWriteSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = SessionLocationPing
+        # Only allow input of latitude, longitude, and accuracy
+        fields = ['latitude', 'longitude', 'accuracy']
