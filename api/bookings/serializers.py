@@ -1,6 +1,6 @@
 from rest_framework import serializers
 from django.utils import timezone
-from .models import Negotiation, NegotiationRound, OrderService, BookingItem, ServicePicture, Session, SessionLocationPing, SessionToken, Shipment, ShipmentRoute
+from .models import Negotiation, NegotiationRound, OrderService, BookingItem, Rating, ServicePicture, Session, SessionLocationPing, SessionToken, Shipment, ShipmentRoute
 from api.serviceProvidersDB.serializers import ProviderSeviceSerializer, ServiceSerializer
 from api.clientsDB.serializers import AddressOnlySerializer, ClientSerializer
 from api.clientsDB.models import ClientDetails, ClientAuth, Address
@@ -440,3 +440,75 @@ class SessionLocationPingWriteSerializer(serializers.ModelSerializer):
         model = SessionLocationPing
         # Only allow input of latitude, longitude, and accuracy
         fields = ['latitude', 'longitude', 'accuracy']
+
+class SessionStatusUpdateSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Session
+        fields = (
+            "session_status",
+            "checkout_location",
+        )
+
+class RatingWriteSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Rating
+        fields = [
+            "session",
+            "score",
+            "review",
+        ]
+
+    def validate(self, data):
+        session = data["session"]
+        request = self.context["request"]
+        user = request.user
+
+        if session.session_status != "completed":
+            raise serializers.ValidationError(
+                "You can only rate after the session is completed."
+            )
+
+        order = session.shipment.service_ordered.order
+
+        # Client rating provider
+        if hasattr(user, "clientdetails"):
+            if Rating.objects.filter(
+                session=session,
+                rater_client=order.client
+            ).exists():
+                raise serializers.ValidationError("You have already rated this session.")
+
+        # Provider rating client
+        elif hasattr(user, "providerservice"):
+            if Rating.objects.filter(
+                session=session,
+                rater_provider=order.provider_for_service
+            ).exists():
+                raise serializers.ValidationError("You have already rated this session.")
+
+        else:
+            raise serializers.ValidationError("Invalid user for rating.")
+
+        return data
+
+    def create(self, validated_data):
+        request = self.context["request"]
+        user = request.user
+        session = validated_data["session"]
+        order = session.shipment.service_ordered.order
+
+        # Client → Provider
+        if hasattr(user, "clientdetails"):
+            validated_data.update({
+                "rater_client": order.client,
+                "rated_provider": order.provider_for_service
+            })
+
+        # Provider → Client
+        elif hasattr(user, "providerservice"):
+            validated_data.update({
+                "rater_provider": order.provider_for_service,
+                "rated_client": order.client
+            })
+
+        return super().create(validated_data)

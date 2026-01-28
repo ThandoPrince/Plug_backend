@@ -73,6 +73,7 @@ urlpatterns = [
     path('api/bookings/sessions/geofence_check/<int:session_id>/', booking_views.session_geofence_check, name='session_geofence_check'),
     path('api/bookings/sessions/<int:session_id>/pings/', booking_views.session_location_pings, name='session_location_pings'),
     path('api/bookings/sessions/<int:session_id>/latest-ping/', booking_views.session_latest_ping, name='session_latest_ping'),
+    path('api/bookings/sessions/<int:session_id>/update_status/', booking_views.update_session_status, name='update_session_status'),
   
 
     # Provider & Client endpoints

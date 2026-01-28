@@ -1,4 +1,5 @@
 from datetime import timedelta
+from django.forms import ValidationError
 from django.utils import timezone
 import uuid
 from django.conf import settings
@@ -493,6 +494,77 @@ class OrderHistory(models.Model):
         )
 
 
+class Rating(models.Model):
+    rating_id = models.AutoField(primary_key=True)
+
+    session = models.OneToOneField(
+        Session,
+        on_delete=models.CASCADE,
+        related_name="rating"
+    )
+
+    # Who is rating
+    rater_client = models.ForeignKey(
+        'clientsDB.ClientDetails',
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="given_ratings"
+    )
+
+    rater_provider = models.ForeignKey(
+        'serviceProvidersDB.ProviderService',
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="given_ratings"
+    )
+
+    # Who is being rated
+    rated_client = models.ForeignKey(
+        'clientsDB.ClientDetails',
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="received_ratings"
+    )
+
+    rated_provider = models.ForeignKey(
+        'serviceProvidersDB.ProviderService',
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="received_ratings"
+    )
+
+    score = models.PositiveSmallIntegerField(
+        choices=[(i, i) for i in range(1, 6)]  # 1–5 stars
+    )
+
+    review = models.TextField(null=True, blank=True)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["session", "rater_client"],
+                name="unique_client_rating_per_session"
+            ),
+            models.UniqueConstraint(
+                fields=["session", "rater_provider"],
+                name="unique_provider_rating_per_session"
+            ),
+        ]
+    def save(self, *args, **kwargs):
+        if self.session.session_status != "completed":
+            raise ValidationError(
+                "Rating is only allowed after the session is completed."
+            )
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return f"Rating {self.score}/5 | Session {self.session.session_id}"
 
 
 

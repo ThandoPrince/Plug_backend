@@ -26,6 +26,7 @@ from .serializers import (
     SessionLocationPingReadSerializer,
     SessionLocationPingWriteSerializer,
     SessionReadSerializer,
+    SessionStatusUpdateSerializer,
     SessionTokenReadSerializer,
     ShipmentReadSerializer,
     ShipmentRouteReadSerializer,
@@ -711,3 +712,45 @@ def session_latest_ping(request, session_id):
 
     serializer = SessionLocationPingReadSerializer(ping)
     return Response(serializer.data)
+
+
+
+
+@api_view(['POST'])
+# @permission_classes([IsAuthenticated])
+def update_session_status(request, session_id):
+    try:
+        session = Session.objects.get(session_id=session_id)
+    except Session.DoesNotExist:
+        return Response(
+            {"detail": "Session not found"},
+            status=status.HTTP_404_NOT_FOUND,
+        )
+
+    serializer = SessionStatusUpdateSerializer(
+        session,
+        data=request.data,
+        partial=True,
+    )
+
+    if not serializer.is_valid():
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+    # Save status update
+    session = serializer.save()
+
+    # ✅ If session is being ended, finalize checkout
+    if session.session_status == "completed" and session.checkout_time is None:
+        session.checkout_time = timezone.now()
+        session.save(update_fields=["checkout_time"])
+
+    return Response(
+        {
+            "message": "Session status updated successfully",
+            "session_id": session.session_id,
+            "session_status": session.session_status,
+            "duration_seconds": int(session.duration().total_seconds()),
+            "checkout_time": session.checkout_time,
+        },
+        status=status.HTTP_200_OK,
+    )
