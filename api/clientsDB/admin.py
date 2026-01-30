@@ -1,10 +1,69 @@
 from django.contrib import admin
+from .models import ClientDetails, ClientAuth, Address, ClientAddress, PendingAddressApproval, ClientNotification
 
-from .models import ClientDetails, ClientAddress
-from .models import ClientAuth
-from .models import Address
+# -----------------------------
+# ClientAuth Admin
+# -----------------------------
+@admin.register(ClientAuth)
+class ClientAuthAdmin(admin.ModelAdmin):
+    list_display = ('email_address', 'mobile_number')
+    search_fields = ('email_address', 'mobile_number')
 
-admin.site.register(ClientDetails)
-admin.site.register(ClientAuth)
-admin.site.register(Address)
-admin.site.register(ClientAddress)
+# -----------------------------
+# ClientDetails Admin
+# -----------------------------
+class ClientAddressInline(admin.TabularInline):
+    model = ClientAddress
+    extra = 0
+    readonly_fields = ('house_administrator', 'is_super_user')
+    can_delete = True
+
+@admin.register(ClientDetails)
+class ClientDetailsAdmin(admin.ModelAdmin):
+    list_display = ('first_name', 'last_name', 'client_profile', 'rating', 'is_active', 'client_ID')
+    search_fields = ('first_name', 'last_name', 'client_profile__email_address', 'client_ID')
+    list_filter = ('is_active',)
+    inlines = [ClientAddressInline]
+
+# -----------------------------
+# Address Admin
+# -----------------------------
+class ClientAddressInlineForAddress(admin.TabularInline):
+    model = ClientAddress
+    extra = 0
+    readonly_fields = ('client', 'is_owner', 'house_administrator', 'is_super_user', 'is_default', 'is_verified')
+    can_delete = False
+
+@admin.register(Address)
+class AddressAdmin(admin.ModelAdmin):
+    list_display = ('formatted_address', 'locality', 'administrative_area_level_1', 'country', 'postal_code')
+    search_fields = ('formatted_address', 'locality', 'administrative_area_level_1', 'country', 'postal_code')
+    inlines = [ClientAddressInlineForAddress]
+
+# -----------------------------
+# ClientAddress Admin
+# -----------------------------
+@admin.register(ClientAddress)
+class ClientAddressAdmin(admin.ModelAdmin):
+    list_display = ('client', 'address', 'is_owner', 'house_administrator', 'is_super_user', 'is_default', 'is_verified')
+    search_fields = ('client__first_name', 'client__last_name', 'address__formatted_address')
+    list_filter = ('is_owner', 'house_administrator', 'is_super_user', 'is_default', 'is_verified')
+    readonly_fields = ('house_administrator', 'is_super_user')
+
+# -----------------------------
+# PendingAddressApproval Admin
+# -----------------------------
+@admin.register(PendingAddressApproval)
+class PendingAddressApprovalAdmin(admin.ModelAdmin):
+    list_display = ('address', 'requested_by', 'owner', 'status', 'created_at')
+    list_filter = ('status',)
+    search_fields = ('requested_by__first_name', 'requested_by__last_name', 'owner__first_name', 'owner__last_name', 'address__formatted_address')
+
+# -----------------------------
+# ClientNotification Admin
+# -----------------------------
+@admin.register(ClientNotification)
+class ClientNotificationAdmin(admin.ModelAdmin):
+    list_display = ('recipient', 'title', 'is_read', 'created_at')
+    list_filter = ('is_read',)
+    search_fields = ('recipient__first_name', 'recipient__last_name', 'title', 'message')

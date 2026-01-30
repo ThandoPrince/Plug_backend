@@ -7,3 +7,5 @@ class BookingsConfig(AppConfig):
     
     def ready(self):
         import api.bookings.services.create_nego_signal 
+        import api.bookings.services.rating_creation_signal
+        import api.bookings.services.calculate_ratings_signal

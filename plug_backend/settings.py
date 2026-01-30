@@ -49,6 +49,7 @@ INSTALLED_APPS = [
     'api.bookings',
     'api.posts',
     'api.audits',
+    
     # 'api.bookings.apps.BookingsConfig',
 ]
 

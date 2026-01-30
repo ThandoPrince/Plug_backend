@@ -66,7 +66,7 @@ urlpatterns = [
     path('api/bookings/shipment/<int:shipment_id>/change_status/', booking_views.change_shipment_status, name='change_shipment_status'),
     path('api/bookings/shipment/<int:shipment_id>/confirm/', booking_views.confirm_shipment, name='confirm_shipment'),
 
-     # Session Check-in endpoints
+     # Session  endpoints
     path('api/bookings/sessions/confirm_checkin/', booking_views.confirm_checkin, name='confirm_checkin'),
     path('api/bookings/sessions/get_checkin_token/<int:shipment_id>/', booking_views.get_checkin_token, name='get_checkin_token'),
     path('api/bookings/sessions/get_session_by_shipment/<int:shipment_id>/', booking_views.get_session_by_shipment, name='get_session_by_shipment'),
@@ -74,11 +74,16 @@ urlpatterns = [
     path('api/bookings/sessions/<int:session_id>/pings/', booking_views.session_location_pings, name='session_location_pings'),
     path('api/bookings/sessions/<int:session_id>/latest-ping/', booking_views.session_latest_ping, name='session_latest_ping'),
     path('api/bookings/sessions/<int:session_id>/update_status/', booking_views.update_session_status, name='update_session_status'),
+    path('api/bookings/sessions/<int:session_id>/check_status/', booking_views.check_session_status, name='check_session_status'),
   
 
     # Provider & Client endpoints
     path('api/bookings/sp_active_orders/<str:email>/', booking_views.bookings_by_invited_provider, name='sp_active_orders'),
     path('api/bookings/client_active_orders/<str:email>/', booking_views.pending_orders_by_client_email, name='client_active_orders'),
+    path('api/bookings/get_ratings/by_client_email/<str:email>/', booking_views.get_ratings_by_client_email, name='client_ratings'),
+    path('api/bookings/get_ratings/by_provider_email/<str:email>/', booking_views.get_ratings_by_provider_email, name='provider_ratings'),
+    path('api/bookings/<int:session_id>/rate-provider/<str:client_email>/', booking_views.submit_client_rating, name='client_submit_rating'),
+    path('api/bookings/<int:session_id>/rate-client/<str:provider_email>/', booking_views.submit_provider_rating, name='provider_submit_rating'),
 
     # Negotiation endpoints
     path('api/bookings/service_orders/negotiations/', booking_views.negotiation_list, name='negotiation_list'),

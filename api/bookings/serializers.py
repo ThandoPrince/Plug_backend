@@ -452,63 +452,92 @@ class SessionStatusUpdateSerializer(serializers.ModelSerializer):
 class RatingWriteSerializer(serializers.ModelSerializer):
     class Meta:
         model = Rating
-        fields = [
-            "session",
-            "score",
-            "review",
-        ]
+        fields = ["session", "score", "review"]
 
     def validate(self, data):
         session = data["session"]
-        request = self.context["request"]
-        user = request.user
+        user = self.context["request"].user
+        order = session.shipment.service_ordered.order
 
         if session.session_status != "completed":
             raise serializers.ValidationError(
-                "You can only rate after the session is completed."
+                "Session must be completed before rating."
             )
-
-        order = session.shipment.service_ordered.order
 
         # Client rating provider
         if hasattr(user, "clientdetails"):
-            if Rating.objects.filter(
-                session=session,
-                rater_client=order.client
-            ).exists():
-                raise serializers.ValidationError("You have already rated this session.")
+            if Rating.objects.filter(session=session, rater_client=user.clientdetails).exists():
+                raise serializers.ValidationError("You already rated this session.")
 
         # Provider rating client
         elif hasattr(user, "providerservice"):
-            if Rating.objects.filter(
-                session=session,
-                rater_provider=order.provider_for_service
-            ).exists():
-                raise serializers.ValidationError("You have already rated this session.")
-
+            if Rating.objects.filter(session=session, rater_provider=user.providerservice).exists():
+                raise serializers.ValidationError("You already rated this session.")
         else:
-            raise serializers.ValidationError("Invalid user for rating.")
+            raise serializers.ValidationError("Invalid user.")
 
         return data
 
     def create(self, validated_data):
-        request = self.context["request"]
-        user = request.user
+        user = self.context["request"].user
         session = validated_data["session"]
         order = session.shipment.service_ordered.order
 
-        # Client → Provider
         if hasattr(user, "clientdetails"):
-            validated_data.update({
-                "rater_client": order.client,
-                "rated_provider": order.provider_for_service
-            })
+            validated_data["rater_client"] = user.clientdetails
+            validated_data["rater_provider"] = order.provider_for_service
 
-        # Provider → Client
         elif hasattr(user, "providerservice"):
-            validated_data.update({
-                "rater_provider": order.provider_for_service,
-                "rated_client": order.client
-            })
+            validated_data["rater_provider"] = user.providerservice
+            validated_data["rater_client"] = order.client
 
         return super().create(validated_data)
+    
+class RatingReadSerializer(serializers.ModelSerializer):
+    author_type = serializers.SerializerMethodField()
+    session = SessionReadSerializer(read_only=True)
+    class Meta:
+        model = Rating
+        fields = '__all__'
+
+    def get_author_type(self, obj):
+        if obj.rater_client:
+            return "client"
+        if obj.rater_provider:
+            return "provider"
+        return "unknown"
+
+class SubmitRatingSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Rating
+        fields = ["score", "review"]
+
+    def validate_score(self, value):
+        if value < 1 or value > 5:
+            raise serializers.ValidationError(
+                "Score must be between 1 and 5."
+            )
+        return value
+
+    def validate(self, data):
+        rating = self.instance
+
+        # Safety check
+        if not rating:
+            raise serializers.ValidationError(
+                "Rating instance is required."
+            )
+
+        # ✅ Prevent rating before session completion
+        if rating.session.session_status != "completed":
+            raise serializers.ValidationError(
+                "You can only submit a rating after the session is completed."
+            )
+
+        # ✅ Prevent double submission
+        if rating.score > 0:
+            raise serializers.ValidationError(
+                "Rating already submitted."
+            )
+
+        return data

@@ -5,6 +5,7 @@ import uuid
 from django.conf import settings
 from django.db import models
 from .utils.choices import ORDER_STATUS, SESSION_STATUS, SHIPMENT_STATUS, PAYMENT_STATUS
+from django.db.models import Avg
 
 
 class OrderService(models.Model):
@@ -495,15 +496,13 @@ class OrderHistory(models.Model):
 
 
 class Rating(models.Model):
-    rating_id = models.AutoField(primary_key=True)
-
-    session = models.OneToOneField(
-        Session,
+    session = models.ForeignKey(
+        'Session',
         on_delete=models.CASCADE,
-        related_name="rating"
+        related_name="ratings"
     )
 
-    # Who is rating
+    # Who is giving the rating
     rater_client = models.ForeignKey(
         'clientsDB.ClientDetails',
         on_delete=models.CASCADE,
@@ -513,40 +512,42 @@ class Rating(models.Model):
     )
 
     rater_provider = models.ForeignKey(
-        'serviceProvidersDB.ProviderService',
+        'serviceProvidersDB.ServiceProvider',
         on_delete=models.CASCADE,
         null=True,
         blank=True,
         related_name="given_ratings"
     )
 
-    # Who is being rated
-    rated_client = models.ForeignKey(
-        'clientsDB.ClientDetails',
-        on_delete=models.CASCADE,
-        null=True,
-        blank=True,
-        related_name="received_ratings"
-    )
-
-    rated_provider = models.ForeignKey(
-        'serviceProvidersDB.ProviderService',
-        on_delete=models.CASCADE,
-        null=True,
-        blank=True,
-        related_name="received_ratings"
-    )
-
     score = models.PositiveSmallIntegerField(
-        choices=[(i, i) for i in range(1, 6)]  # 1–5 stars
+        choices=[(i, i) for i in range(1, 6)],
+        null=True,
+        blank=True
     )
 
     review = models.TextField(null=True, blank=True)
-
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
         constraints = [
+            # Prevent both being NULL
+            models.CheckConstraint(
+                check=(
+                    models.Q(rater_client__isnull=False) |
+                    models.Q(rater_provider__isnull=False)
+                ),
+                name="rating_must_have_a_rater"
+            ),
+
+            # Prevent both being filled
+            models.CheckConstraint(
+                check=~(
+                    models.Q(rater_client__isnull=False) &
+                    models.Q(rater_provider__isnull=False)
+                ),
+                name="rating_only_one_rater"
+            ),
+
             models.UniqueConstraint(
                 fields=["session", "rater_client"],
                 name="unique_client_rating_per_session"
@@ -556,19 +557,11 @@ class Rating(models.Model):
                 name="unique_provider_rating_per_session"
             ),
         ]
-    def save(self, *args, **kwargs):
+
+    def clean(self):
         if self.session.session_status != "completed":
-            raise ValidationError(
-                "Rating is only allowed after the session is completed."
-            )
-        super().save(*args, **kwargs)
+            raise ValidationError("Rating is only allowed after the session is completed.")
 
     def __str__(self):
-        return f"Rating {self.score}/5 | Session {self.session.session_id}"
-
-
-
-
-
-
-
+        rater = self.rater_client or self.rater_provider
+        return f"Rating {self.score}/5 | Session {self.session.session_id} | By {rater}"

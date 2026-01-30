@@ -11,7 +11,7 @@ from api.bookings.services.calculate_distance_meters import calculate_distance_m
 from api.bookings.services.shipment_transition_function import InvalidShipmentTransition, transition_shipment
 from api.serviceProvidersDB.models import ProviderService
 
-from .models import BookingItem, NegotiationRound, OrderService, Negotiation, Session, SessionLocationPing, SessionToken, Shipment, ShipmentRoute
+from .models import BookingItem, NegotiationRound, OrderService, Negotiation, Rating, Session, SessionLocationPing, SessionToken, Shipment, ShipmentRoute
 from .serializers import (
     ConfirmCheckinResponseSerializer,
     ConfirmCheckinSerializer,
@@ -23,6 +23,8 @@ from .serializers import (
     NegotiationClientCounterSerializer,
     BookingItemReadSerializer,
     NegotiationRoundReadSerializer,
+    RatingReadSerializer,
+    RatingWriteSerializer,
     SessionLocationPingReadSerializer,
     SessionLocationPingWriteSerializer,
     SessionReadSerializer,
@@ -31,6 +33,7 @@ from .serializers import (
     ShipmentReadSerializer,
     ShipmentRouteReadSerializer,
     ShipmentRouteWriteSerializer,
+    SubmitRatingSerializer,
 )
 
 
@@ -716,9 +719,9 @@ def session_latest_ping(request, session_id):
 
 
 
-@api_view(['POST'])
-# @permission_classes([IsAuthenticated])
+@api_view(['PATCH'])
 def update_session_status(request, session_id):
+
     try:
         session = Session.objects.get(session_id=session_id)
     except Session.DoesNotExist:
@@ -727,26 +730,38 @@ def update_session_status(request, session_id):
             status=status.HTTP_404_NOT_FOUND,
         )
 
+    # Prevent reopening sessions
+    if session.session_status == "completed":
+        return Response(
+            {"detail": "Session already completed."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    new_status = request.data.get("session_status")
+
+    if new_status == "completed" and not request.data.get("checkout_location"):
+        return Response(
+            {"detail": "Checkout location required when completing a session."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
     serializer = SessionStatusUpdateSerializer(
         session,
         data=request.data,
         partial=True,
     )
 
-    if not serializer.is_valid():
-        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-
-    # Save status update
+    serializer.is_valid(raise_exception=True)
     session = serializer.save()
 
-    # ✅ If session is being ended, finalize checkout
-    if session.session_status == "completed" and session.checkout_time is None:
+    # finalize checkout
+    if session.session_status == "completed":
         session.checkout_time = timezone.now()
         session.save(update_fields=["checkout_time"])
 
     return Response(
         {
-            "message": "Session status updated successfully",
+            "message": "Session updated successfully",
             "session_id": session.session_id,
             "session_status": session.session_status,
             "duration_seconds": int(session.duration().total_seconds()),
@@ -754,3 +769,131 @@ def update_session_status(request, session_id):
         },
         status=status.HTTP_200_OK,
     )
+
+@api_view(['GET'])
+def get_ratings_by_provider_email(request, email):
+    """
+    Get ratings for a provider.
+    Optional query param:
+        ?session_id=5
+    """
+
+    session_id = request.query_params.get("session_id")
+
+    ratings = Rating.objects.filter(
+        rater_provider__sp_profile__email_address=email
+    )
+
+    if session_id:
+        ratings = ratings.filter(session__session_id=session_id)
+
+    serializer = RatingReadSerializer(ratings, many=True)
+    return Response(serializer.data)
+
+
+
+@api_view(['GET'])
+# @permission_classes([IsAuthenticated])
+def get_ratings_by_client_email(request, email):
+    """
+    Get ratings for a client.
+    Optional query param:
+        ?session_id=5
+    """
+
+    session_id = request.query_params.get("session_id")
+
+    ratings = Rating.objects.filter(
+        rater_client__client_profile__email_address=email
+    )
+
+    if session_id:
+        ratings = ratings.filter(session__session_id=session_id)
+
+    serializer = RatingReadSerializer(ratings, many=True)
+    return Response(serializer.data)
+
+@api_view(['PATCH'])
+# @permission_classes([IsAuthenticated])
+def submit_client_rating(request, session_id, client_email):
+    """
+    Client submits rating for provider.
+    """
+
+    try:
+        rating = Rating.objects.get(
+            session__session_id=session_id,
+            rater_client__client_profile__email_address=client_email
+        )
+    except Rating.DoesNotExist:
+        return Response(
+            {"error": "Rating not found."},
+            status=status.HTTP_404_NOT_FOUND
+        )
+
+
+    serializer = SubmitRatingSerializer(
+        rating,
+        data=request.data,
+        partial=True
+    )
+
+    if serializer.is_valid():
+        serializer.save()
+        return Response(serializer.data)
+
+    return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+@api_view(['PATCH'])
+# @permission_classes([IsAuthenticated])
+def submit_provider_rating(request, session_id, provider_email):
+    """
+    Provider submits rating for client.
+    """
+
+    try:
+        rating = Rating.objects.get(
+    session__session_id=session_id,
+    rater_provider__sp_profile__email_address=provider_email
+)
+    except Rating.DoesNotExist:
+        return Response(
+            {"error": "Rating not found."},
+            status=status.HTTP_404_NOT_FOUND
+        )
+
+    serializer = SubmitRatingSerializer(
+        rating,
+        data=request.data,
+        partial=True
+    )
+
+    if serializer.is_valid():
+        serializer.save()
+        return Response(serializer.data)
+
+    return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+@api_view(['GET'])
+def check_session_status(request, session_id):
+    """
+    Returns the current session status.
+    Used by client app to detect when session is completed.
+    """
+
+    try:
+        session = Session.objects.select_related(
+            "shipment__service_ordered__order"
+        ).get(session_id=session_id)
+
+        return Response({
+            "session_id": session.session_id,
+            "status": session.shipment.service_ordered.order.status,
+            "checkout_time": session.checkout_time
+        })
+
+    except Session.DoesNotExist:
+        return Response(
+            {"error": "Session not found"},
+            status=status.HTTP_404_NOT_FOUND
+        )

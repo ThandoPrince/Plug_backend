@@ -1,5 +1,5 @@
 from django.db import transaction
-from api.bookings.services.session_creation_service import create_token_for_delivered_shipment
+from api.bookings.services.session_token_creation_service import create_token_for_delivered_shipment
 from api.bookings.services.shipment_fsm import SHIPMENT_STATE_MACHINE
 from api.bookings.services.shipment_services import create_session_with_qr
 
