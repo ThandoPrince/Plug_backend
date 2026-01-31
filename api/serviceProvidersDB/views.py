@@ -165,9 +165,14 @@ def service_provider_list_service(request):
     if request.method == 'GET':
         service_id = request.query_params.get('service_id', None)
         if service_id is not None:
-            providers = ServiceProvider.objects.filter(services__service_id=service_id)
+            # Only active providers for the given service
+            providers = ServiceProvider.objects.filter(
+                services__service_id=service_id,
+                is_active=True
+            ).distinct()
         else:
-            providers = ServiceProvider.objects.all()
+            # All active providers
+            providers = ServiceProvider.objects.filter(is_active=True)
 
         serializer = ServiceProviderReadSerializer(providers, many=True)
         return Response(serializer.data)
@@ -178,11 +183,10 @@ def service_provider_list_service(request):
             serializer.save()
             return Response(serializer.data, status=status.HTTP_201_CREATED)
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-    
 
     
 MAX_RETRIES = 5
-RETRY_DELAY = 0.1  # seconds
+RETRY_DELAY = 0.1  
 
 @api_view(['POST'])
 def update_sp_live_location(request):

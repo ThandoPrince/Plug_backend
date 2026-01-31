@@ -798,7 +798,7 @@ def get_ratings_by_client_email(request, email):
     """
     Get ratings for a client.
     Optional query param:
-        ?session_id=5
+            
     """
 
     session_id = request.query_params.get("session_id")
