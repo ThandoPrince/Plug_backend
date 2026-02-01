@@ -417,10 +417,10 @@ def get_shipments_by_client(request, client_email):
 
     # 3️⃣ Get shipments linked to these booking items
     shipments = (
-        Shipment.objects
-        .filter(service_ordered__in=booking_items)
-        .order_by('-created_at')  # ✅ newest first
-    )
+    Shipment.objects
+    .filter(service_ordered__in=booking_items)
+    .order_by('-shipment_schedule_date', '-shipment_schedule_time')
+)
 
     # 4️⃣ Serialize and return
     serializer = ShipmentReadSerializer(shipments, many=True)

@@ -33,6 +33,7 @@ SHIPMENT_STATUS = [
     ('delayed', 'Delayed'),
     ('awaiting_pickup', 'Awaiting Pickup'),
     ('arrived', 'Arrived'),
+    ('completed', 'Completed'),
     ('returned', 'Returned'),
 ]
 
