@@ -642,6 +642,8 @@ def session_geofence_check(request, session_id):
     """
     lat = request.data.get("latitude")
     lng = request.data.get("longitude")
+    
+    
 
     if lat is None or lng is None:
         return Response(

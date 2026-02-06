@@ -311,6 +311,12 @@ class ShipmentRouteHistory(models.Model):
         )
     
 class ShipmentRoute(models.Model):
+    class TravelMode(models.TextChoices):
+        CAR = "car", "Car"
+        PEDESTRIAN = "pedestrian", "Pedestrian"
+        BICYCLE = "bicycle", "Bicycle"
+        SCOOTER = "scooter", "Scooter"
+
     route_id = models.AutoField(primary_key=True)
 
     shipment = models.OneToOneField(
@@ -329,6 +335,15 @@ class ShipmentRoute(models.Model):
 
     geometry = models.JSONField()
 
+    travel_mode = models.CharField(
+        max_length=20,
+        choices=TravelMode.choices,
+        default=TravelMode.CAR,
+        help_text="Mode of travel for this route",
+        null=True,
+        blank=True
+    )
+
     is_active = models.BooleanField(default=True)
     recalculated = models.BooleanField(default=False)
 
@@ -337,6 +352,7 @@ class ShipmentRoute(models.Model):
     def save(self, *args, **kwargs):
         is_new = self.pk is None
         super().save(*args, **kwargs)
+
 
         ShipmentRouteHistory.objects.create(
             shipment=self.shipment,
