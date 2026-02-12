@@ -83,7 +83,7 @@ class SupportingDocument(models.Model):
 
 
 class ServiceProvider(models.Model):
-    rating = models.DecimalField(max_digits=3, decimal_places=2, null=True, blank=True)
+    rating = models.DecimalField(max_digits=3, decimal_places=2, null=True, blank=True, default=0.0)
     full_name = models.CharField(max_length=85)
     gender = models.CharField(max_length=50, null=True, blank=True)
     id_number = models.CharField(max_length=20)

@@ -23,7 +23,7 @@ def transition_shipment(shipment, new_status):
     shipment.shipment_status = new_status
     shipment.save(update_fields=["shipment_status"])
 
-    # Side-effects
+   
     if new_status == "delivered":
         create_token_for_delivered_shipment(shipment)
 

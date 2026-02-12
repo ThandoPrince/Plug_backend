@@ -155,6 +155,9 @@ class ClientEmailField(serializers.SlugRelatedField):
             raise serializers.ValidationError(f"No client details linked to '{data}' found.")
 
 
+from rest_framework import serializers
+from decimal import Decimal, InvalidOperation
+
 class OrderServiceWriteSerializer(serializers.ModelSerializer):
     client = ClientEmailField(
         queryset=ClientDetails.objects.all(),
@@ -173,9 +176,24 @@ class OrderServiceWriteSerializer(serializers.ModelSerializer):
         slug_field='provider__sp_profile__email_address'
     )
 
+    # Explicitly define fields you want to validate
+    title = serializers.CharField(required=True, allow_blank=False)
+    notes = serializers.CharField(required=True, allow_blank=False)
+
+
+    proposal_price = serializers.DecimalField(
+        max_digits=12, decimal_places=2, required=True
+    )
+
     class Meta:
         model = OrderService
         fields = '__all__'
+
+    def validate_proposal_price(self, value):
+        # Ensure proposal_price is numeric and positive
+        if value <= 0:
+            raise serializers.ValidationError("Proposal price must be greater than 0.")
+        return value
 
     def create(self, validated_data):
         invited_providers = validated_data.pop("invited_providers", [])
@@ -206,6 +224,7 @@ class OrderServiceWriteSerializer(serializers.ModelSerializer):
                 ServicePicture.objects.create(order=order, image=file)
 
         return order
+
     
     
 class ShipmentReadSerializer(serializers.ModelSerializer):

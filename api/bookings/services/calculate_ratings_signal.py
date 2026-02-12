@@ -28,29 +28,38 @@ def update_client_rating(client):
 
 @receiver(post_save, sender=Rating)
 def rating_saved(sender, instance, **kwargs):
-    booking_item = instance.session.shipment.service_ordered
+    # Safe access to booking_item
+    booking_item = getattr(getattr(instance.session, 'shipment', None), 'service_ordered', None)
+    if not booking_item:
+        return
 
+    # Provider rating update
     if instance.rater_client:
-        provider = booking_item.order.provider_for_service.provider
+        provider_service = getattr(booking_item.order, 'provider_for_service', None)
+        provider = getattr(provider_service, 'provider', None)
         if provider:
             update_provider_rating(provider)
 
+    # Client rating update
     elif instance.rater_provider:
-        client = booking_item.order.client
+        client = getattr(booking_item.order, 'client', None)
         if client:
             update_client_rating(client)
 
 
 @receiver(post_delete, sender=Rating)
 def rating_deleted(sender, instance, **kwargs):
-    booking_item = instance.session.shipment.service_ordered
+    booking_item = getattr(getattr(instance.session, 'shipment', None), 'service_ordered', None)
+    if not booking_item:
+        return
 
     if instance.rater_client:
-        provider = booking_item.order.provider_for_service.provider
+        provider_service = getattr(booking_item.order, 'provider_for_service', None)
+        provider = getattr(provider_service, 'provider', None)
         if provider:
             update_provider_rating(provider)
 
     elif instance.rater_provider:
-        client = booking_item.order.client
+        client = getattr(booking_item.order, 'client', None)
         if client:
             update_client_rating(client)

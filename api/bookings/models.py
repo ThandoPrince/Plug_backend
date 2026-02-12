@@ -4,6 +4,8 @@ from django.utils import timezone
 import uuid
 from django.conf import settings
 from django.db import models
+
+from api.bookings.services.order_status_service import OrderStatusService
 from .utils.choices import ORDER_STATUS, SESSION_STATUS, SHIPMENT_STATUS, PAYMENT_STATUS
 from django.db.models import Avg
 
@@ -243,14 +245,27 @@ class Shipment(models.Model):
     def save(self, *args, **kwargs):
         is_new = self.pk is None
         old_status = None
+
         if not is_new:
-            old_status = Shipment.objects.get(pk=self.pk).shipment_status
+            old_status = Shipment.objects.only(
+                "shipment_status"
+            ).get(pk=self.pk).shipment_status
 
         super().save(*args, **kwargs)
 
         
-     
-    
+        if not is_new and old_status != self.shipment_status:
+
+            order = self.service_ordered.order
+
+            if self.shipment_status == "in_transit":
+                OrderStatusService.set_status(order, "in_delivery")
+
+            elif self.shipment_status == "arrived":
+                OrderStatusService.set_status(order, "awaiting_confirmation")
+
+            elif self.shipment_status == "delivered":
+                OrderStatusService.set_status(order, "awaiting_confirmation")   
 
 
     def __str__(self):
@@ -369,13 +384,15 @@ class ShipmentRoute(models.Model):
 
     def __str__(self):
         return f"Route {self.route_id} | Shipment {self.shipment.shipment_id}"
+    
+    
 class Session(models.Model):
     session_id = models.AutoField(primary_key=True)
 
     shipment = models.OneToOneField(
         Shipment,
         on_delete=models.CASCADE,
-        related_name="session"  # IMPORTANT
+        related_name="session"
     )
 
     checkin_time = models.DateTimeField(auto_now_add=True)
@@ -387,10 +404,33 @@ class Session(models.Model):
     session_status = models.CharField(
         max_length=50,
         choices=SESSION_STATUS,
-        default="in_progress"
+        default="in_session"
     )
 
     date_created = models.DateTimeField(auto_now_add=True)
+
+    def save(self, *args, **kwargs):
+        is_new = self.pk is None
+        old_status = None
+
+        if not is_new:
+            old_status = Session.objects.only("session_status").get(pk=self.pk).session_status
+
+        super().save(*args, **kwargs)
+
+    # ✅ Propagate session status to Order even on new sessions
+        order = self.shipment.service_ordered.order
+        if order:
+            if is_new or old_status != self.session_status:
+                if self.session_status == "in_session":
+                    OrderStatusService.set_status(order, "in_session")
+                elif self.session_status == "completed":
+                # ensure order goes in_session first if needed
+                    if order.status != "in_session":
+                        OrderStatusService.set_status(order, "in_session")
+                    OrderStatusService.set_status(order, "completed")
+
+
 
     def duration(self):
         if self.checkout_time:
@@ -399,6 +439,7 @@ class Session(models.Model):
 
     def __str__(self):
         return f"Session {self.session_id} | Shipment {self.shipment.shipment_id}"
+
 
     
 

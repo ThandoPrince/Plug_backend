@@ -152,7 +152,7 @@ def provider_accept_negotiation(request, negotiation_id):
         negotiation.last_responder = 'provider'
         negotiation.save()
 
-        # Update order with accepted provider and final price
+       
         order.final_price = negotiation.provider_response_price
         order.provider_for_service = provider_service
         order.is_negotiated = True
@@ -359,10 +359,13 @@ def accepted_orders_by_provider_email(request, email):
         return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
     
 
+
+
 @api_view(['GET'])
 def get_shipments_by_provider(request, provider_email):
     """
-    Returns all shipments for a given provider based on provider email.
+    Returns all shipments for a given provider based on provider email
+    filtered by specific statuses.
     """
 
     # 1️⃣ Find the provider by email
@@ -382,22 +385,29 @@ def get_shipments_by_provider(request, provider_email):
     # 3️⃣ Get BookingItems linked to these orders
     booking_items = BookingItem.objects.filter(order__in=provider_orders)
 
-    # 4️⃣ Get all shipments linked to these booking items
-    shipments = (
-        Shipment.objects
-        .filter(service_ordered__in=booking_items)
-        .order_by('-created_at')  # ✅ newest first
-    )
+    # 4️⃣ Get all shipments linked to these booking items with specific statuses
+    shipments = Shipment.objects.filter(
+        service_ordered__in=booking_items,
+        shipment_status__in=[
+            "Pending",
+            "in_transit",
+            "arrived",
+            "delivered",
+            "in_session"
+        ]
+    ).order_by('-created_at')  # newest first
 
     # 5️⃣ Serialize and return
     serializer = ShipmentReadSerializer(shipments, many=True)
     return Response(serializer.data, status=status.HTTP_200_OK)
 
 
+
 @api_view(['GET'])
 def get_shipments_by_client(request, client_email):
     """
     Returns all shipments for a given client based on client email.
+    Only includes shipments with statuses: pending, in_transit, arrived, delivered, in_session.
     Newest shipments are returned first.
     """
 
@@ -415,12 +425,17 @@ def get_shipments_by_client(request, client_email):
     # 2️⃣ Get booking items linked to these orders
     booking_items = BookingItem.objects.filter(order__in=client_orders)
 
-    # 3️⃣ Get shipments linked to these booking items
-    shipments = (
-    Shipment.objects
-    .filter(service_ordered__in=booking_items)
-    .order_by('-shipment_schedule_date', '-shipment_schedule_time')
-)
+    # 3️⃣ Get shipments linked to these booking items with specific statuses
+    shipments = Shipment.objects.filter(
+        service_ordered__in=booking_items,
+        shipment_status__in=[
+            "Pending",
+            "in_transit",
+            "arrived",
+            "delivered",
+            "in_session"
+        ]
+    ).order_by('-shipment_schedule_date', '-shipment_schedule_time')
 
     # 4️⃣ Serialize and return
     serializer = ShipmentReadSerializer(shipments, many=True)
@@ -598,6 +613,8 @@ def confirm_checkin(request):
         defaults={
             "checkin_location": checkin_location,
             "checkin_time": timezone.now(),
+            "session_status": "in_session"
+
         }
     )
 

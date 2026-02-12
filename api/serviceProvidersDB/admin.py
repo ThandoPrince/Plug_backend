@@ -63,7 +63,7 @@ class ServiceProviderAdmin(admin.ModelAdmin):
     list_display = ('full_name', 'id_number', 'gender', 'dob', 'is_active', 'is_discoverable', 'mobile_number', 'rating', 'location')
     search_fields = ('full_name', 'id_number', 'mobile_number')
     list_filter = ('is_active', 'is_discoverable', 'gender')
-    inlines = [CostOfServiceInline, SupportingDocumentInline, SPLocationHistoryInline]
+    inlines = [CostOfServiceInline, SupportingDocumentInline]
 
 # -----------------------------
 # SPProfile Admin
