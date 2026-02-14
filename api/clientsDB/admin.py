@@ -1,5 +1,5 @@
 from django.contrib import admin
-from .models import ClientDetails, ClientAuth, Address, ClientAddress, PendingAddressApproval, ClientNotification
+from .models.models import ClientDetails, ClientAuth, Address, ClientAddress, PendingAddressApproval, ClientNotification
 
 # -----------------------------
 # ClientAuth Admin

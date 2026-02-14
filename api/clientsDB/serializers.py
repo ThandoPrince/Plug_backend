@@ -1,12 +1,18 @@
 from rest_framework import serializers
 from django.contrib.auth.hashers import make_password
-from .models import ClientAuth, Address, ClientDetails, ClientAddress, ClientNotification
+from django.contrib.auth.password_validation import validate_password
+from django.core.validators import RegexValidator
+from django.core.exceptions import ValidationError as DjangoValidationError
+from .models.models import ClientAuth, Address, ClientDetails, ClientAddress, ClientNotification
+import re
+import phonenumbers
 
 class ClientProfileSerializer(serializers.ModelSerializer):
-    # Add profile_image if you have it on ClientAuth model
+    # Add 'profile_image' to fields if it exists in ClientAuth model
+
     class Meta:
         model = ClientAuth
-        fields = ['email_address', 'mobile_number', 'password']  # add 'profile_image' here if exists
+        fields = ['email_address', 'mobile_number', 'password']
         extra_kwargs = {
             'password': {'write_only': True},
         }
@@ -17,13 +23,72 @@ class ClientProfileSerializer(serializers.ModelSerializer):
 
     def update(self, instance, validated_data):
         password = validated_data.pop('password', None)
+
         if password:
             instance.password = make_password(password)
 
         for attr, value in validated_data.items():
             setattr(instance, attr, value)
+
         instance.save()
         return instance
+    
+class ClientRegisterSerializer(serializers.ModelSerializer):
+    password = serializers.CharField(
+        write_only=True,
+        min_length=8,
+        style={'input_type': 'password'}
+    )
+    mobile_number = serializers.CharField()
+
+    class Meta:
+        model = ClientAuth
+        fields = ['email_address', 'mobile_number', 'password']
+        extra_kwargs = {'password': {'write_only': True}}
+
+    def validate_email_address(self, value):
+        value = value.lower()
+        if ClientAuth.objects.filter(email_address=value).exists():
+            raise serializers.ValidationError("A user with this email already exists.")
+        return value
+
+    def validate_mobile_number(self, value):
+        # Clean input
+        cleaned = re.sub(r'[\s\-\(\)]', '', value)
+
+        # Try parsing with phonenumbers
+        try:
+            if not cleaned.startswith('+'):
+                # Assume South Africa (+27) if no country code
+                cleaned = '+27' + cleaned.lstrip('0')
+            number = phonenumbers.parse(cleaned)
+            if not phonenumbers.is_valid_number(number):
+                raise serializers.ValidationError("Enter a valid phone number.")
+            normalized = phonenumbers.format_number(number, phonenumbers.PhoneNumberFormat.E164)
+        except phonenumbers.NumberParseException:
+            raise serializers.ValidationError("Enter a valid phone number with optional country code.")
+
+        # Ensure uniqueness
+        if ClientAuth.objects.filter(mobile_number=normalized).exists():
+            raise serializers.ValidationError("A user with this mobile number already exists.")
+
+        return normalized
+
+    def validate_password(self, value):
+        errors = []
+        if not re.search(r'[A-Z]', value):
+            errors.append("Password must contain at least one uppercase letter.")
+        if not re.search(r'[a-z]', value):
+            errors.append("Password must contain at least one lowercase letter.")
+        if not re.search(r'\d', value):
+            errors.append("Password must contain at least one digit.")
+        if errors:
+            raise serializers.ValidationError(errors)
+        return value
+
+    def create(self, validated_data):
+        validated_data['password'] = make_password(validated_data['password'])
+        return ClientAuth.objects.create(**validated_data)
 
 class AddressSerializer(serializers.ModelSerializer):
     clients = serializers.SerializerMethodField()
@@ -34,6 +99,32 @@ class AddressSerializer(serializers.ModelSerializer):
 
     def get_clients(self, obj):
         return ClientSerializer(obj.clients.all(), many=True).data
+    
+class ClientProfileSerializer(serializers.ModelSerializer):
+    # Add 'profile_image' to fields if it exists in ClientAuth model
+
+    class Meta:
+        model = ClientAuth
+        fields = ['email_address', 'mobile_number', 'password']
+        extra_kwargs = {
+            'password': {'write_only': True},
+        }
+
+    def create(self, validated_data):
+        validated_data['password'] = make_password(validated_data['password'])
+        return super().create(validated_data)
+
+    def update(self, instance, validated_data):
+        password = validated_data.pop('password', None)
+
+        if password:
+            instance.password = make_password(password)
+
+        for attr, value in validated_data.items():
+            setattr(instance, attr, value)
+
+        instance.save()
+        return instance
 
 class ClientSerializer(serializers.ModelSerializer):
     client_profile = ClientProfileSerializer()
@@ -62,8 +153,8 @@ class ClientSerializer(serializers.ModelSerializer):
         return client
 
     def update(self, instance, validated_data):
+    # Handle nested client_profile updates
         profile_data = validated_data.pop('client_profile', None)
-
         if profile_data:
             for attr, value in profile_data.items():
                 if attr == 'password':
@@ -71,8 +162,14 @@ class ClientSerializer(serializers.ModelSerializer):
                 setattr(instance.client_profile, attr, value)
             instance.client_profile.save()
 
+    # Handle image upload separately
+        if 'client_pp' in validated_data:
+            instance.client_pp = validated_data.pop('client_pp')
+
+    # Handle other fields
         for attr, value in validated_data.items():
             setattr(instance, attr, value)
+
         instance.save()
         return instance
 
@@ -82,16 +179,71 @@ class ClientSerializer(serializers.ModelSerializer):
         if request and instance.client_pp:
             rep['client_pp'] = request.build_absolute_uri(instance.client_pp.url)
         return rep
-
+    
+class AddressWriteSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Address
+        fields = [
+            'street_number',
+            'route',
+            'locality',
+            'administrative_area_level_1',
+            'country',
+            'postal_code',
+            'latitude',
+            'longitude'
+        ]
 
 class ClientAddressSerializer(serializers.ModelSerializer):
     client = ClientSerializer()
     address = AddressSerializer()
-   
 
     class Meta:
         model = ClientAddress
         fields = '__all__'
+
+class ClientAddressWriteSerializer(serializers.ModelSerializer):
+    address = AddressWriteSerializer()  # Nested write serializer
+
+    class Meta:
+        model = ClientAddress
+        fields = [
+            'address',
+            'is_owner',
+            'is_default',
+            'address_type',
+        ]
+
+    def create(self, validated_data):
+        # Extract nested address data
+        address_data = validated_data.pop('address')
+        client = self.context.get('client')  # Pass client in serializer context
+
+        # Create or reuse Address
+        address, _ = Address.objects.get_or_create(**address_data)
+
+        # Create ClientAddress linking client and address
+        client_address = ClientAddress.objects.create(
+            client=client,
+            address=address,
+            **validated_data
+        )
+        return client_address
+
+    def update(self, instance, validated_data):
+        # Handle nested address updates
+        address_data = validated_data.pop('address', None)
+        if address_data:
+            for attr, value in address_data.items():
+                setattr(instance.address, attr, value)
+            instance.address.save()
+
+        # Update ClientAddress fields
+        for attr, value in validated_data.items():
+            setattr(instance, attr, value)
+        instance.save()
+        return instance
+
 
 
 class ClientProfileUpdateSerializer(serializers.ModelSerializer):

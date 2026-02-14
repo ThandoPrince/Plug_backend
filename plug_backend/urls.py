@@ -33,6 +33,11 @@ urlpatterns = [
     path('api/clientsDB/default-address/<path:email>/', views.client_default_address),
     path("api/clientsDB/by-address/<int:address_id>/", views.clients_by_address, name="clients-by-address"),
     path("api/clientsDB/by-addresses/", views.clients_by_addresses, name="clients-by-addresses"),
+    path("api/clientsDB/client/register/", views.register_client, name="client-register"),
+    path("api/clientsDB/client/<str:email>/", views.get_client_by_email, name="get-client-by-email"),
+    path("api/clientsDB/client/<str:email>/complete-profile/", views.complete_profile_by_email, name="complete-client-profile"),
+    path("api/clientsDB/client/<str:email>/add-residential-address/", views.add_residential_address, name="add-residential-address"),
+    
 
     # Service Providers DB
     path('api/sp_profiles/', sp_views.sp_profile_list, name='sp_profile_list'),

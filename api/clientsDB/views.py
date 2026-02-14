@@ -4,11 +4,105 @@ from rest_framework.decorators import api_view, parser_classes, permission_class
 from rest_framework.response import Response
 from rest_framework import status
 from rest_framework.parsers import MultiPartParser, FormParser
+from rest_framework.permissions import AllowAny
 
 
 # from rest_framework.permissions import IsAuthenticated
-from .models import ClientAuth, ClientDetails, Address, ClientAddress, ClientNotification 
-from .serializers import AddressClaimSerializer, AddressOnlySerializer, ClientAddressNoDuplicatesSerializer, ClientProfileSerializer, AddressSerializer, ClientSerializer, ClientAddressSerializer, DefaultAddressSerializer
+from .models.models import ClientAuth, ClientDetails, Address, ClientAddress, ClientNotification 
+from .serializers import AddressClaimSerializer, AddressOnlySerializer, ClientAddressNoDuplicatesSerializer, AddressSerializer, ClientAddressWriteSerializer, ClientProfileSerializer, ClientRegisterSerializer, ClientSerializer, ClientAddressSerializer, DefaultAddressSerializer
+
+@api_view(['POST'])
+def register_client(request):
+    serializer = ClientRegisterSerializer(data=request.data)
+
+    if serializer.is_valid():
+        email = serializer.validated_data['email_address'].lower()
+        
+        # Check if a client with this email already exists
+        if ClientAuth.objects.filter(email_address=email).exists():
+            return Response(
+                {"error": "A user with this email already exists."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # Create authentication record
+        client_auth = serializer.save()
+
+        # Create empty profile if not exists
+        ClientDetails.objects.get_or_create(client_profile=client_auth)
+
+        return Response(
+            {
+                "message": "Registration successful.",
+                "email": client_auth.email_address
+            },
+            status=status.HTTP_201_CREATED
+        )
+
+    return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
+@api_view(['GET'])
+def get_client_by_email(request, email):
+    try:
+        client = ClientDetails.objects.get(client_profile__email_address=email)
+    except ClientDetails.DoesNotExist:
+        return Response(
+            {"error": "Client not found."},
+            status=status.HTTP_404_NOT_FOUND
+        )
+
+    serializer = ClientSerializer(client, context={'request': request})
+    return Response(serializer.data)
+
+@api_view(['PATCH'])
+@parser_classes([MultiPartParser, FormParser])
+def complete_profile_by_email(request, email):
+    try:
+        client = ClientDetails.objects.get(client_profile__email_address=email)
+    except ClientDetails.DoesNotExist:
+        return Response(
+            {"error": "Client not found."},
+            status=status.HTTP_404_NOT_FOUND
+        )
+
+    serializer = ClientSerializer(
+        client,
+        data=request.data,
+        partial=True,
+        context={'request': request}
+    )
+
+    if serializer.is_valid():
+        updated_client = serializer.save()
+
+        # Mark onboarding complete
+        if (
+            updated_client.first_name and
+            updated_client.last_name and
+            updated_client.date_of_birth
+        ):
+            updated_client.client_profile.is_profile_completed = True
+            updated_client.client_profile.save()
+
+        return Response(serializer.data)
+
+    return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+@api_view(['POST'])
+def add_residential_address(request, email):
+    try:
+        client = ClientDetails.objects.get(client_profile__email_address=email)
+    except ClientDetails.DoesNotExist:
+        return Response({"error": "Client not found."}, status=404)
+
+    serializer = ClientAddressWriteSerializer(data=request.data, context={'client': client})
+    if serializer.is_valid():
+        client_address = serializer.save()
+        return Response(ClientAddressWriteSerializer(client_address).data, status=201)
+    return Response(serializer.errors, status=400)
+
+
 
 @api_view(['GET', 'POST', 'PUT', 'DELETE'])
 def clientProfile_list(request,format=None):
@@ -26,7 +120,7 @@ def clientProfile_list(request,format=None):
         serializer = ClientProfileSerializer(client_profiles, many=True)
         return Response({'Client Profiles': serializer.data})
 
-@api_view(['GET', 'POST', 'PUT', 'DELETE'])
+@api_view(['GET'])
 @parser_classes([MultiPartParser, FormParser])
 def client_list(request, format=None):
     if request.method == 'GET':
@@ -34,41 +128,13 @@ def client_list(request, format=None):
         serializer = ClientSerializer(clients, many=True, context={'request': request})
         return Response(serializer.data)
 
-    elif request.method == 'POST':
-        serializer = ClientSerializer(data=request.data, context={'request': request})
-        if serializer.is_valid():
-            serializer.save()
-            return Response(serializer.data, status=status.HTTP_201_CREATED)
-        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-
-    elif request.method == 'PUT':
-        email = request.data.get('email')
-        if not email:
-            return Response({'error': 'Email is required for update.'}, status=status.HTTP_400_BAD_REQUEST)
-        try:
-            client = ClientDetails.objects.get(client_profile__email=email)
-        except ClientDetails.DoesNotExist:
-            return Response({'error': 'Client not found.'}, status=status.HTTP_404_NOT_FOUND)
-
-        serializer = ClientSerializer(client, data=request.data, partial=True, context={'request': request})
-        if serializer.is_valid():
-            serializer.save()
-            return Response(serializer.data)
-        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-
-    elif request.method == 'DELETE':
-        ClientDetails.objects.all().delete()
-        return Response(status=status.HTTP_204_NO_CONTENT)
+    
 
 
-@api_view(['GET', 'POST', 'PUT', 'DELETE'])
+
+@api_view(['GET'])
 def address_list(request,format=None):
-    if request.method == 'POST':
-        serializer = AddressSerializer(data=request.data)
-        if serializer.is_valid():
-            serializer.save()
-            return Response({'message': 'Address created successfully.', 'data': serializer.data}, status=201)
-        return Response({'error': 'Invalid data provided.', 'details': serializer.errors}, status=400)
+   
 
     if request.method == 'GET':
         addresses = Address.objects.all()
@@ -92,7 +158,7 @@ def address_list(request,format=None):
         except Address.DoesNotExist:
             return Response({'error': 'Address not found.'}, status=404)
 
-@api_view(['GET', 'POST', 'PUT', 'DELETE'])
+@api_view(['GET'])
 def client_address_list(request,format=None):
     if request.method == 'POST':
         serializer = ClientAddressSerializer(data=request.data)
@@ -502,26 +568,26 @@ def become_address_owner(request, address_id):
     }, status=200)
 
 
-@api_view(['POST'])
-def set_default_address(request, client_email):
-    try:
-        client = ClientDetails.objects.get(client_profile__email_address=client_email)
-    except ClientDetails.DoesNotExist:
-        return Response({'error': 'Client not found'}, status=status.HTTP_404_NOT_FOUND)
+# @api_view(['POST'])
+# def set_default_address(request, client_email):
+#     try:
+#         client = ClientDetails.objects.get(client_profile__email_address=client_email)
+#     except ClientDetails.DoesNotExist:
+#         return Response({'error': 'Client not found'}, status=status.HTTP_404_NOT_FOUND)
 
-    client_address_id = request.data.get('client_address_id')
-    if not client_address_id:
-        return Response({'error': 'client_address_id is required'}, status=status.HTTP_400_BAD_REQUEST)
+#     client_address_id = request.data.get('client_address_id')
+#     if not client_address_id:
+#         return Response({'error': 'client_address_id is required'}, status=status.HTTP_400_BAD_REQUEST)
 
-    try:
-        client_address = ClientAddress.objects.get(id=client_address_id, client=client)
-    except ClientAddress.DoesNotExist:
-        return Response({'error': 'ClientAddress not found for this client'}, status=status.HTTP_404_NOT_FOUND)
+#     try:
+#         client_address = ClientAddress.objects.get(id=client_address_id, client=client)
+#     except ClientAddress.DoesNotExist:
+#         return Response({'error': 'ClientAddress not found for this client'}, status=status.HTTP_404_NOT_FOUND)
 
-    client.default_address = client_address
-    client.save()
+#     client.default_address = client_address
+#     client.save()
 
-    return Response({'message': 'Default address updated successfully'}, status=status.HTTP_200_OK)
+#     return Response({'message': 'Default address updated successfully'}, status=status.HTTP_200_OK)
 
 
 

@@ -3,6 +3,8 @@ from django.core.exceptions import ValidationError
 from django.contrib.auth import get_user_model
 
 
+
+
 class Address(models.Model):
 
     latitude = models.DecimalField(max_digits=9, decimal_places=7, blank=True, null=True)
@@ -34,7 +36,8 @@ class ClientAuth(models.Model):
     email_address = models.EmailField(primary_key=True, max_length=100)
     mobile_number = models.CharField(max_length=60, default='0719503706')
     password = models.CharField(max_length=128)
-    
+    is_profile_completed = models.BooleanField(default=False)
+
 
     def __str__(self):
         return f"{self.email_address} - {self.password}"
@@ -47,7 +50,7 @@ class ClientDetails(models.Model):
     client_profile = models.OneToOneField(ClientAuth, on_delete=models.CASCADE, primary_key=True)
     rating = models.DecimalField(max_digits=3, decimal_places=2, null=True, blank=True, default=0.0)
     client_pp = models.ImageField(upload_to='client_profile_pics', default='default.jpg', null=True, blank=True)
-    client_ID = models.CharField(max_length=20, blank=True, null=True)
+    client_ID = models.CharField(max_length=20, blank=True, null=True, unique=True, auto_created=True)
     is_active = models.BooleanField(default=True)
 
 
@@ -58,6 +61,7 @@ class ClientDetails(models.Model):
 
 
 class ClientAddress(models.Model):
+    id = models.AutoField(auto_created=True, primary_key=True)  
     RESIDENTIAL = "Residential Address"
     VACATION = "Vacation Address"
     ADDRESS_TYPE_CHOICES = [
@@ -133,6 +137,7 @@ class PendingAddressApproval(models.Model):
     owner = models.ForeignKey(ClientDetails, related_name='approver', on_delete=models.CASCADE)
     status = models.CharField(choices=[('pending', 'Pending'), ('approved', 'Approved'), ('rejected', 'Rejected')], default='pending')
     created_at = models.DateTimeField(auto_now_add=True)
+    id = models.AutoField(auto_created=True, primary_key=True)
 
 User = get_user_model()
 

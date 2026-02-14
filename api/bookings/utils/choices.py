@@ -23,6 +23,7 @@ SHIPMENT_STATUS = [
     ('delivered', 'Delivered'),
     ('failed', 'Failed'),
     ('resheduled', 'Rescheduled'),
+    ('awaiting_confirmation', 'Awaiting Confirmation'),
     ('canceled', 'Canceled'),
     ('in_transit', 'In Transit'),
     ('out_for_delivery', 'Out for Delivery'),

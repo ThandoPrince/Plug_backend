@@ -3,7 +3,9 @@ from django.utils import timezone
 from .models import Negotiation, NegotiationRound, OrderService, BookingItem, Rating, ServicePicture, Session, SessionLocationPing, SessionToken, Shipment, ShipmentRoute
 from api.serviceProvidersDB.serializers import ProviderSeviceSerializer, ServiceSerializer
 from api.clientsDB.serializers import AddressOnlySerializer, ClientSerializer
-from api.clientsDB.models import ClientDetails, ClientAuth, Address
+from api.clientsDB.models.models import ClientDetails, ClientAuth, Address
+from django.contrib.auth.hashers import make_password
+
 
 
 class NegotiationRoundWriteSerializer(serializers.ModelSerializer):
