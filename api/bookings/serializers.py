@@ -165,7 +165,10 @@ class OrderServiceWriteSerializer(serializers.ModelSerializer):
         queryset=ClientDetails.objects.all(),
         slug_field='client_profile.email_address'
     )
-    delivery_address = serializers.PrimaryKeyRelatedField(queryset=Address.objects.all())
+    delivery_address = serializers.SlugRelatedField(
+        queryset=Address.objects.all(),
+        slug_field='place_id'
+    )
     provider_for_service = serializers.PrimaryKeyRelatedField(
         queryset=ProviderSeviceSerializer.Meta.model.objects.all(),
         required=False,

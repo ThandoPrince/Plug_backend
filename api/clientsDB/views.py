@@ -9,7 +9,7 @@ from rest_framework.permissions import AllowAny
 
 # from rest_framework.permissions import IsAuthenticated
 from .models.models import ClientAuth, ClientDetails, Address, ClientAddress, ClientNotification 
-from .serializers import AddressClaimSerializer, AddressOnlySerializer, ClientAddressNoDuplicatesSerializer, AddressSerializer, ClientAddressWriteSerializer, ClientProfileSerializer, ClientRegisterSerializer, ClientSerializer, ClientAddressSerializer, DefaultAddressSerializer
+from .serializers import AddressClaimSerializer, AddressOnlySerializer, ClientAddressNoDuplicatesSerializer, AddressSerializer, ClientAddressWriteSerializer, ClientLoginSerializer, ClientProfileSerializer, ClientRegisterSerializer, ClientSerializer, ClientAddressSerializer, DefaultAddressSerializer
 
 @api_view(['POST'])
 def register_client(request):
@@ -91,16 +91,46 @@ def complete_profile_by_email(request, email):
 
 @api_view(['POST'])
 def add_residential_address(request, email):
-    try:
-        client = ClientDetails.objects.get(client_profile__email_address=email)
-    except ClientDetails.DoesNotExist:
-        return Response({"error": "Client not found."}, status=404)
 
-    serializer = ClientAddressWriteSerializer(data=request.data, context={'client': client})
+    client = get_object_or_404(
+        ClientDetails,
+        client_profile__email_address=email
+    )
+
+    serializer = ClientAddressWriteSerializer(
+        data=request.data,
+        context={"client": client}
+    )
+
+    if not serializer.is_valid():
+        print(serializer.errors)
+        return Response(serializer.errors, status=400)
+    client_address = serializer.save()
+
+    return Response(
+        {
+            "message": "Address added successfully.",
+            "data": ClientAddressSerializer(client_address).data
+        },
+        status=status.HTTP_201_CREATED
+    )
+
+@api_view(['POST'])
+def client_login(request):
+    serializer = ClientLoginSerializer(data=request.data)
     if serializer.is_valid():
-        client_address = serializer.save()
-        return Response(ClientAddressWriteSerializer(client_address).data, status=201)
-    return Response(serializer.errors, status=400)
+        user = serializer.validated_data['user']
+        client_details = getattr(user, 'clientdetails', None)
+
+        return Response({
+            "email": user.email_address,
+            "first_name": getattr(client_details, 'first_name', ''),
+            "last_name": getattr(client_details, 'last_name', ''),
+            "is_profile_completed": user.is_profile_completed,
+        }, status=status.HTTP_200_OK)
+
+    # Return structured errors
+    return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
 
 

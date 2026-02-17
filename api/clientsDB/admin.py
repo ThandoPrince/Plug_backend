@@ -31,7 +31,7 @@ class ClientDetailsAdmin(admin.ModelAdmin):
 class ClientAddressInlineForAddress(admin.TabularInline):
     model = ClientAddress
     extra = 0
-    readonly_fields = ('client', 'is_owner', 'house_administrator', 'is_super_user', 'is_default', 'is_verified')
+    readonly_fields = ('client', 'is_owner', 'house_administrator', 'is_super_user', 'is_default')
     can_delete = False
 
 @admin.register(Address)
@@ -45,9 +45,9 @@ class AddressAdmin(admin.ModelAdmin):
 # -----------------------------
 @admin.register(ClientAddress)
 class ClientAddressAdmin(admin.ModelAdmin):
-    list_display = ('client', 'address', 'is_owner', 'house_administrator', 'is_super_user', 'is_default', 'is_verified')
+    list_display = ('client', 'address', 'is_owner', 'house_administrator', 'is_super_user', 'is_default')
     search_fields = ('client__first_name', 'client__last_name', 'address__formatted_address')
-    list_filter = ('is_owner', 'house_administrator', 'is_super_user', 'is_default', 'is_verified')
+    list_filter = ('is_owner', 'house_administrator', 'is_super_user', 'is_default')
     readonly_fields = ('house_administrator', 'is_super_user')
 
 # -----------------------------

@@ -5,7 +5,10 @@ from django.core.validators import RegexValidator
 from django.core.exceptions import ValidationError as DjangoValidationError
 from .models.models import ClientAuth, Address, ClientDetails, ClientAddress, ClientNotification
 import re
+from django.contrib.auth.hashers import check_password
 import phonenumbers
+from datetime import date
+from django.db import transaction
 
 class ClientProfileSerializer(serializers.ModelSerializer):
     # Add 'profile_image' to fields if it exists in ClientAuth model
@@ -53,26 +56,40 @@ class ClientRegisterSerializer(serializers.ModelSerializer):
         return value
 
     def validate_mobile_number(self, value):
-        # Clean input
-        cleaned = re.sub(r'[\s\-\(\)]', '', value)
+    # Remove spaces, dashes, brackets
+        cleaned = re.sub(r'\D', '', value)
 
-        # Try parsing with phonenumbers
+    # Must be exactly 10 digits
+        if not re.fullmatch(r'\d{10}', cleaned):
+            raise serializers.ValidationError(
+                "Phone number must be exactly 10 digits."
+            )
+
+    # Must start with 0 (SA local format)
+        if not cleaned.startswith('0'):
+            raise serializers.ValidationError(
+                "Phone number must start with 0."
+            )
+
+    # Convert to international format (+27)
+        normalized = '+27' + cleaned[1:]
+
+    # Validate properly using phonenumbers
         try:
-            if not cleaned.startswith('+'):
-                # Assume South Africa (+27) if no country code
-                cleaned = '+27' + cleaned.lstrip('0')
-            number = phonenumbers.parse(cleaned)
+            number = phonenumbers.parse(normalized)
             if not phonenumbers.is_valid_number(number):
-                raise serializers.ValidationError("Enter a valid phone number.")
-            normalized = phonenumbers.format_number(number, phonenumbers.PhoneNumberFormat.E164)
+                raise serializers.ValidationError("Enter a valid South African mobile number.")
         except phonenumbers.NumberParseException:
-            raise serializers.ValidationError("Enter a valid phone number with optional country code.")
+            raise serializers.ValidationError("Invalid phone number format.")
 
-        # Ensure uniqueness
+    # Ensure uniqueness
         if ClientAuth.objects.filter(mobile_number=normalized).exists():
-            raise serializers.ValidationError("A user with this mobile number already exists.")
+            raise serializers.ValidationError(
+                "A user with this mobile number already exists."
+            )
 
         return normalized
+
 
     def validate_password(self, value):
         errors = []
@@ -134,6 +151,25 @@ class ClientSerializer(serializers.ModelSerializer):
         model = ClientDetails
         fields = '__all__'
 
+    def validate_date_of_birth(self, value):
+        """Validate date_of_birth field if provided"""
+        if value:
+            if value > date.today():
+                raise serializers.ValidationError("Date of birth cannot be in the future.")
+            age = (date.today() - value).days // 365
+            if age < 18:
+                raise serializers.ValidationError("Client must be at least 18 years old.")
+        return value
+
+    def validate(self, data):
+        # Validate DOB in nested updates (PATCH)
+        dob = data.get('date_of_birth')
+        if not dob and 'client_profile' in data:
+            dob = data['client_profile'].get('date_of_birth')
+        if dob:
+            self.validate_date_of_birth(dob)
+        return data
+
     def create(self, validated_data):
         profile_data = validated_data.pop('client_profile')
         email = profile_data['email_address']
@@ -153,7 +189,6 @@ class ClientSerializer(serializers.ModelSerializer):
         return client
 
     def update(self, instance, validated_data):
-    # Handle nested client_profile updates
         profile_data = validated_data.pop('client_profile', None)
         if profile_data:
             for attr, value in profile_data.items():
@@ -162,37 +197,19 @@ class ClientSerializer(serializers.ModelSerializer):
                 setattr(instance.client_profile, attr, value)
             instance.client_profile.save()
 
-    # Handle image upload separately
         if 'client_pp' in validated_data:
             instance.client_pp = validated_data.pop('client_pp')
 
-    # Handle other fields
         for attr, value in validated_data.items():
             setattr(instance, attr, value)
 
         instance.save()
         return instance
-
-    def to_representation(self, instance):
-        rep = super().to_representation(instance)
-        request = self.context.get('request')
-        if request and instance.client_pp:
-            rep['client_pp'] = request.build_absolute_uri(instance.client_pp.url)
-        return rep
     
 class AddressWriteSerializer(serializers.ModelSerializer):
     class Meta:
         model = Address
-        fields = [
-            'street_number',
-            'route',
-            'locality',
-            'administrative_area_level_1',
-            'country',
-            'postal_code',
-            'latitude',
-            'longitude'
-        ]
+        fields = '__all__'
 
 class ClientAddressSerializer(serializers.ModelSerializer):
     client = ClientSerializer()
@@ -202,47 +219,138 @@ class ClientAddressSerializer(serializers.ModelSerializer):
         model = ClientAddress
         fields = '__all__'
 
+class AddressWriteSerializer(serializers.ModelSerializer):
+
+    class Meta:
+        model = Address
+        fields = [
+            'latitude',
+            'longitude',
+            'place_id',
+            'street_number',
+            'route',
+            'locality',
+            'administrative_area_level_1',
+            'country',
+            'postal_code',
+        ]
+
+    def validate(self, attrs):
+        street_number = attrs.get('street_number')
+        route = attrs.get('route')
+
+        errors = {}
+
+        if not street_number:
+            errors['street_number'] = "Street number is required."
+
+        if not route:
+            errors['route'] = "Street name (route) is required."
+
+        if errors:
+            raise serializers.ValidationError(errors)
+
+        return attrs
+
+
 class ClientAddressWriteSerializer(serializers.ModelSerializer):
-    address = AddressWriteSerializer()  # Nested write serializer
+    address = AddressWriteSerializer()
 
     class Meta:
         model = ClientAddress
         fields = [
-            'address',
-            'is_owner',
-            'is_default',
-            'address_type',
+            "address",
+            "is_owner",
+            "is_default",
+            "address_type",
+            "house_administrator"
         ]
 
+    @transaction.atomic
     def create(self, validated_data):
-        # Extract nested address data
-        address_data = validated_data.pop('address')
-        client = self.context.get('client')  # Pass client in serializer context
+        address_data = validated_data.pop("address")
+        client = self.context["client"]
 
-        # Create or reuse Address
-        address, _ = Address.objects.get_or_create(**address_data)
+        # --- 1️⃣ Apartment / House Validation ---
+        building_type = address_data.get("building_type", "house")
+        unit_number = address_data.get("unit_number")
 
-        # Create ClientAddress linking client and address
+        if building_type == "apartment" and not unit_number:
+            raise serializers.ValidationError("Unit number is required for apartments.")
+        if building_type == "house" and unit_number:
+            raise serializers.ValidationError("Houses cannot have a unit number.")
+
+        # --- 2️⃣ Prevent duplicate household globally ---
+        # Unique by place_id + unit_number
+        address, created = Address.objects.get_or_create(
+            place_id=address_data.get("place_id"),
+            unit_number=unit_number or "",
+            defaults={
+                "street_number": address_data.get("street_number"),
+                "route": address_data.get("route"),
+                "locality": address_data.get("locality"),
+                "administrative_area_level_1": address_data.get("administrative_area_level_1"),
+                "postal_code": address_data.get("postal_code"),
+                "country": address_data.get("country"),
+                "latitude": address_data.get("latitude"),
+                "longitude": address_data.get("longitude"),
+                "building_type": building_type,
+            }
+        )
+
+        # Update place_id if missing
+        if not created and not address.place_id and address_data.get("place_id"):
+            address.place_id = address_data["place_id"]
+            address.save(update_fields=["place_id"])
+
+        # --- 3️⃣ Prevent duplicate ClientAddress link ---
+        if ClientAddress.objects.filter(client=client, address=address).exists():
+            raise serializers.ValidationError("You have already added this address.")
+
+        # --- 4️⃣ Create link ---
         client_address = ClientAddress.objects.create(
             client=client,
             address=address,
             **validated_data
         )
+
         return client_address
+    
+class ClientLoginSerializer(serializers.Serializer):
+    email = serializers.EmailField(required=True)
+    password = serializers.CharField(write_only=True, required=True, min_length=6)
 
-    def update(self, instance, validated_data):
-        # Handle nested address updates
-        address_data = validated_data.pop('address', None)
-        if address_data:
-            for attr, value in address_data.items():
-                setattr(instance.address, attr, value)
-            instance.address.save()
+    first_name = serializers.CharField(source='clientdetails.first_name', read_only=True)
+    last_name = serializers.CharField(source='clientdetails.last_name', read_only=True)
+    is_profile_completed = serializers.BooleanField(read_only=True)
 
-        # Update ClientAddress fields
-        for attr, value in validated_data.items():
-            setattr(instance, attr, value)
-        instance.save()
-        return instance
+    def validate(self, data):
+        email = data.get('email')
+        password = data.get('password')
+
+        if not email:
+            raise serializers.ValidationError({
+                "email": ["Email is required."]
+            })
+        if not password:
+            raise serializers.ValidationError({
+                "password": ["Password is required."]
+            })
+
+        try:
+            user = ClientAuth.objects.get(email_address=email)
+        except ClientAuth.DoesNotExist:
+            raise serializers.ValidationError({
+                "non_field_errors": ["Invalid email or password."]
+            })
+
+        if not check_password(password, user.password):
+            raise serializers.ValidationError({
+                "non_field_errors": ["Invalid email or password."]
+            })
+
+        data['user'] = user
+        return data
 
 
 

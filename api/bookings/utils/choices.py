@@ -15,6 +15,11 @@ ORDER_STATUS = [
     ('awaiting_rating', 'Awaiting Rating'),
 
 ]
+BUILDING_TYPE_CHOICES  = [("house", "House"),
+        ("apartment", "Apartment / Flat"),
+        ("complex", "Estate / Complex"),
+        ("office", "Office / Commercial"),
+        ("other", "Other")]
 
 SHIPMENT_STATUS = [
     ('pending', 'Pending'),

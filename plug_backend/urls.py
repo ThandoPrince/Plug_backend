@@ -37,6 +37,7 @@ urlpatterns = [
     path("api/clientsDB/client/<str:email>/", views.get_client_by_email, name="get-client-by-email"),
     path("api/clientsDB/client/<str:email>/complete-profile/", views.complete_profile_by_email, name="complete-client-profile"),
     path("api/clientsDB/client/<str:email>/add-residential-address/", views.add_residential_address, name="add-residential-address"),
+    path("api/clientsDB/login/", views.client_login, name="client-login"),
     
 
     # Service Providers DB
