@@ -9,7 +9,7 @@ from django.db import transaction
 
 from api.bookings.services.calculate_distance_meters import calculate_distance_meters
 from api.bookings.services.shipment_transition_function import InvalidShipmentTransition, transition_shipment
-from api.serviceProvidersDB.models import ProviderService
+from api.serviceProvidersDB.models import ProviderService, ServiceProvider
 
 from .models import BookingItem, NegotiationRound, OrderService, Negotiation, Rating, Session, SessionLocationPing, SessionToken, Shipment, ShipmentRoute
 from .serializers import (
@@ -49,6 +49,8 @@ def order_service_list(request):
 
 @api_view(['POST'])
 def order_service_create(request):
+    print("FILES RECEIVED:", request.FILES)
+    print("POST DATA:", request.data)
     """Create a new order"""
     serializer = OrderServiceWriteSerializer(data=request.data, context={'request': request})
     if serializer.is_valid():
@@ -368,24 +370,24 @@ def get_shipments_by_provider(request, provider_email):
     filtered by specific statuses.
     """
 
-    # 1️⃣ Find the provider by email
+    # 1️⃣ Find the ServiceProvider
     try:
-        provider = ProviderService.objects.get(
-            provider__sp_profile__email_address=provider_email
+        provider = ServiceProvider.objects.get(
+            sp_profile__email_address=provider_email
         )
-    except ProviderService.DoesNotExist:
-        return Response(
-            {"error": "Provider not found."},
-            status=status.HTTP_404_NOT_FOUND
-        )
+    except ServiceProvider.DoesNotExist:
+        return Response({"error": "Provider not found."}, status=status.HTTP_404_NOT_FOUND)
 
-    # 2️⃣ Get all orders assigned to this provider
-    provider_orders = OrderService.objects.filter(provider_for_service=provider)
+    # 2️⃣ Get all ProviderService instances for this provider
+    provider_services = ProviderService.objects.filter(provider=provider)
 
-    # 3️⃣ Get BookingItems linked to these orders
+    # 3️⃣ Get all OrderService instances assigned to these provider_services
+    provider_orders = OrderService.objects.filter(provider_for_service__in=provider_services)
+
+    # 4️⃣ Get BookingItems linked to these orders
     booking_items = BookingItem.objects.filter(order__in=provider_orders)
 
-    # 4️⃣ Get all shipments linked to these booking items with specific statuses
+    # 5️⃣ Get all Shipments linked to these booking items with specific statuses
     shipments = Shipment.objects.filter(
         service_ordered__in=booking_items,
         shipment_status__in=[
@@ -397,7 +399,7 @@ def get_shipments_by_provider(request, provider_email):
         ]
     ).order_by('-created_at')  # newest first
 
-    # 5️⃣ Serialize and return
+    # 6️⃣ Serialize and return
     serializer = ShipmentReadSerializer(shipments, many=True)
     return Response(serializer.data, status=status.HTTP_200_OK)
 
@@ -417,10 +419,7 @@ def get_shipments_by_client(request, client_email):
     )
 
     if not client_orders.exists():
-        return Response(
-            {"error": "Client not found or no orders available."},
-            status=status.HTTP_404_NOT_FOUND
-        )
+        return Response([], status=status.HTTP_200_OK)
 
     # 2️⃣ Get booking items linked to these orders
     booking_items = BookingItem.objects.filter(order__in=client_orders)

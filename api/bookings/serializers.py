@@ -1,5 +1,7 @@
 from rest_framework import serializers
 from django.utils import timezone
+
+from api.serviceProvidersDB.models import ProviderService
 from .models import Negotiation, NegotiationRound, OrderService, BookingItem, Rating, ServicePicture, Session, SessionLocationPing, SessionToken, Shipment, ShipmentRoute
 from api.serviceProvidersDB.serializers import ProviderSeviceSerializer, ServiceSerializer
 from api.clientsDB.serializers import AddressOnlySerializer, ClientSerializer
@@ -157,37 +159,45 @@ class ClientEmailField(serializers.SlugRelatedField):
             raise serializers.ValidationError(f"No client details linked to '{data}' found.")
 
 
-from rest_framework import serializers
-from decimal import Decimal, InvalidOperation
+
 
 class OrderServiceWriteSerializer(serializers.ModelSerializer):
+
     client = ClientEmailField(
         queryset=ClientDetails.objects.all(),
         slug_field='client_profile.email_address'
     )
+
     delivery_address = serializers.SlugRelatedField(
         queryset=Address.objects.all(),
         slug_field='place_id'
     )
+
     provider_for_service = serializers.PrimaryKeyRelatedField(
-        queryset=ProviderSeviceSerializer.Meta.model.objects.all(),
+        queryset=ProviderService.objects.all(),
         required=False,
         allow_null=True
     )
-    service_pictures = ServicePictureReadSerializer(many=True, read_only=True)
-    invited_providers = serializers.SlugRelatedField(
-        queryset=ProviderSeviceSerializer.Meta.model.objects.all(),
-        many=True,
-        slug_field='provider__sp_profile__email_address'
+
+    # 🔥 IMPORTANT: accept raw emails instead of SlugRelatedField
+    invited_providers = serializers.ListField(
+        child=serializers.EmailField(),
+        write_only=True,
+        required=False
     )
 
-    # Explicitly define fields you want to validate
-    title = serializers.CharField(required=True, allow_blank=False)
-    notes = serializers.CharField(required=True, allow_blank=False)
+    service_pictures = ServicePictureReadSerializer(
+        many=True,
+        read_only=True
+    )
 
+    title = serializers.CharField(required=True)
+    notes = serializers.CharField(required=True)
 
     proposal_price = serializers.DecimalField(
-        max_digits=12, decimal_places=2, required=True
+        max_digits=12,
+        decimal_places=2,
+        required=True
     )
 
     class Meta:
@@ -195,25 +205,45 @@ class OrderServiceWriteSerializer(serializers.ModelSerializer):
         fields = '__all__'
 
     def validate_proposal_price(self, value):
-        # Ensure proposal_price is numeric and positive
         if value <= 0:
-            raise serializers.ValidationError("Proposal price must be greater than 0.")
+            raise serializers.ValidationError(
+                "Proposal price must be greater than 0."
+            )
         return value
 
     def create(self, validated_data):
-        invited_providers = validated_data.pop("invited_providers", [])
+        invited_emails = validated_data.pop("invited_providers", [])
         request = self.context.get("request")
+        service_required = validated_data.get("service_required")
 
+        # Create order first
         order = OrderService.objects.create(**validated_data)
 
-        # Create initial negotiations if proposal_price exists
+        # 🔥 CRITICAL FIX:
+        # filter by BOTH email and service
+        provider_services = ProviderService.objects.filter(
+            provider__sp_profile__email_address__in=invited_emails,
+            service=service_required
+        )
+
+        # Optional safety check
+        if len(provider_services) != len(invited_emails):
+            raise serializers.ValidationError(
+                "One or more invited providers do not offer this service."
+            )
+
+        # Set many-to-many
+        order.invited_providers.set(provider_services)
+
+        # Create negotiations
         if order.proposal_price:
-            for provider in invited_providers:
+            for provider_service in provider_services:
                 negotiation = Negotiation.objects.create(
                     service_order=order,
-                    provider_for_negotiation=provider,
+                    provider_for_negotiation=provider_service,
                     proposed_price=order.proposal_price
                 )
+
                 NegotiationRound.objects.create(
                     negotiation=negotiation,
                     sender_type="client",
@@ -221,12 +251,13 @@ class OrderServiceWriteSerializer(serializers.ModelSerializer):
                     message="Initial proposal"
                 )
 
-        order.invited_providers.set(invited_providers)
-
-        # Handle uploaded service pictures
+        # Handle uploaded pictures
         if request and hasattr(request, "FILES"):
             for file in request.FILES.getlist("service_pictures"):
-                ServicePicture.objects.create(order=order, image=file)
+                ServicePicture.objects.create(
+                    order=order,
+                    image=file
+                )
 
         return order
 
@@ -565,3 +596,4 @@ class SubmitRatingSerializer(serializers.ModelSerializer):
             )
 
         return data
+    

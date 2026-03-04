@@ -3,7 +3,7 @@ from django.contrib.auth.hashers import make_password
 from django.contrib.auth.password_validation import validate_password
 from django.core.validators import RegexValidator
 from django.core.exceptions import ValidationError as DjangoValidationError
-from .models.models import ClientAuth, Address, ClientDetails, ClientAddress, ClientNotification
+from .models.models import AddressSuperUserVerification, ClientAuth, Address, ClientDetails, ClientAddress, ClientNotification
 import re
 from django.contrib.auth.hashers import check_password
 import phonenumbers
@@ -35,6 +35,19 @@ class ClientProfileSerializer(serializers.ModelSerializer):
 
         instance.save()
         return instance
+
+
+
+
+class ClientAuthReadSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ClientAuth
+        fields = [
+            'id',
+            'email_address',
+            'mobile_number',
+            'is_profile_completed',
+        ]
     
 class ClientRegisterSerializer(serializers.ModelSerializer):
     password = serializers.CharField(
@@ -271,7 +284,7 @@ class ClientAddressWriteSerializer(serializers.ModelSerializer):
         address_data = validated_data.pop("address")
         client = self.context["client"]
 
-        # --- 1️⃣ Apartment / House Validation ---
+     
         building_type = address_data.get("building_type", "house")
         unit_number = address_data.get("unit_number")
 
@@ -280,8 +293,7 @@ class ClientAddressWriteSerializer(serializers.ModelSerializer):
         if building_type == "house" and unit_number:
             raise serializers.ValidationError("Houses cannot have a unit number.")
 
-        # --- 2️⃣ Prevent duplicate household globally ---
-        # Unique by place_id + unit_number
+   
         address, created = Address.objects.get_or_create(
             place_id=address_data.get("place_id"),
             unit_number=unit_number or "",
@@ -298,16 +310,16 @@ class ClientAddressWriteSerializer(serializers.ModelSerializer):
             }
         )
 
-        # Update place_id if missing
+    
         if not created and not address.place_id and address_data.get("place_id"):
             address.place_id = address_data["place_id"]
             address.save(update_fields=["place_id"])
 
-        # --- 3️⃣ Prevent duplicate ClientAddress link ---
+ 
         if ClientAddress.objects.filter(client=client, address=address).exists():
             raise serializers.ValidationError("You have already added this address.")
 
-        # --- 4️⃣ Create link ---
+     
         client_address = ClientAddress.objects.create(
             client=client,
             address=address,
@@ -315,6 +327,48 @@ class ClientAddressWriteSerializer(serializers.ModelSerializer):
         )
 
         return client_address
+    
+
+class AddressVerificationCreateSerializer(serializers.ModelSerializer):
+    client_address = serializers.PrimaryKeyRelatedField(
+        queryset=ClientAddress.objects.all()
+    )
+
+    class Meta:
+        model = AddressSuperUserVerification
+        fields = [
+            "client_address",
+            "proof_of_residence",
+            "id_document",
+        ]
+
+    def validate(self, attrs):
+        client_address = attrs["client_address"]
+
+        if hasattr(client_address, "verification_request"):
+            existing = client_address.verification_request
+
+            if existing.status == "approved":
+                raise serializers.ValidationError(
+                    "This address has already been verified."
+                )
+
+            if existing.status == "pending":
+                raise serializers.ValidationError(
+                    "Verification request is already pending."
+                )
+
+  
+        if not attrs.get("proof_of_residence") or not attrs.get("id_document"):
+            raise serializers.ValidationError(
+                "Both proof of residence and ID document must be uploaded."
+            )
+
+        return attrs
+
+    def create(self, validated_data):
+        return AddressSuperUserVerification.objects.create(**validated_data)
+
     
 class ClientLoginSerializer(serializers.Serializer):
     email = serializers.EmailField(required=True)

@@ -23,6 +23,11 @@ urlpatterns = [
     # Clients DB
     path('api/clientsDB/client-profiles/', views.clientProfile_list, name='client-profile-list'),
     path('api/clientsDB/clients/', views.client_list, name='client-list'),
+    path(
+        'api/client-auth/<str:email>/',
+        views.client_auth_by_email,
+        name='client-auth-by-email'
+    ),
     path('api/clientsDB/addresses/', views.address_list, name='address-list'),
     path('api/clientsDB/address-only/<str:email>', views.client_saved_addresses, name='address-only-list'),
     path('api/clientsDB/client-addresses/', views.client_address_list, name='client-address-list'),
@@ -34,20 +39,31 @@ urlpatterns = [
     path("api/clientsDB/by-address/<int:address_id>/", views.clients_by_address, name="clients-by-address"),
     path("api/clientsDB/by-addresses/", views.clients_by_addresses, name="clients-by-addresses"),
     path("api/clientsDB/client/register/", views.register_client, name="client-register"),
+    path("api/address-client/set-default/<int:address_id>/", views.set_default_address, name="set-default-address"),
     path("api/clientsDB/client/<str:email>/", views.get_client_by_email, name="get-client-by-email"),
     path("api/clientsDB/client/<str:email>/complete-profile/", views.complete_profile_by_email, name="complete-client-profile"),
     path("api/clientsDB/client/<str:email>/add-residential-address/", views.add_residential_address, name="add-residential-address"),
     path("api/clientsDB/login/", views.client_login, name="client-login"),
+    path("api/clientsDB/address/verify/<int:client_address_id>/", views.submit_address_verification, name="client-address-verification"),
     
 
     # Service Providers DB
+    path('api/sp_profile/register/', sp_views.sp_register, name='sp_profile_register'),
+    path('api/sp_login/', sp_views.sp_login, name='sp_login'),
+    path('api/sp_service/<str:email>/cost/<int:service_id>/', sp_views.update_cost_of_service, name='sp_cost_of'),
+    
+    path('api/sp_details/upload/<str:email>/', sp_views.patch_sp_profile_by_email, name='sp_details_upload'),
+    path('api/sp/upload/address_document/', sp_views.sp_add_address_document, name='sp_details_upload'),
+    path('api/service/upload_or_create/<str:email>/', sp_views.submit_service, name='sp_service_create  '),
     path('api/sp_profiles/', sp_views.sp_profile_list, name='sp_profile_list'),
     path('api/sp_profiles/<str:email>/', sp_views.sp_profile_detail, name='sp_profile_detail'),
     path('api/cost_of_service/<str:email>/', sp_views.costs_by_sp_email, name='cost_of_service'),
     path('api/service_groups/', sp_views.service_group_list, name='service_group_list'),
     path('api/service_groups/<str:group_id>/', sp_views.service_group_detail, name='service_group_detail'),
     path('api/services/', sp_views.service_list, name='service_list'),
+    path('api/approved_services/', sp_views.approved_services_list, name='service_list'),
     path('api/services/<int:pk>/', sp_views.service_detail, name='service_detail'),
+
     
     path('api/service_providers/', sp_views.service_provider_list_service, name='service_provider_list'),
     path('api/service_providers/<str:email>/', sp_views.service_provider_detail, name='service_provider_detail_by_email'),

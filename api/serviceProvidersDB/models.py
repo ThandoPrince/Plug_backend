@@ -1,10 +1,17 @@
 from django.conf import settings
 from django.db import models
 from django.forms import ValidationError
+from api.bookings.utils.choices import BUILDING_TYPE_CHOICES
+from django.contrib.auth.hashers import make_password
+from django.db.models import Q
+from django.db import transaction
+from api.serviceProvidersDB.services.service_category_constants import RiskLevel, ServiceCategoryID, ServiceCategoryName
 
 
 class Address(models.Model):
     id = models.AutoField(primary_key=True, editable=False)
+    building_type  = models.CharField(max_length=100, choices=BUILDING_TYPE_CHOICES , default='house')
+    unit_number = models.CharField(max_length=20, blank=True, default="")
     street_number = models.CharField(max_length=10, blank=True, null=True)
     route = models.CharField("Street Name", max_length=255, blank=True, null=True)
     locality = models.CharField("City/Town", max_length=100, blank=True, null=True)
@@ -23,8 +30,29 @@ class Address(models.Model):
             or "Unnamed Address"
         )
 
+    
 
+class ServiceCategory(models.Model):
 
+    category_id = models.CharField(
+        max_length=10,
+        primary_key=True,
+        unique=True,
+        choices= ServiceCategoryID.choices
+    )
+
+    name = models.CharField(max_length=100, unique=True, choices=ServiceCategoryName.choices)
+
+    risk_level = models.CharField(
+    max_length=20,
+    choices=RiskLevel.choices
+)
+
+    requires_verification = models.BooleanField(default=False)
+    requires_admin_approval = models.BooleanField(default=False)
+
+    def __str__(self):
+        return f"{self.name} ({self.risk_level})"
 
 class ServiceGroup(models.Model):
     group_id = models.CharField(
@@ -35,53 +63,93 @@ class ServiceGroup(models.Model):
     )
     name = models.CharField(max_length=100, unique=True)
 
+    category = models.ForeignKey(
+        ServiceCategory,
+        on_delete=models.PROTECT,
+        related_name="groups"
+   , null=True )
+
     def __str__(self):
         return f"{self.name} ({self.group_id})"
 
 
 class Service(models.Model):
+    REVIEW_STATUS = [
+        ("PENDING", "Pending Review"),
+        ("APPROVED", "Approved"),
+        ("REJECTED", "Rejected"),
+    ]
+
+    review_status = models.CharField(
+        max_length=20,
+        choices=REVIEW_STATUS,
+        default="APPROVED"
+    )
+    risk_level = models.CharField(
+        max_length=20,
+        choices=RiskLevel.choices,
+        default=RiskLevel.LOW
+    )
     service_id = models.AutoField(primary_key=True, editable=False)
     service_name = models.CharField(max_length=100)
-    service_group = models.ForeignKey(ServiceGroup, on_delete=models.SET_NULL, null=True)
+    service_group = models.ForeignKey(
+        ServiceGroup,
+        on_delete=models.SET_NULL,
+        null=True,
+        related_name="services"
+    )
     description = models.TextField(null=True, blank=True)
+
+    def save(self, *args, **kwargs):
+        if self.service_group and self.service_group.category:
+            self.risk_level = self.service_group.category.risk_level
+        super().save(*args, **kwargs)
 
     def __str__(self):
         return f"{self.service_name}"
-    @property
-    def active_provider_count(self):
-        return self.providers.filter(is_active=True).count()
+
+
     
 
-class ProviderService(models.Model):
-    provider = models.ForeignKey('ServiceProvider', on_delete=models.CASCADE)
-    service = models.ForeignKey(Service, on_delete=models.CASCADE)
-
-    class Meta:
-        unique_together = ('provider', 'service')
+class ServiceKeyword(models.Model):
+    keyword = models.CharField(max_length=100, unique=True)
+    service = models.ForeignKey(
+        Service,
+        on_delete=models.CASCADE,
+        related_name="keywords",
+        null=True,
+        blank=True
+    )
+    # Add this field to match your validator logic
+    risk_level = models.CharField(
+        max_length=20,
+        choices=RiskLevel.choices,
+        default=RiskLevel.LOW
+    )
+    is_prohibited = models.BooleanField(default=False)
+    is_active = models.BooleanField(default=True)
 
     def __str__(self):
-        return f"{self.provider.full_name} - {self.service.service_name}"
+        return f"{self.keyword} ({self.risk_level})"
     
 
-
-
 class SPProfile(models.Model):
-    email_address = models.EmailField(primary_key=True)
+    id = models.AutoField(primary_key=True)
+    email_address = models.EmailField(unique=True)
     password = models.CharField(max_length=128)
+    mobile_number = models.CharField(max_length=20, unique=True, null=True)
+    is_profile_completed = models.BooleanField(default=False)
+    is_active = models.BooleanField(default=True)
+
+    def set_password(self, raw_password):
+        self.password = make_password(raw_password)
+
+    def __str__(self):
+        return f"SPProfile: {self.email_address}"
 
     def __str__(self):
         return f"SPProfile: {self.email_address}"
     
-class SupportingDocument(models.Model):
-    provider = models.ForeignKey('ServiceProvider', on_delete=models.CASCADE, related_name='documents')
-    document_name = models.CharField(max_length=100)
-    document_file = models.FileField(upload_to='supporting_documents/')
-    uploaded_at = models.DateTimeField(auto_now_add=True)
-
-    def __str__(self):
-        return f"{self.document_name} for {self.provider.full_name}"
-
-
 class ServiceProvider(models.Model):
     rating = models.DecimalField(max_digits=3, decimal_places=2, null=True, blank=True, default=0.0)
     full_name = models.CharField(max_length=85)
@@ -90,11 +158,9 @@ class ServiceProvider(models.Model):
     sp_description = models.CharField(max_length=255, null=True, blank=True, help_text="Brief description of yourself and qualities")
     dob = models.DateField()
     is_active = models.BooleanField(default=True)
-    is_discoverable = models.BooleanField(default=True)
-    mobile_number = models.CharField(max_length=20)
     location = models.ForeignKey(Address, on_delete=models.SET_NULL, null=True)
     sp_profile = models.OneToOneField(SPProfile, on_delete=models.CASCADE, primary_key=True)
-    services = models.ManyToManyField(Service, through='ProviderService', related_name='providers')
+    
     
 
     def service_provider_upload_path(instance, filename):
@@ -103,6 +169,130 @@ class ServiceProvider(models.Model):
         return f"profile_images/providers/{safe_email}/{filename}"
 
     profile_image = models.ImageField(upload_to=service_provider_upload_path, null=True, blank=True)
+    
+class CostOfService(models.Model):
+    base_price = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+    negotiable = models.BooleanField(default=True)
+    notes = models.TextField(blank=True, null=True, )
+
+    
+    def __str__(self):
+        return f"Base Price: {self.base_price}"
+    
+
+
+
+
+class ProviderService(models.Model):
+    provider = models.ForeignKey(
+        'ServiceProvider',
+        on_delete=models.CASCADE,
+        related_name='provider_services'
+    )
+
+    service = models.ForeignKey(
+        'Service',
+        on_delete=models.CASCADE,
+        related_name='service_providers'   # 🔥 IMPORTANT
+    )
+
+    cost_of_service = models.OneToOneField(
+        'CostOfService',
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name='provider_service'
+    )
+    
+
+    is_primary = models.BooleanField(default=False)
+
+    class Meta:
+        unique_together = ('provider', 'service')
+
+        constraints = [
+            models.UniqueConstraint(
+                fields=['provider'],
+                condition=Q(is_primary=True),
+                name='unique_primary_service_per_provider'
+            )
+        ]
+
+        indexes = [
+            models.Index(fields=['provider']),
+            models.Index(fields=['service']),
+        ]
+
+    def clean(self):
+        """
+        Business Rules:
+        - Max 3 services per provider
+        """
+
+        if self.pk:
+            existing_count = ProviderService.objects.filter(
+                provider=self.provider
+            ).exclude(pk=self.pk).count()
+        else:
+            existing_count = ProviderService.objects.filter(
+                provider=self.provider
+            ).count()
+
+        if existing_count >= 3:
+            raise ValidationError(
+                "A provider can only have a maximum of 3 services."
+            )
+
+    def save(self, *args, **kwargs):
+        with transaction.atomic():
+
+            is_new = self.pk is None
+
+            # If first service → auto primary
+            if is_new and not ProviderService.objects.filter(
+                provider=self.provider
+            ).exists():
+                self.is_primary = True
+
+            # If marking as primary → unset others
+            if self.is_primary:
+                ProviderService.objects.filter(
+                    provider=self.provider,
+                    is_primary=True
+                ).exclude(pk=self.pk).update(is_primary=False)
+
+            self.full_clean()
+            super().save(*args, **kwargs)
+
+    def __str__(self):
+        return f"{self.provider.full_name} - {self.service.service_name}"
+
+    
+class SupportingDocument(models.Model):
+
+    ID_TYPE_CHOICES = [
+        ("greenbook", "Green Book"),
+        ("card", "ID Card"),
+    ]
+
+    provider = models.ForeignKey(
+        'ServiceProvider',
+        on_delete=models.CASCADE,
+        related_name='documents'
+    )
+
+    id_type = models.CharField(max_length=20, choices=ID_TYPE_CHOICES, default= 'card')
+
+    front_file = models.FileField(upload_to='sp_ids/', blank=True, null=True)
+    back_file = models.FileField(upload_to='sp_ids/', blank=True, null=True)
+
+    uploaded_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return f"{self.id_type} for {self.provider.full_name}"
+
+
+
 
 class SPLiveLocation(models.Model):
     provider = models.OneToOneField(
@@ -133,17 +323,7 @@ class SPLocationHistory(models.Model):
 
 
 
-class CostOfService(models.Model):
-    service = models.ForeignKey(Service, on_delete=models.CASCADE, related_name='costs')
-    provider = models.ForeignKey(ServiceProvider, on_delete=models.CASCADE)
-    base_price = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
-    negotiable = models.BooleanField(default=True)
-    notes = models.TextField(blank=True, null=True, )
 
-    class Meta:
-        unique_together = ['service', 'provider']
-    def __str__(self):
-        return f"{self.service.service_name} - {self.provider.full_name} - Base Price: {self.base_price}"
 
 
 class ServiceProviderAvailability(models.Model):

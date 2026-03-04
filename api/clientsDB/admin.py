@@ -1,5 +1,5 @@
 from django.contrib import admin
-from .models.models import ClientDetails, ClientAuth, Address, ClientAddress, PendingAddressApproval, ClientNotification
+from .models.models import AddressSuperUserVerification, ClientDetails, ClientAuth, Address, ClientAddress, PendingAddressApproval, ClientNotification
 
 # -----------------------------
 # ClientAuth Admin
@@ -67,3 +67,41 @@ class ClientNotificationAdmin(admin.ModelAdmin):
     list_display = ('recipient', 'title', 'is_read', 'created_at')
     list_filter = ('is_read',)
     search_fields = ('recipient__first_name', 'recipient__last_name', 'title', 'message')
+
+
+# -----------------------------
+# AddressSuperUserVerification Admin
+# -----------------------------
+@admin.register(AddressSuperUserVerification)
+class AddressSuperUserVerificationAdmin(admin.ModelAdmin):
+    list_display = (
+        'client_address',
+        'status',
+        'submitted_at',
+        'reviewed_at',
+    )
+
+    list_filter = ('status', 'submitted_at')
+
+    search_fields = (
+        'client_address__client__first_name',
+        'client_address__client__last_name',
+        'client_address__address__formatted_address',
+    )
+
+    readonly_fields = (
+        'client_address',
+        'proof_of_residence',
+        'id_document',
+        'submitted_at',
+    )
+
+    actions = ['approve_verifications', 'reject_verifications']
+
+    def approve_verifications(self, request, queryset):
+        queryset.update(status='approved')
+    approve_verifications.short_description = "Approve selected verifications"
+
+    def reject_verifications(self, request, queryset):
+        queryset.update(status='rejected')
+    reject_verifications.short_description = "Reject selected verifications"

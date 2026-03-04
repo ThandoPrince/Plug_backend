@@ -1,147 +1,254 @@
 from django.core.management.base import BaseCommand
 from django.db import transaction
-from api.serviceProvidersDB.models import ServiceGroup, Service
+
+from api.serviceProvidersDB.models import (
+    ServiceCategory,
+    ServiceGroup,
+    Service,
+    RiskLevel,
+    ServiceCategoryID,
+    ServiceCategoryName,
+    ServiceKeyword,
+)
 
 
 class Command(BaseCommand):
-    help = 'Seed initial service groups and services with predefined group_ids'
+    help = "Seed service categories, groups, services, keywords and enforce inherited risk levels"
 
+    @transaction.atomic
     def handle(self, *args, **options):
-        service_groups = [
+        self.stdout.write(self.style.WARNING("Seeding Service Categories..."))
+
+        categories_data = [
             {
-                'group_id': 'BEA001',
-                'name': 'Beauty & Personal Care',
-                'services': [
-                    {'service_name': 'Makeup Technician'},
-                    {'service_name': 'Hairdresser'},
-                    {'service_name': 'Nail Technician'},
-                    {'service_name': 'Barber'},
-                    {'service_name': 'Skincare Specialist'},
-                    {'service_name': 'Tattoo Artist'},
-                    {'service_name': 'Pest Control'},
-                    
-                ]
+                "id": ServiceCategoryID.DOMESTIC,
+                "name": ServiceCategoryName.DOMESTIC,
+                "risk": RiskLevel.LOW,
+                "verification": False,
+                "admin": False,
             },
             {
-                'group_id': 'HOL001',
-                'name': 'Household Support',
-                'services': [
-                    {'service_name': 'House Cleaner'},
-                    {'service_name': 'Laundry Helper'},
-                    {'service_name': 'Gardener'},
-                    {'service_name': 'Car-wash'},
-                    {'service_name': 'Plumber'},
-                    {'service_name': 'Electrician'},
-                    {'service_name': 'Pest Control'},
-                    {'service_name': 'Handyman'},
-                    {'service_name': 'Carpenter'},
-                    {'service_name': 'Painter'},
-                    {'service_name': 'Mover'},
-
-                ]
+                "id": ServiceCategoryID.HIGH_STAKES,
+                "name": ServiceCategoryName.HIGH_STAKES,
+                "risk": RiskLevel.HIGH,
+                "verification": True, 
+                "admin": True,        
             },
-            {
-                'group_id': 'OTH001',
-                'name': 'Other Services',
-                'services': [
-                    {'service_name': 'Tutor'},
-                    {'service_name': 'Driver'},
-                    {'service_name': 'Babysitter'},
-                    {'service_name': 'Pet Sitter'},
-                    {'service_name': 'General Labourer'},
-                    {'service_name': 'Security Guard'},
-                ]
+             {
+                "id": ServiceCategoryID.OTHER,
+                "name": ServiceCategoryName.OTHER,
+                "risk": RiskLevel.HIGH,
+                "verification": True, 
+                "admin": True,        
             },
-
-
-            {
-                'group_id': 'ENT001',
-                'name': 'Entertainment',
-                'services': [
-   
-                    {'service_name': 'DJ'},
-                    {'service_name': 'Photographer'},
-                    {'service_name': 'Videographer'},
-                    {'service_name': 'Event Host'},   
-                    {'service_name': 'Magician'},
-                    {'service_name': 'Party Planner'},
-                    {'service_name': 'Sound Technician'},         
-
-                ]
-            },
-
-            {
-                'group_id': 'FIT001',
-                'name': 'Fitness & Wellness',
-                'services': [
-                    {'service_name': 'Personal Trainer'},
-                    {'service_name': 'Yoga Instructor'},
-                    {'service_name': 'Pilates Instructor'},
-                    {'service_name': 'Nutrition'},
-                    {'service_name': 'Massage Therapist'},
-                    {'service_name': 'Chiropractor'},
-                    {'service_name': 'Acupuncturist'},
-                    {'service_name': 'Reiki Practitioner'},
-                
-  
             
+            {
+                "id": ServiceCategoryID.PERSONAL_BODY,
+                "name": ServiceCategoryName.PERSONAL_BODY,
+                "risk": RiskLevel.MEDIUM,
+                "verification": True,
+                "admin": False,
+            },
+            {
+                "id": ServiceCategoryID.EVENTS_MEDIA,
+                "name": ServiceCategoryName.EVENTS_MEDIA,
+                "risk": RiskLevel.LOW,
+                "verification": False,
+                "admin": False,
+            },
+            {
+                "id": ServiceCategoryID.GENERAL,
+                "name": ServiceCategoryName.GENERAL,
+                "risk": RiskLevel.MEDIUM,
+                "verification": False,
+                "admin": False,
+            },
+            {
+                "id": ServiceCategoryID.RESTRICTED,
+                "name": ServiceCategoryName.RESTRICTED,
+                "risk": RiskLevel.PROHIBITED,
+                "verification": True,
+                "admin": True,
+            },
+        ]
+
+        category_map = {}
+        for cat in categories_data:
+            category, created = ServiceCategory.objects.update_or_create(
+                category_id=cat["id"],
+                defaults={
+                    "name": cat["name"],
+                    "risk_level": cat["risk"],
+                    "requires_verification": cat["verification"],
+                    "requires_admin_approval": cat["admin"],
+                },
+            )
+            category_map[cat["id"]] = category
+            msg = "Created" if created else "Updated"
+            self.stdout.write(self.style.SUCCESS(f"{msg} Category: {category.name}"))
+
+        self.stdout.write(self.style.WARNING("\nSeeding Groups & Services..."))
+
+        groups_data = [
+    {
+        "group_id": "BEA001",
+        "name": "Beauty & Personal Care",
+        "category": ServiceCategoryID.PERSONAL_BODY,
+        "services": ["Makeup Technician", "Hairdresser", "Nail Technician", "Barber", "Skincare Specialist", "Tattoo Artist"],
+    },
+    {
+        "group_id": "SEC001", # High Risk Group
+        "name": "Security & Protection",
+        "category": ServiceCategoryID.HIGH_STAKES,
+        "services": ["Armed Guard", "Bodyguard", "Security System Installer", "Private Investigator"],
+    },
+    {
+        "group_id": "FOD001",
+        "name": "Catering & Food",
+        "category": ServiceCategoryID.EVENTS_MEDIA,
+        "services": ["Private Chef", "Cake Baker", "Catering", "Spit Braai Specialist"],
+    },
+    {
+        "group_id": "AUT001",
+        "name": "Automotive Services",
+        "category": ServiceCategoryID.DOMESTIC,
+        "services": ["Mechanic", "Car Wash", "Auto Electrician", "Towing Service", "Tyre Specialist"],
+    },
+    {
+        "group_id": "HOL001",
+        "name": "Household Support",
+        "category": ServiceCategoryID.DOMESTIC,
+        "services": ["House Cleaner", "Laundry Helper", "Gardener", "Plumber", "Electrician", "Handyman", "Carpenter", "Painter", "Mover"],
+    },
+    {
+        "group_id": "LOG001",
+        "name": "Logistics & Transport",
+        "category": ServiceCategoryID.GENERAL,
+        "services": ["Runner"],
+    },
+    {
+        "group_id": "FIT001",
+        "name": "Fitness & Wellness",
+        "category": ServiceCategoryID.GENERAL,
+        "services": ["Personal Trainer", "Yoga Instructor", "Pilates Instructor", "Nutrition", "Massage Therapist", "Chiropractor", "Acupuncturist", "Reiki Practitioner"],
+    },
+    {
+        "group_id": "PRO001",
+        "name": "Professional & Business Services",
+        "category": ServiceCategoryID.GENERAL,
+        "services": ["Private Tutor", "Graphic Designer", "IT Technician", "Accountant", "Translator", "Marketing Specialist", "Legal Consultant", "CV Writer"],
+    },
+    {
+        "group_id": "ENT001",
+        "name": "Entertainment",
+        "category": ServiceCategoryID.EVENTS_MEDIA,
+        "services": ["DJ", "Photographer", "Videographer", "Event Host", "Magician", "Party Planner", "Sound Technician"],
+    },
+    {
+        "group_id": "OTH001",
+        "name": "Other",
+        "category": ServiceCategoryID.OTHER,
+        "services": ["Tutor", "Babysitter", "Pet Sitter", "General Labourer"],
+    },
+]
+
+        for group_data in groups_data:
+            category = category_map[group_data["category"]]
+
+            group, created = ServiceGroup.objects.update_or_create(
+                group_id=group_data["group_id"],
+                defaults={"name": group_data["name"], "category": category},
+            )
+
+            msg = "Created" if created else "Updated"
+            self.stdout.write(self.style.SUCCESS(f"{msg} Group: {group.name}"))
+
+            for service_name in group_data["services"]:
+                service, created = Service.objects.get_or_create(
+                    service_name=service_name.strip(),
+                    service_group=group,
+                    defaults={"review_status": "APPROVED"},
+                )
+                service.save()  # enforce inherited risk
+                action = "Added" if created else "Exists"
+                self.stdout.write(f"{action} Service: {service.service_name} ({service.risk_level})")
+
+        # -----------------------------
+        # PROHIBITED KEYWORDS
+        # -----------------------------
+        self.stdout.write(self.style.WARNING("\nSeeding Prohibited Keywords..."))
+        prohibited_keywords = [
+            # adult/illegal/prohibited terms...
+            "escort", "prostitute", "prostitution", "sexual service", "sex worker", "happy ending", "erotic massage", "sex", "porn", "nudes",
+            "intimate service", "adult service", "sensual massage", "adult entertainment", "sex work", "porn service", 
+            "xxx service", "weed", "marijuana", "cannabis", "coke", "cocaine", "heroin", "meth", "methamphetamine", "drug delivery", 
+            "narcotics", "ecstasy", "lsd", "opioid", "illegal drugs", "pill selling", "isibhamu", "gun for hire", "illegal firearm", "weapon sale",
+              "gun sale", "arms trade", "firearm trafficking", "inkabi","killer", "kill people","hitman", "fake id", "forged documents",
+                "identity fraud", "scam service", "phishing", "credit card fraud", "counterfeit", "imitation documents", "fake passport", "fraudulent service", "hacking service", "cybercrime", "illegal software", 
+                "pirated software", "smuggling","indunu","umdidi","ingquza", "inquza", "only fans", "only-fans", "thengisa ingquza",
+                "ngithengisa ingquza","thengisa inquza","ngithengisa inquza", "ngithengisa umdidi","isitho", "isitho esingaseze", 
+                "hookup", "strip club", "lap dance", "webcam service", "camgirl", "sugar daddy", "sugar baby", "blesser", "blessee", 
+                "adult chat", "massage parlor", "body to body", "B2B massage", "nude photos", "send nudes", "sexting", "ukudayisa umzimba", 
+                "thengisa umzimba", "ukuphinga", "dagga", "nyaope", "wunga", "crystal tik", "tik", "rock cocaine", "crack", "shrooms", "magic mushrooms", "lsd tabs", "xanax", "codeine syrup", 
+                "lean drink", "tramadol", "abortion pills", "cytotec", "mizoprostol", "zaza", "hubbly flavors nicotine", 
+                "assassination", "contract killer", "ukubulala", "idubula", "ukushaya", "hostage", "kidnapping", "protection money", 
+                "extortion", "debt collection force", "hijacking", "stolen goods", "hot property", "izimoto ezitshontshiwe", 
+                "money laundering", "wash wash", "black dollars", "ssd solution", "cloned cards", "carding", "money mule", 
+                "pyramid scheme", "ponzi", "invest and get double", 
+                "binary options trading", "forex signals scam", "bitcoin doubler", "account hacking", "bank login", "stolen id",
+                  "social engineering", "human organs", "kidney sale", "ivory", "rhino horn", "imfezi", "muthi for luck", 
+                  "bring back lost lover", "get rich quick muthi", "traditional healer luck", "penis enlargement", "hips and bum cream"
 
         ]
-            }
-        ]
 
-        with transaction.atomic():
-            for group_data in service_groups:
-                group_id = group_data['group_id']
-                name = group_data['name']
-                services = group_data['services']
+        for word in prohibited_keywords:
+            obj, created = ServiceKeyword.objects.get_or_create(
+                keyword=word.lower().strip(),
+                defaults={"service": None, "is_prohibited": True, "risk_level": RiskLevel.PROHIBITED},
+            )
+            if created:
+                self.stdout.write(f"🚫 Prohibited keyword added: {word}")
 
-                # First, try get by group_id
-                group = ServiceGroup.objects.filter(group_id=group_id).first()
+        # -----------------------------
+        # SERVICE SYNONYMS
+        # -----------------------------
+        self.stdout.write(self.style.WARNING("\nSeeding Service Synonyms..."))
+        service_synonyms = {
+    "House Cleaner": ["maid", "cleaner", "domestic worker", "housekeeping", "cleaning service"],
+    "Hairdresser": ["hairstylist", "hair stylist", "barber", "hair salon", "hair treatment"],
+    "Makeup Technician": ["makeup artist", "mua", "beauty artist", "bridal makeup", "special effects makeup"],
+    "DJ": ["disc jockey", "music dj", "deejay", "event dj"],
+    "Nail Technician": ["nail tech", "manicurist", "pedicurist", "nail salon"],
+    "Plumber": ["pipe repair", "plumbing service", "leak repair", "drain cleaning"],
+    "Electrician": ["electrical repair", "wiring", "circuit repair", "electrical maintenance"],
+    "Gardener": ["landscaper", "yard work", "lawn care", "garden maintenance"],
+    "Painter": ["house painter", "wall painting", "interior painter", "exterior painter"],
+    "Private Tutor": ["teacher", "private lessons", "academic support", "tutor", "coaching"],
+    "Graphic Designer": ["logo design", "branding", "digital artist", "illustrator"],
+    "IT Technician": ["computer repair", "tech support", "pc doctor", "network setup"],
+    "Accountant": ["bookkeeper", "tax consultant", "auditor", "financial advisor"],
+    "Translator": ["language service", "interpreting", "document translation"],
+    "Marketing Specialist": ["social media manager", "digital marketing", "seo expert", "content creator"],
+    "Armed Guard": ["security guard", "bouncer", "armed response", "protection officer", "psira"],
+    "Bodyguard": ["personal protection", "close protection", "cpo", "vip guard"],
+    "Security System Installer": ["alarm installer", "cctv technician", "electric fence installer", "gate motor repair"],
+    "Personal Trainer": ["fitness coach", "gym instructor", "workout partner", "personal training"],
+    "Massage Therapist": ["massage", "spa", "deep tissue", "reflexology"],
+    "Babysitter": ["nanny", "childcare", "au pair"],
+}
 
-                if group:
-                    if group.name != name:
-                        # Check if another group already has this name
-                        name_conflict = ServiceGroup.objects.filter(name=name).exclude(group_id=group_id).exists()
-                        if name_conflict:
-                            self.stdout.write(self.style.ERROR(
-                                f"❌ Conflict: Name '{name}' is used by another group. Skipping group_id: {group_id}"
-                            ))
-                            continue
-                        group.name = name
-                        group.save()
-                        self.stdout.write(self.style.SUCCESS(f"🔄 Updated name of group {group_id} to {name}"))
-                    else:
-                        self.stdout.write(self.style.WARNING(f"⚠️ Group already exists: {name} ({group_id})"))
-                else:
-                    # Check if name exists under another group_id
-                    existing_by_name = ServiceGroup.objects.filter(name=name).first()
-                    if existing_by_name:
-                        self.stdout.write(self.style.ERROR(
-                            f"❌ Conflict: Group name '{name}' already exists with different ID ({existing_by_name.group_id}). Skipping."
-                        ))
-                        continue
-                    group = ServiceGroup.objects.create(group_id=group_id, name=name)
-                    self.stdout.write(self.style.SUCCESS(f"🆕 Created group: {name} ({group_id})"))
+        for service_name, keywords in service_synonyms.items():
+            service = Service.objects.filter(service_name__iexact=service_name).first()
+            if not service:
+                self.stdout.write(self.style.WARNING(f"⚠ Service not found: {service_name}"))
+                continue
 
-                # Process services
-                for service_data in services:
-                    service_name = service_data['service_name'].strip().title()
-                   
+            for word in keywords:
+                obj, created = ServiceKeyword.objects.get_or_create(
+                    keyword=word.lower().strip(),
+                    defaults={"service": service, "is_prohibited": False, "risk_level": service.risk_level},
+                )
+                if created:
+                    self.stdout.write(f"+ Synonym added: {word} → {service.service_name}")
 
-                    service, service_created = Service.objects.get_or_create(
-                        service_name=service_name,
-                        service_group=group,
-                       
-                    )
-
-                    if service_created:
-                        self.stdout.write(f"   ✅ Added service: {service_name}")
-                    else:
-                        updated = False
-
-                        msg = "🔁 Service already exists"
-                       
-                        self.stdout.write(f"   {msg}: {service_name} (ID: {service.pk})")
-
-        self.stdout.write(self.style.SUCCESS('\n✅ All service groups and services seeded successfully!'))
+        self.stdout.write(self.style.SUCCESS("\nAll categories, groups, services, and keywords seeded successfully!"))

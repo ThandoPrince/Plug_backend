@@ -70,10 +70,16 @@ class Address(models.Model):
 
 
 class ClientAuth(models.Model):
-    email_address = models.EmailField(primary_key=True, max_length=100)
+    id = models.AutoField(primary_key=True)
+    email_address = models.EmailField(unique=True, max_length=100)
     mobile_number = models.CharField(max_length=60, default='0719503706')
     password = models.CharField(max_length=128)
-    is_profile_completed = models.BooleanField(default=False)
+    Profile_CHOICES = [
+        ("in-details", "In-Details"),
+        ("in-address", "In-Address"),
+        ("completed", "Completed"),
+    ]
+    is_profile_completed = models.CharField(default="in-details", choices=Profile_CHOICES, max_length= 20)
 
 
     def __str__(self):
@@ -134,6 +140,7 @@ class ClientSession(models.Model):
 
 class ClientAddress(models.Model):
     id = models.AutoField(auto_created=True, primary_key=True)
+    is_active = models.BooleanField(default=True)
 
     RESIDENTIAL = "Residential Address"
     VACATION = "Vacation Address"
@@ -143,8 +150,8 @@ class ClientAddress(models.Model):
         (VACATION, "Vacation Address"),
     ]
 
-    client = models.ForeignKey(ClientDetails, on_delete=models.CASCADE)
-    address = models.ForeignKey(Address, on_delete=models.CASCADE)
+    client = models.ForeignKey("ClientDetails", on_delete=models.CASCADE)
+    address = models.ForeignKey("Address", on_delete=models.CASCADE)
 
     # User-controlled flags
     is_owner = models.BooleanField(
@@ -174,20 +181,16 @@ class ClientAddress(models.Model):
     class Meta:
         unique_together = ('client', 'address')
 
+    # --------------------------------------------------
+    # VALIDATION
+    # --------------------------------------------------
     def clean(self):
-        # Only one default per client
-        if self.is_default:
-            other_defaults = ClientAddress.objects.filter(
-                client=self.client,
-                is_default=True
-            ).exclude(pk=self.pk)
+        """
+        Business validation only.
+        Do NOT validate default uniqueness here.
+        """
 
-            if other_defaults.exists():
-                raise ValidationError(
-                    "Each client can only have one default address."
-                )
-
-        
+        # Maximum 2 owners per address
         if self.is_owner:
             owner_count = ClientAddress.objects.filter(
                 address=self.address,
@@ -199,17 +202,21 @@ class ClientAddress(models.Model):
                     "Only two clients can be marked as owners of this address."
                 )
 
-    def save(self, *args, **kwargs):
-        self.full_clean()
 
-        # Remove automatic role escalation
-        # Super user now controlled by document verification
+    def save(self, *args, **kwargs):
+        """
+        Automatically ensure only one default per client.
+        """
+
 
         if self.is_default:
             ClientAddress.objects.filter(
                 client=self.client,
                 is_default=True
             ).exclude(pk=self.pk).update(is_default=False)
+
+        # Now run validation AFTER fixing defaults
+        self.full_clean()
 
         super().save(*args, **kwargs)
 
@@ -231,11 +238,11 @@ class AddressSuperUserVerification(models.Model):
     )
 
     proof_of_residence = models.FileField(
-        upload_to="address_verifications/proof_of_residence/"
+        upload_to="media/address_verifications/proof_of_residence/"
     )
 
     id_document = models.ImageField(
-        upload_to="address_verifications/id_documents/"
+        upload_to="media/address_verifications/id_documents"
     )
 
     status = models.CharField(
@@ -274,7 +281,7 @@ class PendingAddressApproval(models.Model):
     address = models.ForeignKey(Address, on_delete=models.CASCADE)
     requested_by = models.ForeignKey(ClientDetails, on_delete=models.CASCADE)
     owner = models.ForeignKey(ClientDetails, related_name='approver', on_delete=models.CASCADE)
-    status = models.CharField(choices=[('pending', 'Pending'), ('approved', 'Approved'), ('rejected', 'Rejected')], default='pending')
+    status = models.CharField(choices=[('pending', 'Pending'), ('approved', 'Approved'), ('rejected', 'Rejected')], default='pending', max_length=50)
     created_at = models.DateTimeField(auto_now_add=True)
     id = models.AutoField(auto_created=True, primary_key=True)
 
