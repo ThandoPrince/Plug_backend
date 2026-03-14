@@ -1,0 +1,29 @@
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.sqlite3
+db.sqlite3
+*.log
+.env
+.env.*
+!.env.example
+
+# Virtual environments
+myenv/
+venv/
+.venv/
+env/
+
+# Django static/media generated files
+staticfiles/
+media/
+*.pem
+*.key
+config/*firebase-adminsdk*.json
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
