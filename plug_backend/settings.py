@@ -12,7 +12,7 @@ def get_env(name: str, default: str | None = None, required: bool = False) -> st
         raise ValueError(f"Missing required environment variable: {name}")
     return value
 
-SECRET_KEY = get_env("DJANGO_SECRET_KEY", required=False)
+SECRET_KEY = get_env("DJANGO_SECRET_KEY", required=True)
 DEBUG = get_env("DJANGO_DEBUG", "False").lower() == "true"
 
 ALLOWED_HOSTS = [
