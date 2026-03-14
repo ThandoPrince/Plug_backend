@@ -1,0 +1,1 @@
+web: gunicorn plug_backend.wsgi:application
