@@ -1,3 +1,5 @@
+from datetime import datetime, timedelta
+
 from rest_framework import serializers
 from django.utils import timezone
 
@@ -160,9 +162,7 @@ class ClientEmailField(serializers.SlugRelatedField):
 
 
 
-
 class OrderServiceWriteSerializer(serializers.ModelSerializer):
-
     client = ClientEmailField(
         queryset=ClientDetails.objects.all(),
         slug_field='client_profile.email_address'
@@ -179,7 +179,6 @@ class OrderServiceWriteSerializer(serializers.ModelSerializer):
         allow_null=True
     )
 
-    # 🔥 IMPORTANT: accept raw emails instead of SlugRelatedField
     invited_providers = serializers.ListField(
         child=serializers.EmailField(),
         write_only=True,
@@ -211,47 +210,63 @@ class OrderServiceWriteSerializer(serializers.ModelSerializer):
             )
         return value
 
+    def validate(self, attrs):
+        requested_date = attrs.get("requested_date")
+        requested_time = attrs.get("requested_date_time")
+
+        if not requested_date:
+            raise serializers.ValidationError({
+                "requested_date": "Requested date is required."
+            })
+
+        if not requested_time:
+            raise serializers.ValidationError({
+                "requested_date_time": "Requested time is required."
+            })
+
+        requested_datetime = datetime.combine(
+            requested_date,
+            requested_time
+        )
+
+        if timezone.is_naive(requested_datetime):
+            requested_datetime = timezone.make_aware(
+                requested_datetime,
+                timezone.get_current_timezone()
+            )
+
+        minimum_allowed_time = timezone.now() + timedelta(hours=1)
+
+        if requested_datetime < minimum_allowed_time:
+            raise serializers.ValidationError({
+                "requested_date_time": (
+                    "Booking must be scheduled at least 1 hour from now."
+                )
+            })
+
+        return attrs
+
     def create(self, validated_data):
         invited_emails = validated_data.pop("invited_providers", [])
         request = self.context.get("request")
         service_required = validated_data.get("service_required")
 
-        # Create order first
-        order = OrderService.objects.create(**validated_data)
-
-        # 🔥 CRITICAL FIX:
-        # filter by BOTH email and service
         provider_services = ProviderService.objects.filter(
             provider__sp_profile__email_address__in=invited_emails,
             service=service_required
         )
 
-        # Optional safety check
         if len(provider_services) != len(invited_emails):
             raise serializers.ValidationError(
                 "One or more invited providers do not offer this service."
             )
 
-        # Set many-to-many
+        order = OrderService.objects.create(**validated_data)
+
         order.invited_providers.set(provider_services)
 
-        # Create negotiations
-        if order.proposal_price:
-            for provider_service in provider_services:
-                negotiation = Negotiation.objects.create(
-                    service_order=order,
-                    provider_for_negotiation=provider_service,
-                    proposed_price=order.proposal_price
-                )
+        
 
-                NegotiationRound.objects.create(
-                    negotiation=negotiation,
-                    sender_type="client",
-                    offered_price=order.proposal_price,
-                    message="Initial proposal"
-                )
-
-        # Handle uploaded pictures
         if request and hasattr(request, "FILES"):
             for file in request.FILES.getlist("service_pictures"):
                 ServicePicture.objects.create(
@@ -271,6 +286,20 @@ class ShipmentReadSerializer(serializers.ModelSerializer):
         model = Shipment
         fields = '__all__'
         read_only_fields = ['shipment_id', 'created_at']
+
+class OrderFinalPricePatchSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = OrderService
+        fields = ['final_price']
+
+    def validate_final_price(self, value):
+        if value is None:
+            raise serializers.ValidationError("Final price is required.")
+
+        if value < 0:
+            raise serializers.ValidationError("Final price cannot be negative.")
+
+        return value
 
 class ShipmentWriteSerializer(serializers.ModelSerializer):
     class Meta:

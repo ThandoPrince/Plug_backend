@@ -15,10 +15,15 @@ from rest_framework.decorators import api_view, parser_classes
 from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 from rest_framework.response import Response
 
+from api.clientsDB.models.models import DeviceToken
 from api.serviceProvidersDB.services.service_validator import validate_service_submission
-from .models import CostOfService, ProviderService, SPLiveLocation, SPLocationHistory, SPProfile, ServiceGroup, Service, ServiceProvider, Address
+from .models import CostOfService, CostOfServiceImage, ProviderService, SPLiveLocation, SPLocationHistory, SPProfile, ServiceGroup, Service, ServiceProvider, Address
 from .serializers import (
+    CostOfServiceImageReadSerializer,
+    CostOfServiceImageWriteSerializer,
     CostOfServiceSerializer,
+    DeviceTokenWriteSerializer,
+    ProviderSeviceSerializer,
     SPAddressDocumentWriteSerializer,
     SPLiveLocationSerializer,
     SPLoginSerializer,
@@ -80,6 +85,7 @@ def sp_login(request):
 def sp_add_address_document(request):
     print("FILES RECEIVED:", request.FILES)
     print("POST DATA:", request.data)
+
     address_raw = request.data.get('address')
 
     if not address_raw:
@@ -99,93 +105,124 @@ def sp_add_address_document(request):
     }
 
     serializer = SPAddressDocumentWriteSerializer(data=clean_data)
+
     if not serializer.is_valid():
         print("SERIALIZER ERRORS:", serializer.errors)
         return Response(
             {"success": False, "errors": serializer.errors},
             status=400
-    )
+        )
 
-    if serializer.is_valid():
-        try:
-            with transaction.atomic():
-                service_provider = serializer.save()
+    try:
+        with transaction.atomic():
+            service_provider = serializer.save()
 
-            return Response({
-                "success": True,
-                "message": "Registration completed successfully.",
-                "provider_id": service_provider.sp_profile_id
-            }, status=status.HTTP_201_CREATED)
-        
+            # Move onboarding to next step
+            sp_profile = service_provider.sp_profile
+            sp_profile.is_profile_completed = "in-services"
+            sp_profile.save(update_fields=["is_profile_completed"])
 
-        except Exception as e:
+        return Response({
+            "success": True,
+            "message": "Registration completed successfully.",
+            "provider_id": service_provider.sp_profile_id,
+            "profile_status": sp_profile.is_profile_completed
+        }, status=status.HTTP_201_CREATED)
 
-            return Response({"success": False, "error": str(e)}, status=400)
-
- 
-    return Response({"success": False, "errors": serializer.errors}, status=400)
+    except Exception as e:
+        return Response(
+            {"success": False, "error": str(e)},
+            status=400
+        )
 
 
 
 
 @api_view(['POST'])
 def sp_register(request):
-   
+
     serializer = SPProfileWriteSerializer(data=request.data)
-    
-  
+
     if not serializer.is_valid():
         return Response(
             {
                 "success": False,
                 "message": "Validation failed",
                 "errors": serializer.errors
-            }, 
+            },
             status=status.HTTP_400_BAD_REQUEST
         )
 
     try:
-        # 2. Use Atomic Transaction to ensure database consistency
         with transaction.atomic():
-            sp_profile = serializer.save()
-            
+
+            sp_profile = serializer.save(
+                is_profile_completed="in-details"
+            )
+
         return Response(
             {
                 "success": True,
                 "message": "Service Provider registered successfully.",
                 "data": {
                     "email": sp_profile.email_address,
-                    "mobile": sp_profile.mobile_number
+                    "mobile": sp_profile.mobile_number,
+                    "profile_status": sp_profile.is_profile_completed
                 }
-            }, 
+            },
             status=status.HTTP_201_CREATED
         )
 
     except IntegrityError:
-       
+
         return Response(
             {
                 "success": False,
                 "message": "An account with this email or mobile already exists."
-            }, 
+            },
             status=status.HTTP_409_CONFLICT
         )
 
     except Exception as e:
-        # 4. Professional Error Logging (Don't leak raw 'e' to the user)
+
         logger.error(f"Registration Error: {str(e)}")
+
         return Response(
             {
                 "success": False,
                 "message": "A server error occurred. Please try again later."
-            }, 
+            },
             status=status.HTTP_500_INTERNAL_SERVER_ERROR
         )
+    
+@api_view(['POST'])
+def register_device_token(request):
+    serializer = DeviceTokenWriteSerializer(
+        data=request.data,
+        context={'request': request},
+    )
+
+    if not serializer.is_valid():
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+    token = serializer.validated_data["fcm_token"]
+
+    # Remove duplicate tokens across all providers
+    DeviceToken.objects.filter(fcm_token=token).delete()
+
+    device_token = serializer.save()
+
+    return Response(
+        {
+            "message": "Device token registered successfully",
+            "token_id": device_token.id,
+        },
+        status=status.HTTP_201_CREATED,
+    )
 
 @api_view(["PATCH"])
 def patch_sp_profile_by_email(request, email):
     try:
-        # Optimization: select_related joins the tables in one SQL query
         service_provider = ServiceProvider.objects.select_related('sp_profile').get(
             sp_profile__email_address=email
         )
@@ -195,34 +232,39 @@ def patch_sp_profile_by_email(request, email):
             "message": "Service Provider profile not found."
         }, status=status.HTTP_404_NOT_FOUND)
 
-    # Note: request.data handles both JSON and Multipart (Images)
     serializer = ServiceProviderPatchSerializer(
         service_provider,
         data=request.data,
         partial=True,
-        context={'request': request} # Helps in returning absolute image URLs
+        context={'request': request}
     )
 
     if serializer.is_valid():
         try:
-            # The transaction.atomic inside the serializer's update() 
-            # handles the database safety.
             serializer.save()
+
+            # Update onboarding step after successful details completion
+            sp_profile = service_provider.sp_profile
+            service_provider.sp_profile.is_profile_completed = "in-address"
+            sp_profile.save(update_fields=["is_profile_completed"])
+
             return Response({
                 "success": True,
                 "message": "Profile updated successfully.",
-                "data": serializer.data
+                "data": {
+                    **serializer.data,
+                    "profile_status": sp_profile.is_profile_completed,
+                }
             }, status=status.HTTP_200_OK)
+
         except Exception as e:
-            # Log the error for debugging, but hide it from the user
             import logging
             logging.getLogger(__name__).error(f"Patch Error: {str(e)}")
             return Response({
-                "success": False, 
+                "success": False,
                 "message": "A server error occurred while saving your data."
             }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
-    # Return structured errors so Flutter can map them to fields
     return Response({
         "success": False,
         "message": "Please fix the errors below.",
@@ -237,7 +279,7 @@ def approved_services_list(request):
     Return only APPROVED services.
     """
     services = Service.objects.filter(
-        review_status="Pending"
+        review_status="APPROVED"
     ).select_related("service_group")
 
     serializer = ServiceReadSerializer(services, many=True)
@@ -260,7 +302,7 @@ def submit_service(request, email):
             status=status.HTTP_400_BAD_REQUEST
         )
 
-    #   Get Provider
+    # Get Provider
     try:
         provider = ServiceProvider.objects.select_related('sp_profile').get(
             sp_profile__email_address=email
@@ -271,7 +313,7 @@ def submit_service(request, email):
             status=status.HTTP_404_NOT_FOUND
         )
 
-    #  Validate Service Submission
+    # Validate Service Submission
     validation = validate_service_submission(service_name, description)
 
     if validation["status"] == "rejected":
@@ -283,15 +325,14 @@ def submit_service(request, email):
     try:
         with transaction.atomic():
 
-            #  If Service Already Exists
+            # If Service Already Exists
             if validation["status"] == "exists":
 
                 service = validation["service"]
 
-                # Prevent duplicate linking manually for clarity
                 if ProviderService.objects.filter(
-                        provider=provider,
-                        service=service
+                    provider=provider,
+                    service=service
                 ).exists():
                     return Response(
                         {"error": "Service already linked to this provider."},
@@ -303,13 +344,17 @@ def submit_service(request, email):
                     service=service
                 )
 
+                provider.sp_profile.is_profile_completed = "in-cost"
+                provider.sp_profile.save(update_fields=["is_profile_completed"])
+
                 return Response({
                     "status": "linked_existing",
                     "is_primary": provider_service.is_primary,
-                    "service": ServiceReadSerializer(service).data
+                    "service": ServiceReadSerializer(service).data,
+                    "profile_status": provider.sp_profile.is_profile_completed
                 }, status=status.HTTP_200_OK)
 
-            #  New Service Creation Requires Group
+            # New Service Creation Requires Group
             if not service_group_id:
                 return Response(
                     {"error": "service_group is required for new service."},
@@ -326,14 +371,13 @@ def submit_service(request, email):
                     status=status.HTTP_400_BAD_REQUEST
                 )
 
-            
             review_status = (
                 "PENDING"
                 if validation["status"] == "requires_review"
                 else "APPROVED"
             )
 
-            # 5️⃣ Create Service
+            # Create Service
             service = Service.objects.create(
                 service_name=service_name.strip().title(),
                 description=description,
@@ -342,20 +386,23 @@ def submit_service(request, email):
                 risk_level=service_group.category.risk_level
             )
 
-            # 6️⃣ Link Provider to Service
+            # Link Provider to Service
             provider_service = ProviderService.objects.create(
                 provider=provider,
                 service=service
             )
 
+            provider.sp_profile.is_profile_completed = "in-cost"
+            provider.sp_profile.save(update_fields=["is_profile_completed"])
+
             return Response({
                 "status": validation["status"],
                 "is_primary": provider_service.is_primary,
-                "service": ServiceReadSerializer(service).data
+                "service": ServiceReadSerializer(service).data,
+                "profile_status": provider.sp_profile.is_profile_completed
             }, status=status.HTTP_201_CREATED)
 
     except ValidationError as e:
-        
         return Response(
             {"error": e.message_dict if hasattr(e, "message_dict") else str(e)},
             status=status.HTTP_400_BAD_REQUEST
@@ -369,9 +416,8 @@ def submit_service(request, email):
     
 @api_view(['PATCH'])
 def update_cost_of_service(request, email, service_id):
-
     try:
-        provider = ServiceProvider.objects.get(
+        provider = ServiceProvider.objects.select_related('sp_profile').get(
             sp_profile__email_address=email
         )
     except ServiceProvider.DoesNotExist:
@@ -408,13 +454,18 @@ def update_cost_of_service(request, email, service_id):
             cost.notes = notes
             cost.save()
 
+        provider.sp_profile.is_profile_completed = "completed"
+        provider.sp_profile.save(update_fields=["is_profile_completed"])
+
         return Response({
             "success": True,
             "cost_of_service": {
-                "base_price": str(cost.base_price),
+                "id": cost.id,
+                "base_price": str(cost.base_price) if cost.base_price is not None else None,
                 "negotiable": cost.negotiable,
                 "notes": cost.notes,
-            }
+            },
+            "profile_status": provider.sp_profile.is_profile_completed
         }, status=200)
 
     except Exception as e:
@@ -457,6 +508,114 @@ def sp_profile_detail(request, email):
     elif request.method == 'DELETE':
         profile.delete()
         return Response(status=204)
+    
+@api_view(['PATCH'])
+def toggle_provider_active(request, email):
+    try:
+        provider = ServiceProvider.objects.get(
+            sp_profile__email_address=email
+        )
+    except ServiceProvider.DoesNotExist:
+        return Response(
+            {
+                "success": False,
+                "message": "Service provider not found",
+            },
+            status=status.HTTP_404_NOT_FOUND,
+        )
+
+    provider.is_active = not provider.is_active
+    provider.save(update_fields=['is_active'])
+
+    return Response(
+        {
+            "success": True,
+            "message": "Provider active status updated",
+            "is_active": provider.is_active,
+            "email": email,
+        },
+        status=status.HTTP_200_OK,
+    )
+
+@api_view(['GET'])
+def get_provider_services_by_email(request, email):
+    try:
+        provider = ServiceProvider.objects.get(
+            sp_profile__email_address=email
+        )
+    except ServiceProvider.DoesNotExist:
+        return Response(
+            {
+                "success": False,
+                "message": "Provider not found."
+            },
+            status=status.HTTP_404_NOT_FOUND
+        )
+
+    provider_services = ProviderService.objects.select_related(
+        'service',
+        'provider',
+        'cost_of_service',
+        'provider__sp_profile'
+    ).filter(provider=provider)
+
+    serializer = ProviderSeviceSerializer(provider_services, many=True)
+
+    return Response(
+        {
+            "success": True,
+            "count": provider_services.count(),
+            "data": serializer.data
+        },
+        status=status.HTTP_200_OK
+    )
+
+@api_view(['POST'])
+def upload_service_images(request, cost_id):
+    try:
+        cost = CostOfService.objects.get(id=cost_id)
+    except CostOfService.DoesNotExist:
+        return Response(
+            {"error": "CostOfService not found"},
+            status=404
+        )
+
+    images = request.FILES.getlist('images')
+
+    if not images:
+        return Response(
+            {"error": "No images provided"},
+            status=400
+        )
+
+    if cost.images.count() + len(images) > 5:
+        return Response(
+            {"error": "Maximum 5 images allowed"},
+            status=400
+        )
+
+    created_images = []
+
+    for img in images:
+        image = CostOfServiceImage.objects.create(
+            cost_of_service=cost,
+            image=img
+        )
+        created_images.append(image)
+
+    serializer = CostOfServiceImageReadSerializer(
+        created_images,
+        many=True,
+        context={'request': request},
+    )
+
+    return Response(
+        {
+            "success": True,
+            "images": serializer.data
+        },
+        status=201
+    )
 
 
 
@@ -506,8 +665,9 @@ def service_group_detail(request, group_id):
 
 @api_view(['GET'])
 def service_list(request):
-
-    services = Service.objects.annotate(
+    services = Service.objects.filter(
+        review_status="APPROVED"
+    ).annotate(
         active_provider_count=Count(
             'service_providers__provider',
             filter=Q(service_providers__provider__is_active=True),
@@ -767,20 +927,59 @@ def providers_by_service(request, service_id):
     return Response(serializer.data)
 
 @api_view(['GET'])
-def costs_by_sp_email(request, email):
+def get_cost_of_service_images_by_cost_id(request, cost_id):
+    try:
+        CostOfService.objects.get(id=cost_id)
+    except CostOfService.DoesNotExist:
+        return Response(
+            {"detail": "Cost of service not found."},
+            status=status.HTTP_404_NOT_FOUND
+        )
+
+    images = CostOfServiceImage.objects.filter(
+        cost_of_service_id=cost_id
+    ).order_by('-uploaded_at')
+
+    serializer = CostOfServiceImageReadSerializer(
+        images,
+        many=True,
+        context={'request': request}
+    )
+    return Response(serializer.data, status=status.HTTP_200_OK)
+
+@api_view(['GET'])
+def costs_by_sp_email(request, email, service_id=None):
     try:
         sp = ServiceProvider.objects.get(sp_profile__email_address=email)
     except ServiceProvider.DoesNotExist:
-        return Response({"detail": "Service provider not found."}, status=status.HTTP_404_NOT_FOUND)
+        return Response(
+            {"detail": "Service provider not found."},
+            status=status.HTTP_404_NOT_FOUND
+        )
 
-    # 🔹 fetch ProviderService objects linked to this SP
-    provider_services = ProviderService.objects.filter(provider=sp).select_related('service', 'cost_of_service')
+    provider_services = ProviderService.objects.select_related(
+        'service',
+        'cost_of_service'
+    ).filter(
+        provider=sp,
+        cost_of_service__isnull=False
+    )
 
-    # 🔹 extract only existing CostOfService objects
-    costs = [ps.cost_of_service for ps in provider_services if ps.cost_of_service is not None]
+    if service_id is not None:
+        try:
+            provider_service = provider_services.get(service_id=service_id)
+        except ProviderService.DoesNotExist:
+            return Response(
+                {"detail": "Cost of service not found for this provider and service."},
+                status=status.HTTP_404_NOT_FOUND
+            )
 
+        serializer = CostOfServiceSerializer(provider_service.cost_of_service)
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+    costs = [ps.cost_of_service for ps in provider_services]
     serializer = CostOfServiceSerializer(costs, many=True)
-    return Response(serializer.data)
+    return Response(serializer.data, status=status.HTTP_200_OK)
 
 
 

@@ -11,6 +11,8 @@ https://docs.djangoproject.com/en/5.2/ref/settings/
 """
 
 from pathlib import Path
+import os
+from dotenv import load_dotenv
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -89,8 +91,12 @@ WSGI_APPLICATION = 'plug_backend.wsgi.application'
 
 DATABASES = {
     'default': {
-        'ENGINE': 'django.db.backends.sqlite3',
-        'NAME': BASE_DIR / 'db.sqlite3',
+        'ENGINE': 'django.db.backends.postgresql',
+        'NAME': 'plug_db',
+        'USER': 'postgres',
+        'PASSWORD': 'Thando9920!',
+        'HOST': '127.0.0.1',
+        'PORT': '5432',
     }
 }
 
@@ -113,6 +119,15 @@ AUTH_PASSWORD_VALIDATORS = [
     },
 ]
 
+load_dotenv()
+
+HMS_APP_ID = "114790013"
+HMS_APP_SECRET = "22bf7dca728752c5b77691950c7ee6b0c149b1fb7a70c870fdb6ec217a449943"
+
+PROVIDER_HMS_APP_ID = "115435535"
+PROVIDER_HMS_APP_SECRET = "33269b12d97b276397a21f3fc54f92f456da31056cdae29ce535fc908a80b283"
+# settings.py
+FIREBASE_KEY_PATH = os.path.join(BASE_DIR, "config/plug-prj-firebase-adminsdk-fbsvc-c6badf007e.json")
 
 # Internationalization
 # https://docs.djangoproject.com/en/5.2/topics/i18n/

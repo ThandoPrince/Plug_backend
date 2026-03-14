@@ -8,8 +8,8 @@ from rest_framework.permissions import AllowAny
 
 
 # from rest_framework.permissions import IsAuthenticated
-from .models.models import ClientAuth, ClientDetails, Address, ClientAddress, ClientNotification 
-from .serializers import AddressClaimSerializer, AddressOnlySerializer, AddressVerificationCreateSerializer, ClientAddressNoDuplicatesSerializer, AddressSerializer, ClientAddressWriteSerializer, ClientAuthReadSerializer, ClientLoginSerializer, ClientProfileSerializer, ClientRegisterSerializer, ClientSerializer, ClientAddressSerializer, DefaultAddressSerializer
+from .models.models import ClientAuth, ClientDetails, Address, ClientAddress, ClientNotification, DeviceToken 
+from .serializers import AddressClaimSerializer, AddressOnlySerializer, AddressVerificationCreateSerializer, ClientAddressNoDuplicatesSerializer, AddressSerializer, ClientAddressWriteSerializer, ClientAuthReadSerializer, ClientLoginSerializer, ClientProfileSerializer, ClientRegisterSerializer, ClientSerializer, ClientAddressSerializer, DefaultAddressSerializer, DeviceTokenWriteSerializer
 
 @api_view(['POST'])
 def register_client(request):
@@ -202,7 +202,29 @@ def submit_address_verification(request, client_address_id):
     return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
 @api_view(['POST'])
+def register_device_token(request):
+    print("FILES RECEIVED:", request.FILES)
+    print("POST DATA:", request.data)   
+    serializer = DeviceTokenWriteSerializer(data=request.data, context={'request': request})
+    if not serializer.is_valid():
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+    token = serializer.validated_data["fcm_token"]
+
+    # Remove duplicate tokens across all users
+    DeviceToken.objects.filter(fcm_token=token).delete()
+
+    device_token = serializer.save()
+
+    return Response(
+        {"message": "Device token registered successfully", "token_id": device_token.id},
+        status=status.HTTP_201_CREATED
+    )
+
+@api_view(['POST'])
 def client_login(request):
+    print("FILES RECEIVED:", request.FILES)
+    print("POST DATA:", request.data)
     serializer = ClientLoginSerializer(data=request.data)
     if serializer.is_valid():
         user = serializer.validated_data['user']
@@ -215,7 +237,6 @@ def client_login(request):
             "is_profile_completed": user.is_profile_completed,
         }, status=status.HTTP_200_OK)
 
-    # Return structured errors
     return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
 

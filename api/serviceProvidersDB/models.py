@@ -138,7 +138,14 @@ class SPProfile(models.Model):
     email_address = models.EmailField(unique=True)
     password = models.CharField(max_length=128)
     mobile_number = models.CharField(max_length=20, unique=True, null=True)
-    is_profile_completed = models.BooleanField(default=False)
+    Profile_CHOICES = [
+        ("in-details", "In-Details"),
+        ("in-address", "In-Address"),
+        ("in-services", "In-Services"),
+        ("in-cost", "In-Cost"),
+        ("completed", "Completed"),
+    ]
+    is_profile_completed = models.CharField(default="in-details", choices=Profile_CHOICES, max_length= 20)
     is_active = models.BooleanField(default=True)
 
     def set_password(self, raw_password):
@@ -147,8 +154,7 @@ class SPProfile(models.Model):
     def __str__(self):
         return f"SPProfile: {self.email_address}"
 
-    def __str__(self):
-        return f"SPProfile: {self.email_address}"
+    
     
 class ServiceProvider(models.Model):
     rating = models.DecimalField(max_digits=3, decimal_places=2, null=True, blank=True, default=0.0)
@@ -160,8 +166,6 @@ class ServiceProvider(models.Model):
     is_active = models.BooleanField(default=True)
     location = models.ForeignKey(Address, on_delete=models.SET_NULL, null=True)
     sp_profile = models.OneToOneField(SPProfile, on_delete=models.CASCADE, primary_key=True)
-    
-    
 
     def service_provider_upload_path(instance, filename):
         
@@ -169,6 +173,50 @@ class ServiceProvider(models.Model):
         return f"profile_images/providers/{safe_email}/{filename}"
 
     profile_image = models.ImageField(upload_to=service_provider_upload_path, null=True, blank=True)
+
+
+class DeviceToken(models.Model):
+    DEVICE_TYPES = (
+        ("android", "Android"),
+        ("ios", "iOS"),
+        ("web", "Web"),
+        ("huawei", "Huawei"),
+    )
+
+    PROVIDER_TYPES = (
+        ("firebase", "Firebase Cloud Messaging"),
+        ("huawei", "Huawei Push Kit"),
+    )
+
+    provider = models.CharField(
+        max_length=20,
+        choices=PROVIDER_TYPES,
+        default="firebase"
+    )
+
+    service_provider = models.ForeignKey(
+        'SPProfile',
+        on_delete=models.CASCADE,
+        related_name="device_tokens"
+    )
+
+    fcm_token = models.CharField(max_length=512)
+    device_type = models.CharField(max_length=20, choices=DEVICE_TYPES)
+    device_name = models.CharField(max_length=100, blank=True, null=True)
+    os_version = models.CharField(max_length=50, blank=True, null=True)
+    app_version = models.CharField(max_length=20, blank=True, null=True)
+    last_seen = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["service_provider", "fcm_token"],
+                name="unique_token_per_service_provider"
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.service_provider.email_address} - {self.device_name or self.device_type}"
     
 class CostOfService(models.Model):
     base_price = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
@@ -178,6 +226,36 @@ class CostOfService(models.Model):
     
     def __str__(self):
         return f"Base Price: {self.base_price}"
+    
+
+
+
+class CostOfServiceImage(models.Model):
+    cost_of_service = models.ForeignKey(
+        'CostOfService',
+        on_delete=models.CASCADE,
+        related_name='images'
+    )
+
+    image = models.ImageField(upload_to='service_images/')
+
+    uploaded_at = models.DateTimeField(auto_now_add=True)
+
+    def save(self, *args, **kwargs):
+        if self.cost_of_service_id:
+            existing_count = CostOfServiceImage.objects.filter(
+                cost_of_service_id=self.cost_of_service_id
+            ).count()
+
+            if existing_count >= 5 and not self.pk:
+                raise ValidationError(
+                    "Maximum of 5 images allowed per service."
+                )
+
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return f"Service Image {self.id} for Cost {self.cost_of_service_id}"
     
 
 

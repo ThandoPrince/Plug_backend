@@ -1,6 +1,6 @@
 from django.contrib import admin
 from .models import (
-    Address, ServiceGroup, Service, ServiceKeyword, ServiceProvider, SPProfile,
+    Address, DeviceToken, ServiceGroup, Service, ServiceKeyword, ServiceProvider, SPProfile,
     ProviderService, CostOfService, SPLiveLocation, SPLocationHistory,
     ServiceProviderAvailability, SupportingDocument, ServiceCategory
 )
@@ -137,6 +137,22 @@ class ServiceProviderAdmin(admin.ModelAdmin):
     def safe_location(self, obj):
         return str(obj.location) if obj.location else "No Location"
     safe_location.short_description = "Location"
+
+@admin.register(DeviceToken)
+class DeviceTokenAdmin(admin.ModelAdmin):
+    list_display = ('owner_email_or_username', 'device_type', 'device_name', 'os_version', 'app_version', 'last_seen')
+    search_fields = ('service_provider__email_address', 'admin__username', 'device_name', 'fcm_token')
+    list_filter = ('device_type', 'last_seen')
+
+    readonly_fields = ('fcm_token', 'device_type', 'device_name', 'os_version', 'app_version', 'last_seen')
+
+    def owner_email_or_username(self, obj):
+        if obj.service_provider:
+            return obj.service_provider.email_address
+        elif obj.admin:
+            return obj.admin.username
+        return "Unknown"
+    owner_email_or_username.short_description = "Owner"
 
 
 # -----------------------------

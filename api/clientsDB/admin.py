@@ -1,9 +1,26 @@
 from django.contrib import admin
-from .models.models import AddressSuperUserVerification, ClientDetails, ClientAuth, Address, ClientAddress, PendingAddressApproval, ClientNotification
+from .models.models import AddressSuperUserVerification, ClientDetails, ClientAuth, Address, ClientAddress, DeviceToken, PendingAddressApproval, ClientNotification
 
 # -----------------------------
 # ClientAuth Admin
 # -----------------------------
+@admin.register(DeviceToken)
+class DeviceTokenAdmin(admin.ModelAdmin):
+    list_display = ('owner_email_or_username', 'device_type', 'device_name', 'os_version', 'app_version', 'last_seen')
+    search_fields = ('client__email_address', 'admin__username', 'device_name', 'fcm_token')
+    list_filter = ('device_type', 'last_seen')
+
+    readonly_fields = ('fcm_token', 'device_type', 'device_name', 'os_version', 'app_version', 'last_seen')
+
+    def owner_email_or_username(self, obj):
+        if obj.client:
+            return obj.client.email_address
+        elif obj.admin:
+            return obj.admin.username
+        return "Unknown"
+    owner_email_or_username.short_description = "Owner"
+
+    
 @admin.register(ClientAuth)
 class ClientAuthAdmin(admin.ModelAdmin):
     list_display = ('email_address', 'mobile_number')
@@ -39,6 +56,8 @@ class AddressAdmin(admin.ModelAdmin):
     list_display = ('formatted_address', 'locality', 'administrative_area_level_1', 'country', 'postal_code')
     search_fields = ('formatted_address', 'locality', 'administrative_area_level_1', 'country', 'postal_code')
     inlines = [ClientAddressInlineForAddress]
+
+
 
 # -----------------------------
 # ClientAddress Admin

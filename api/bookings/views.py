@@ -16,6 +16,7 @@ from .serializers import (
     ConfirmCheckinResponseSerializer,
     ConfirmCheckinSerializer,
     NegotiationRoundWriteSerializer,
+    OrderFinalPricePatchSerializer,
     OrderServiceReadSerializer,
     OrderServiceWriteSerializer,
     NegotiationReadSerializer,
@@ -55,6 +56,7 @@ def order_service_create(request):
     serializer = OrderServiceWriteSerializer(data=request.data, context={'request': request})
     if serializer.is_valid():
         order = serializer.save()
+        order.notify_invited_providers_of_new_booking()
         read_serializer = OrderServiceReadSerializer(order)
         return Response(read_serializer.data, status=status.HTTP_201_CREATED)
     return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
@@ -285,6 +287,35 @@ def provider_start_round(request, negotiation_id):
     read_serializer = NegotiationRoundReadSerializer(new_round)
     return Response(read_serializer.data, status=status.HTTP_201_CREATED)
 
+@api_view(['PATCH'])
+def patch_order_final_price(request, order_id):
+    try:
+        order = OrderService.objects.get(order_id=order_id)
+    except OrderService.DoesNotExist:
+        return Response(
+            {"detail": "Order not found."},
+            status=status.HTTP_404_NOT_FOUND
+        )
+
+    serializer = OrderFinalPricePatchSerializer(
+        order,
+        data=request.data,
+        partial=True
+    )
+
+    if serializer.is_valid():
+        serializer.save()
+        return Response(
+            {
+                "message": "Final price updated successfully.",
+                "order_id": order.order_id,
+                "final_price": serializer.data.get("final_price"),
+            },
+            status=status.HTTP_200_OK
+        )
+
+    return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
 
     
 
@@ -360,6 +391,22 @@ def accepted_orders_by_provider_email(request, email):
     except Exception as e:
         return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
     
+@api_view(['GET'])
+def get_shipment_by_id(request, shipment_id):
+    """
+    Returns a single shipment by shipment_id.
+    """
+
+    try:
+        shipment = Shipment.objects.get(shipment_id=shipment_id)
+    except Shipment.DoesNotExist:
+        return Response(
+            {"error": "Shipment not found."},
+            status=status.HTTP_404_NOT_FOUND,
+        )
+
+    serializer = ShipmentReadSerializer(shipment)
+    return Response(serializer.data, status=status.HTTP_200_OK)
 
 
 

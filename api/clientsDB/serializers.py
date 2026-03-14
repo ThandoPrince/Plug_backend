@@ -3,7 +3,7 @@ from django.contrib.auth.hashers import make_password
 from django.contrib.auth.password_validation import validate_password
 from django.core.validators import RegexValidator
 from django.core.exceptions import ValidationError as DjangoValidationError
-from .models.models import AddressSuperUserVerification, ClientAuth, Address, ClientDetails, ClientAddress, ClientNotification
+from .models.models import AddressSuperUserVerification, ClientAuth, Address, ClientDetails, ClientAddress, ClientNotification, DeviceToken
 import re
 from django.contrib.auth.hashers import check_password
 import phonenumbers
@@ -230,6 +230,35 @@ class ClientAddressSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = ClientAddress
+        fields = '__all__'
+
+class DeviceTokenWriteSerializer(serializers.ModelSerializer):
+    email = serializers.EmailField(write_only=True, required=True)
+    push_token = serializers.CharField(write_only=True, required=True, source='fcm_token')
+
+    class Meta:
+        model = DeviceToken
+        fields = '__all__'
+        extra_kwargs = {
+            'client': {'read_only': True},
+            'fcm_token': {'required': False},  # prevent DRF from expecting it separately
+        }
+
+    def create(self, validated_data):
+        email = validated_data.pop('email')
+        try:
+            client_user = ClientAuth.objects.get(email_address=email)
+        except ClientAuth.DoesNotExist:
+            raise serializers.ValidationError({"email": "No client found with this email."})
+
+        validated_data['client'] = client_user
+        return super().create(validated_data)
+    
+class DeviceTokenReadSerializer(serializers.ModelSerializer):
+    client_email = serializers.CharField(source='client.email_address', read_only=True)
+
+    class Meta:
+        model = DeviceToken
         fields = '__all__'
 
 class AddressWriteSerializer(serializers.ModelSerializer):

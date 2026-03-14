@@ -5,15 +5,14 @@ import re
 from rest_framework import serializers
 from django.core.validators import validate_email
 from django.core.exceptions import ValidationError as DjangoValidationError
-from .models import SPProfile
+from .models import CostOfServiceImage, DeviceToken, SPProfile
 from .models import CostOfService, ProviderService, SPLiveLocation, SPProfile, ServiceCategory, ServiceProvider, ServiceGroup, Service, Address, SupportingDocument
 
 
 class SPProfileWriteSerializer(serializers.ModelSerializer):
-    # Explicitly define email_address to add custom validation
     email_address = serializers.EmailField()
     password = serializers.CharField(
-        write_only=True, 
+        write_only=True,
         min_length=6,
         style={'input_type': 'password'}
     )
@@ -23,79 +22,108 @@ class SPProfileWriteSerializer(serializers.ModelSerializer):
         fields = ["email_address", "password", "mobile_number"]
 
     def validate_email_address(self, value):
-        """
-        Check for valid format and uniqueness.
-        """
         email = value.lower().strip()
-        
-        # 1. Django internal email format validation
+
         try:
             validate_email(email)
         except DjangoValidationError:
             raise serializers.ValidationError("Enter a valid email address.")
 
-        # 2. Check Uniqueness
         if SPProfile.objects.filter(email_address=email).exists():
-            raise serializers.ValidationError("An account with this email already exists.")
-            
+            raise serializers.ValidationError(
+                "An account with this email already exists."
+            )
+
         return email
 
     def validate_password(self, value):
-        """
-        Enforce Uppercase, Lowercase, and Special Char.
-        """
         if not re.search(r'[A-Z]', value):
-            raise serializers.ValidationError("Password must contain at least one uppercase letter.")
-        
+            raise serializers.ValidationError(
+                "Password must contain at least one uppercase letter."
+            )
+
         if not re.search(r'[a-z]', value):
-            raise serializers.ValidationError("Password must contain at least one lowercase letter.")
-        
-        if not re.search(r'[!@#$%^&*(),.?":{}|<>]', value):
-            raise serializers.ValidationError("Password must contain at least one special character.")
-            
+            raise serializers.ValidationError(
+                "Password must contain at least one lowercase letter."
+            )
+
+        if not re.search(r'[!@#$%^&*(),.?\":{}|<>]', value):
+            raise serializers.ValidationError(
+                "Password must contain at least one special character."
+            )
+
         return value
 
     def validate_mobile_number(self, value):
-        
-        # Remove any spaces or dashes the user might have entered
+
         raw_number = value.strip().replace(" ", "").replace("-", "")
 
-        # 1. Length Check (Must be exactly 10 digits)
         if not raw_number.isdigit() or len(raw_number) != 10:
-            raise serializers.ValidationError("Mobile number must be exactly 10 digits.")
+            raise serializers.ValidationError(
+                "Mobile number must be exactly 10 digits."
+            )
 
-        # 2. Dummy Number Check
-        if raw_number == "0000000000" or raw_number == "1234567890":
-            raise serializers.ValidationError("Please enter a valid mobile number.")
+        if raw_number in ["0000000000", "1234567890"]:
+            raise serializers.ValidationError(
+                "Please enter a valid mobile number."
+            )
 
-        # 3. Normalization (e.g., 072... -> +2772...)
         normalized = raw_number
-        if normalized.startswith('0'):
+        if normalized.startswith("0"):
             normalized = f"+27{normalized[1:]}"
-        
-        # 4. Uniqueness Check (against the normalized version)
+
         if SPProfile.objects.filter(mobile_number=normalized).exists():
-            raise serializers.ValidationError("This mobile number is already registered.")
-            
+            raise serializers.ValidationError(
+                "This mobile number is already registered."
+            )
+
         return normalized
 
     @transaction.atomic
     def create(self, validated_data):
         password = validated_data.pop("password")
 
+        # 🔒 Force lowercase email again for safety
+        validated_data["email_address"] = validated_data["email_address"].lower()
+
         sp_profile = SPProfile(**validated_data)
-        sp_profile.set_password(password)  # ✅ Use model method
+        sp_profile.set_password(password)
         sp_profile.save()
 
-        # 🔥 Automatically create related provider profile
+        # Auto-create provider profile
         ServiceProvider.objects.create(
             sp_profile=sp_profile,
             full_name="",
             id_number="",
-            dob="2000-01-01",  # Temporary placeholder
+            dob="2000-01-01",
         )
 
         return sp_profile
+    
+class DeviceTokenWriteSerializer(serializers.ModelSerializer):
+    email = serializers.EmailField(write_only=True, required=True)
+    push_token = serializers.CharField(write_only=True, required=True, source='fcm_token')
+
+    class Meta:
+        model = DeviceToken
+        fields = '__all__'
+        extra_kwargs = {
+            'service_provider': {'read_only': True},
+            'fcm_token': {'required': False},
+        }
+
+    def create(self, validated_data):
+        email = validated_data.pop('email').strip().lower()
+
+        try:
+            service_provider = SPProfile.objects.get(email_address=email)
+        except SPProfile.DoesNotExist:
+            raise serializers.ValidationError({
+                "email": "No service provider found with this email."
+            })
+
+        validated_data['service_provider'] = service_provider
+        return super().create(validated_data)
     
 
 
@@ -313,6 +341,27 @@ class SPAddressDocumentWriteSerializer(serializers.Serializer):
             )
 
         return provider
+
+class CostOfServiceImageReadSerializer(serializers.ModelSerializer):
+    image_url = serializers.SerializerMethodField()
+
+    class Meta:
+        model = CostOfServiceImage
+        fields = [
+            'id',
+            'cost_of_service',
+            'image',
+            'image_url',
+            'uploaded_at',
+        ]
+
+    def get_image_url(self, obj):
+        request = self.context.get('request')
+        if obj.image and request:
+            return request.build_absolute_uri(obj.image.url)
+        elif obj.image:
+            return obj.image.url
+        return None
     
 
 class SPLoginSerializer(serializers.Serializer):
@@ -431,15 +480,69 @@ class ServiceProviderReadSerializer(serializers.ModelSerializer):
     class Meta:
         model = ServiceProvider
         fields = '__all__'
+class CostOfServiceReadSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = CostOfService
+        fields = [
+            "id",
+            "base_price",
+            "negotiable",
+            "notes",
+        ]
 
 class ProviderSeviceSerializer(serializers.ModelSerializer):
     service = ServiceSerializer()
     provider = ServiceProviderReadSerializer()
+    cost_of_service = CostOfServiceReadSerializer()
     class Meta:
         model = ProviderService
         
         
         fields = '__all__'
+
+class ServiceProviderActiveSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ServiceProvider
+        fields = ["is_active"]
+
+class CostOfServiceImageReadSerializer(serializers.ModelSerializer):
+    image = serializers.SerializerMethodField()
+
+    class Meta:
+        model = CostOfServiceImage
+        fields = ['id', 'image', 'uploaded_at']
+
+    def get_image(self, obj):
+        request = self.context.get('request')
+        if obj.image and hasattr(obj.image, 'url'):
+            if request:
+                return request.build_absolute_uri(obj.image.url)
+            return obj.image.url
+        return None
+    
+class CostOfServiceImageWriteSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = CostOfServiceImage
+        fields = ['cost_of_service', 'image']
+
+    def validate(self, attrs):
+        cost_of_service = attrs.get('cost_of_service')
+
+        if not cost_of_service:
+            raise serializers.ValidationError({
+                "cost_of_service": "This field is required."
+            })
+
+        existing_count = CostOfServiceImage.objects.filter(
+            cost_of_service=cost_of_service
+        ).count()
+
+        if existing_count >= 5:
+            raise serializers.ValidationError(
+                "Maximum of 5 images allowed per service."
+            )
+
+        return attrs
 
 class ServiceProviderWriteSerializer(serializers.ModelSerializer):
     sp_profile = SPProfileReadSerializer()

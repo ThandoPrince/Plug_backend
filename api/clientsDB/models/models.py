@@ -85,6 +85,34 @@ class ClientAuth(models.Model):
     def __str__(self):
         return f"{self.email_address} - {self.password}"
 
+class DeviceToken(models.Model):
+    DEVICE_TYPES = (
+        ("android", "Android"),
+        ("ios", "iOS"),
+        ("web", "Web"),
+        ("huawei", "Huawei"),
+    )
+    PROVIDER_TYPES = (
+        ("firebase", "Firebase Cloud Messaging"),
+        ("huawei", "Huawei Push Kit"),
+    )
+    provider = models.CharField(max_length=20, choices=PROVIDER_TYPES, default="firebase")
+
+    client = models.ForeignKey(
+        'ClientAuth',  # link to your auth model
+        on_delete=models.CASCADE,
+        related_name="device_tokens"
+    )
+    fcm_token = models.CharField(max_length=512)
+    device_type = models.CharField(max_length=20, choices=DEVICE_TYPES)
+    device_name = models.CharField(max_length=100, blank=True, null=True)
+    os_version = models.CharField(max_length=50, blank=True, null=True)
+    app_version = models.CharField(max_length=20, blank=True, null=True)
+    last_seen = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f"{self.client.email_address} - {self.device_name or self.device_type}"
+
 
 class ClientDetails(models.Model):
     first_name = models.CharField(max_length=100, null=True, blank=True)

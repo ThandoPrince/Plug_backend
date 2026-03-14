@@ -6,24 +6,49 @@ from django.conf import settings
 from django.db import models
 
 from api.bookings.services.order_status_service import OrderStatusService
+from api.clientsDB.notifications.services.client_push_notification_service import send_push_to_client
+from api.serviceProvidersDB.notifications.services.provider_push_notification_service import send_push_to_provider
 from .utils.choices import ORDER_STATUS, SESSION_STATUS, SHIPMENT_STATUS, PAYMENT_STATUS
 from django.db.models import Avg
 
 
 class OrderService(models.Model):
-    title = models.CharField(max_length=255, null=True, blank=True, help_text="Example, I want my nails done.")
+    title = models.CharField(
+        max_length=255,
+        null=True,
+        blank=True,
+        help_text="Example, I want my nails done."
+    )
     order_id = models.AutoField(primary_key=True)
     proposal_price = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
     base_price = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
     final_price = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
-    notes = models.TextField(null=True, blank=True, help_text="Brief description of the service you require.")
+    notes = models.TextField(
+        null=True,
+        blank=True,
+        help_text="Brief description of the service you require."
+    )
     is_negotiated = models.BooleanField(default=False, null=True, blank=True)
-    client = models.ForeignKey('clientsDB.ClientDetails', on_delete=models.CASCADE, null=True, blank=True)
+    client = models.ForeignKey(
+        'clientsDB.ClientDetails',
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True
+    )
     requested_date = models.DateField(null=True, blank=True)
-    provider_for_service = models.ForeignKey('serviceProvidersDB.ProviderService', on_delete=models.SET_NULL, null=True, blank=True)
+    provider_for_service = models.ForeignKey(
+        'serviceProvidersDB.ProviderService',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True
+    )
     requested_date_time = models.TimeField(null=True, blank=True)
-    service_required = models.ForeignKey('serviceProvidersDB.Service', on_delete=models.SET_NULL, null=True, blank=True)
-    
+    service_required = models.ForeignKey(
+        'serviceProvidersDB.Service',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True
+    )
     delivery_address = models.ForeignKey(
         'clientsDB.Address',
         on_delete=models.SET_NULL,
@@ -33,7 +58,6 @@ class OrderService(models.Model):
     date_and_time_created = models.DateTimeField(auto_now_add=True)
     status = models.CharField(max_length=100, choices=ORDER_STATUS, default='pending')
     is_broadcasted = models.BooleanField(default=False)
-
     invited_providers = models.ManyToManyField(
         'serviceProvidersDB.ProviderService',
         related_name='invited_orders',
@@ -41,25 +65,155 @@ class OrderService(models.Model):
     )
 
     def save(self, *args, **kwargs):
-        if self.pk:
-            old = OrderService.objects.get(pk=self.pk)
-            if old.status != self.status:
-                OrderHistory.objects.create(
-                    order=self,
-                    previous_status=old.status,
-                    new_status=self.status
-                )
+        is_new = self.pk is None
+        old_status = None
+
+        if not is_new:
+            old_status = (
+                OrderService.objects
+                .filter(pk=self.pk)
+                .values_list('status', flat=True)
+                .first()
+            )
+
         super().save(*args, **kwargs)
 
-    def __str__(self):
-        return (
-            f"Order {self.order_id} | Client: {self.client.first_name} {self.client.last_name} "
-            f"| Status: {self.status}"
+        if not is_new and old_status != self.status:
+            self._log_order_history(old_status=old_status, new_status=self.status)
+            self._send_status_notification()
+
+    def _log_order_history(self, old_status, new_status):
+        try:
+            OrderHistory.objects.create(
+                order=self,
+                previous_status=old_status,
+                new_status=new_status
+            )
+        except Exception as e:
+            print(f"Failed to create order history for Order {self.order_id}: {e}")
+
+    def _send_status_notification(self):
+        if not self.client:
+            return
+
+        client_auth_user = getattr(self.client, 'client_profile', None)
+        if not client_auth_user:
+            return
+
+        service_name = (
+            self.service_required.service_name
+            if self.service_required else
+            'your service'
         )
 
-    @property
-    def total_price(self):
-        return sum(item.final_price for item in self.booking_items.all())
+        notification_map = {
+            "accepted": {
+                "title": "Order Accepted 🛠️",
+                "body": f"Your order for {service_name} has been accepted!",
+                "type": "order_accepted",
+            },
+            "in_delivery": {
+                "title": "Provider On The Way 🚗",
+                "body": f"Your provider is on the way for {service_name}.",
+                "type": "provider_on_the_way",
+            },
+            "awaiting_confirmation": {
+                "title": "Provider Has Arrived 📍",
+                "body": f"Your provider has arrived for {service_name}. Please confirm.",
+                "type": "provider_arrived",
+            },
+        }
+
+        notification_config = notification_map.get(self.status)
+        if not notification_config:
+            return
+
+        try:
+            send_push_to_client(
+                client=client_auth_user,
+                title=notification_config["title"],
+                body=notification_config["body"],
+                data={
+                    "order_id": str(self.order_id),
+                    "type": notification_config["type"],
+                    "status": self.status,
+                }
+            )
+        except Exception as e:
+            print(f"Push notification failed for Order {self.order_id}: {e}")
+
+    def notify_invited_providers_of_new_booking(self):
+        print(f"[Push] notify_invited_providers_of_new_booking CALLED for order {self.order_id}")
+
+        invited_provider_services = self.invited_providers.select_related(
+        "provider",
+        "service",
+        "provider__sp_profile",
+    )
+
+        print(f"[Push] invited providers count: {invited_provider_services.count()}")
+
+        if not invited_provider_services.exists():
+            print(f"[Push] No invited providers found for Order {self.order_id}.")
+            return
+
+        client_name = "A client"
+
+        if self.client:
+            first_name = getattr(self.client, "first_name", "") or ""
+            last_name = getattr(self.client, "last_name", "") or ""
+            full_name = f"{first_name} {last_name}".strip()
+
+            if full_name:
+                client_name = full_name
+
+        service_name = (
+        self.service_required.service_name
+        if self.service_required
+        else "a service"
+    )
+
+        booking_title = self.title or f"New booking for {service_name}"
+
+        for provider_service in invited_provider_services:
+            provider = getattr(provider_service, "provider", None)
+
+            print(f"[Push] ProviderService ID: {provider_service.pk}")
+
+            if not provider:
+                print("[Push] provider missing")
+                continue
+
+            sp_profile = getattr(provider, "sp_profile", None)
+
+            print(f"[Push] SP Profile: {sp_profile}")
+
+            if not sp_profile:
+                print("[Push] sp_profile missing")
+                continue
+
+            try:
+                send_push_to_provider(
+                    service_provider=sp_profile,
+                    title="New Booking Request 📩",
+                    body=f"{client_name} created a new booking for {service_name}.",
+                    data={
+                    "type": "new_booking_invite",
+                    "order_id": str(self.order_id),
+                    "status": self.status,
+                    "title": booking_title,
+                    "service_name": service_name,
+                    "client_name": client_name,
+                }
+            )
+
+                print(f"[Push] Notification sent to SPProfile {sp_profile.pk}")
+
+            except Exception as e:
+                print(
+                f"[Push ERROR] Failed sending notification for "
+                f"Order {self.order_id}, ProviderService {provider_service.pk}: {e}"
+            )
 
 
 class ServicePicture(models.Model):
@@ -542,8 +696,8 @@ class OrderHistory(models.Model):
     history_id = models.AutoField(primary_key=True)
     order = models.ForeignKey(OrderService, on_delete=models.CASCADE, related_name='history')
     status_change_date = models.DateTimeField(auto_now_add=True)
-    previous_status = models.CharField(max_length=20)
-    new_status = models.CharField(max_length=20)
+    previous_status = models.CharField(max_length=50)
+    new_status = models.CharField(max_length=50)
 
     def __str__(self):
         return (

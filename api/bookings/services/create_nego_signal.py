@@ -50,14 +50,14 @@ def handle_negotiation_round(sender, instance, created, **kwargs):
         negotiation = instance.negotiation
         order = negotiation.service_order
 
-        # ✅ Only trigger in-negotiation if provider starts the round
+        #  Only trigger in-negotiation if provider starts the round
         if instance.sender_type == "provider":
             if order.status != "in-negotiation":
                 order.status = "in-negotiation"
                 order.is_negotiated = True
                 order.save(update_fields=["status", "is_negotiated"])
 
-        # ✅ If provider accepts during the round, finalize price
+        #  If provider accepts during the round, finalize price
         if negotiation.status == "accepted" and instance.sender_type == "provider":
             order.final_price = instance.offered_price
             order.status = "accepted"

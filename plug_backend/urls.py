@@ -31,6 +31,7 @@ urlpatterns = [
     path('api/clientsDB/addresses/', views.address_list, name='address-list'),
     path('api/clientsDB/address-only/<str:email>', views.client_saved_addresses, name='address-only-list'),
     path('api/clientsDB/client-addresses/', views.client_address_list, name='client-address-list'),
+    path("api/client_devices/register-device-token/", views.register_device_token, name="register-device-token"),
     path('api/clientsDB/client-profiles/<str:email>', views.clientProfile_detail),
     path('api/clientsDB/clients/<str:email>/', views.client_detail, name='client-detail'),
     path('api/clientsDB/addresses/<int:id>', views.address_detail),
@@ -58,11 +59,24 @@ urlpatterns = [
     path('api/sp_profiles/', sp_views.sp_profile_list, name='sp_profile_list'),
     path('api/sp_profiles/<str:email>/', sp_views.sp_profile_detail, name='sp_profile_detail'),
     path('api/cost_of_service/<str:email>/', sp_views.costs_by_sp_email, name='cost_of_service'),
+    path(
+        'api/cost_of_service/<str:email>/<int:service_id>/',
+        sp_views.costs_by_sp_email,
+        name='cost_by_sp_email_and_service'
+    ),
+    path(
+        'api/cost_of_service/<int:cost_id>/images/',
+        sp_views.get_cost_of_service_images_by_cost_id,
+        name='get_cost_of_service_images_by_cost_id'
+    ),
     path('api/service_groups/', sp_views.service_group_list, name='service_group_list'),
     path('api/service_groups/<str:group_id>/', sp_views.service_group_detail, name='service_group_detail'),
     path('api/services/', sp_views.service_list, name='service_list'),
     path('api/approved_services/', sp_views.approved_services_list, name='service_list'),
     path('api/services/<int:pk>/', sp_views.service_detail, name='service_detail'),
+
+
+
 
     
     path('api/service_providers/', sp_views.service_provider_list_service, name='service_provider_list'),
@@ -75,6 +89,10 @@ urlpatterns = [
     path('api/service_providers/sp/update-live-location/', sp_views.update_sp_live_location, name='service_provider_update_live_location'),
     path('api/service_providersDB/live-loc-by-service/<int:service_id>/', sp_views.fetch_sp_live_locations_by_service, name='fetch_service_provider_live_location_by_service'),
     path('api/service_providersDB/sps_by_live_location/', sp_views.sps_by_live_location, name='service_provider_by_live_location'),
+    path('api/service_provider/<str:email>/services/',sp_views.get_provider_services_by_email,name='get_provider_services_by_email'),
+    path('api/serviceProvider/cost/<int:cost_id>/images/',sp_views.upload_service_images,name='upload_service_images'),
+    path('api/providers/<str:email>/toggle-active/',sp_views.toggle_provider_active,name='toggle-provider-active'),
+    path('api/sp/register/device-token/', sp_views.register_device_token, name='register-device-token'),
     
 
 
@@ -83,10 +101,16 @@ urlpatterns = [
     path('api/bookings/service_orders/<int:pk>/', booking_views.order_service_detail, name='service_order_detail'),
     path('api/bookings/order_a_service/', booking_views.order_service_create, name='order_a_service'),
     path('api/bookings/get_shipment/by_sp_email/<str:provider_email>/', booking_views.get_shipments_by_provider, name='get_shipments_by_provider_email'),
+    path('api/bookings/get_shipment/by_shipment_id/<int:shipment_id>/', booking_views.get_shipment_by_id, name='get_shipment_by_id'),
     path('api/bookings/get_shipment/by_client_email/<str:client_email>/', booking_views.get_shipments_by_client, name='get_shipments_by_client_email'),
     path('api/bookings/shipment/<int:shipment_id>/route/', booking_views.shipment_routes_view, name='shipment_routes'),
     path('api/bookings/shipment/<int:shipment_id>/change_status/', booking_views.change_shipment_status, name='change_shipment_status'),
     path('api/bookings/shipment/<int:shipment_id>/confirm/', booking_views.confirm_shipment, name='confirm_shipment'),
+    path(
+        'api/bookings/<int:order_id>/final-price/',
+        booking_views.patch_order_final_price,
+        name='patch_order_final_price'
+    ),
 
      # Session  endpoints
     path('api/bookings/sessions/confirm_checkin/', booking_views.confirm_checkin, name='confirm_checkin'),
