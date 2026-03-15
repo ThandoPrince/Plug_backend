@@ -3,6 +3,7 @@ from django.urls import path
 from django.http import JsonResponse
 from api.clientsDB import views
 from api.bookings import views as booking_views
+from api.clientsDB.urls import media_debug
 from api.serviceProvidersDB import views as sp_views
 from rest_framework.urlpatterns import format_suffix_patterns
 from django.conf import settings
@@ -140,7 +141,7 @@ urlpatterns = [
     path('api/bookings/service_orders/negotiation/rounds/<int:negotiation_id>/', booking_views.negotiation_rounds_by_negotiation, name='negotiation_round_list'),
     path('api/bookings/service_orders/negotiation/rounds/<int:negotiation_id>/client_start_round/', booking_views.client_start_round, name='negotiation_round_client_start_round'),
     path('api/bookings/service_orders/negotiation/provider_accepts_negotiation/<int:negotiation_id>/', booking_views.provider_accept_negotiation, name='provider_accepts_negotiation'),
-    
+    path("media-debug/", media_debug),
 
   
 ]
