@@ -19,7 +19,8 @@ ALLOWED_HOSTS = [
     host.strip()
     for host in get_env(
         "DJANGO_ALLOWED_HOSTS",
-        "localhost,127.0.0.1"
+        "localhost,127.0.0.1",
+        "https://web-production-7dfca.up.railway.app/"
     ).split(",")
     if host.strip()
 ]
