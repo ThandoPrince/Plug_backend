@@ -24,6 +24,15 @@ ALLOWED_HOSTS = [
     ).split(",")
     if host.strip()
 ]
+CSRF_TRUSTED_ORIGINS = [
+    origin.strip()
+    for origin in get_env(
+        "DJANGO_CSRF_TRUSTED_ORIGINS",
+        "http://127.0.0.1,http://localhost"
+    ).split(",")
+    if origin.strip()
+]
+
 
 CORS_ALLOWED_ORIGINS = [
     origin.strip()
