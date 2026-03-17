@@ -1002,26 +1002,33 @@ def fetch_sp_addresses_by_service(request, service_id):
 @api_view(['GET'])
 def fetch_sp_live_locations_by_service(request, service_id):
     """
-    Fetch all active service providers for a service
+    Fetch up to 10 active service providers for a service
     along with their latest live location.
     """
 
-    # Step 1: Filter active providers offering this service
-    providers = ServiceProvider.objects.filter(
-        provider_services__service__service_id=service_id,
-        is_active=True
-    ).distinct()
-
-    # Step 2: Subquery to get latest live location ID per provider
+    # Subquery for latest location per provider
     latest_location_subquery = SPLiveLocation.objects.filter(
-        provider=OuterRef('provider')
+        provider=OuterRef('pk')
     ).order_by('-updated_at').values('id')[:1]
 
-    # Step 3: Get only latest locations
-    latest_locations = SPLiveLocation.objects.filter(
-        provider__in=providers,
-        id=Subquery(latest_location_subquery)
-    ).select_related('provider')
+    # Step 1: Limit providers FIRST
+    providers = (
+        ServiceProvider.objects.filter(
+            provider_services__service__service_id=service_id,
+            is_active=True
+        )
+        .distinct()
+        .annotate(latest_location_id=Subquery(latest_location_subquery))
+        [:10]  # ✅ LIMIT HERE
+    )
+
+    # Step 2: Get those latest locations
+    latest_location_ids = providers.values_list('latest_location_id', flat=True)
+
+    latest_locations = (
+        SPLiveLocation.objects.filter(id__in=latest_location_ids)
+        .select_related('provider')
+    )
 
     serializer = SPLiveLocationSerializer(latest_locations, many=True)
     return Response(serializer.data)
