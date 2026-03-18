@@ -87,8 +87,8 @@ urlpatterns = [
     path('api/service_providers/by-service/<int:service_id>/', sp_views.providers_by_service, name='service_provider_detail_by_service'),
     path('api/serviceProvidersDB/address/<int:id>/', sp_views.service_provider_address_detail, name='service_provider_address'),
     path('api/serviceProvidersDB/address/', sp_views.service_provider_address, name='service_provider_address_detail'),
-    path('api/service_providersDB/address-by-service/<int:service_id>/', sp_views.fetch_sp_addresses_by_service, name='service_provider_detail_by_service'),
-    path('api/service_providersDB/sps_by_addresses/', sp_views.sps_by_addresses, name='service_provider_detail_by_service'),
+
+  
     path('api/service_providers/sp/update-live-location/', sp_views.update_sp_live_location, name='service_provider_update_live_location'),
     path('api/service_providersDB/live-loc-by-service/<int:service_id>/', sp_views.fetch_sp_live_locations_by_service, name='fetch_service_provider_live_location_by_service'),
     path('api/service_providersDB/sps_by_live_location/', sp_views.sps_by_live_location, name='service_provider_by_live_location'),

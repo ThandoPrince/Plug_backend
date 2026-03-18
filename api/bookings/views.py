@@ -2,14 +2,15 @@ from datetime import timedelta
 from django.conf import settings
 from django.utils import timezone
 from django.shortcuts import get_object_or_404
-from rest_framework.decorators import api_view
+from rest_framework.decorators import api_view, throttle_classes
 from rest_framework.response import Response
 from rest_framework import status
 from django.db import transaction
-
+from django.db.models import Exists, OuterRef
 from api.bookings.services.calculate_distance_meters import calculate_distance_meters
 from api.bookings.services.shipment_transition_function import InvalidShipmentTransition, transition_shipment
 from api.serviceProvidersDB.models import ProviderService, ServiceProvider
+from plug_backend.throttles import BookingLikeWriteThrottle, HeavyReadThrottle, UserReadThrottle
 
 from .models import BookingItem, NegotiationRound, OrderService, Negotiation, Rating, Session, SessionLocationPing, SessionToken, Shipment, ShipmentRoute
 from .serializers import (
@@ -41,6 +42,7 @@ from .serializers import (
 # ---------------- OrderService ----------------
 
 @api_view(['GET'])
+@throttle_classes([HeavyReadThrottle])
 def order_service_list(request):
     """List all orders"""
     orders = OrderService.objects.all()
@@ -49,6 +51,7 @@ def order_service_list(request):
 
 
 @api_view(['POST'])
+@throttle_classes([HeavyReadThrottle])
 def order_service_create(request):
     print("FILES RECEIVED:", request.FILES)
     print("POST DATA:", request.data)
@@ -63,6 +66,7 @@ def order_service_create(request):
 
 
 @api_view(['GET', 'PUT', 'PATCH', 'DELETE'])
+@throttle_classes([HeavyReadThrottle])
 def order_service_detail(request, pk):
     """Retrieve, update, or delete a specific order"""
     order = get_object_or_404(OrderService, pk=pk)
@@ -87,6 +91,7 @@ def order_service_detail(request, pk):
 # ---------------- Negotiation ----------------
 
 @api_view(['GET'])
+@throttle_classes([HeavyReadThrottle])
 def negotiation_list(request):
     """List all negotiations"""
     negotiations = Negotiation.objects.all()
@@ -95,6 +100,7 @@ def negotiation_list(request):
 
 
 @api_view(['GET', 'PUT', 'PATCH'])
+@throttle_classes([HeavyReadThrottle])
 def negotiation_detail(request, pk):
     """Retrieve or update a negotiation"""
     negotiation = get_object_or_404(Negotiation, pk=pk)
@@ -124,6 +130,7 @@ def negotiation_detail(request, pk):
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
     
 @api_view(['POST'])
+@throttle_classes([HeavyReadThrottle])
 def provider_accept_negotiation(request, negotiation_id):
     """
     Endpoint for a provider to accept a negotiation.
@@ -179,6 +186,7 @@ def provider_accept_negotiation(request, negotiation_id):
 # ---------------- Additional endpoints ----------------
 
 @api_view(['GET'])
+@throttle_classes([HeavyReadThrottle])
 def negotiations_by_order(request, order_id):
     """Get all negotiations for a specific order"""
     order = get_object_or_404(OrderService, pk=order_id)
@@ -188,6 +196,7 @@ def negotiations_by_order(request, order_id):
 
 
 @api_view(['GET'])
+@throttle_classes([HeavyReadThrottle])
 def negotiations_by_order_and_provider(request, order_id, email):
     """Get all negotiations for a specific order and provider email"""
     order = get_object_or_404(OrderService, pk=order_id)
@@ -200,6 +209,7 @@ def negotiations_by_order_and_provider(request, order_id, email):
 
 
 @api_view(['GET'])
+@throttle_classes([HeavyReadThrottle])
 def bookings_by_invited_provider(request, email):
     """Get all bookings where the given provider email is invited"""
     orders = OrderService.objects.filter(
@@ -211,19 +221,33 @@ def bookings_by_invited_provider(request, email):
     return Response(serializer.data)
 
 @api_view(['GET'])
+@throttle_classes([HeavyReadThrottle])
 def pending_orders_by_client_email(request, email):
     """
     Fetch pending orders for a given client email,
-    including those with negotiation status.
+    including whether each order is in negotiation.
     """
     try:
-        orders = OrderService.objects.filter(
-            client__client_profile__email_address=email,
-            status__in=['pending', 'in-negotiation']
-        ).order_by('-date_and_time_created')
+        negotiation_subquery = Negotiation.objects.filter(
+            service_order=OuterRef('pk')
+        )
+
+        orders = (
+            OrderService.objects.filter(
+                client__client_profile__email_address=email,
+                status__in=['pending', 'in-negotiation']
+            )
+            .annotate(in_negotiation=Exists(negotiation_subquery))
+            .order_by('-date_and_time_created')
+        )
 
         serializer = OrderServiceReadSerializer(orders, many=True)
-        return Response(serializer.data, status=status.HTTP_200_OK)
+        data = serializer.data
+
+        for i, order in enumerate(orders):
+            data[i]['in_negotiation'] = order.in_negotiation
+
+        return Response(data, status=status.HTTP_200_OK)
 
     except Exception as e:
         return Response(
@@ -231,18 +255,8 @@ def pending_orders_by_client_email(request, email):
             status=status.HTTP_500_INTERNAL_SERVER_ERROR
         )
 
-    # Annotate each order with negotiation status
-    orders_with_status = []
-    for order in orders:
-        # Check if the order has any negotiations
-        in_negotiation = Negotiation.objects.filter(order_service=order).exists()
-        order_data = OrderServiceReadSerializer(order).data
-        order_data['in_negotiation'] = in_negotiation  
-        orders_with_status.append(order_data)
-
-    return Response(orders_with_status)
-
 @api_view(['POST'])
+@throttle_classes([HeavyReadThrottle])
 def provider_start_round(request, negotiation_id):
     """
     Allows a provider to start or respond to a negotiation round.
@@ -288,6 +302,7 @@ def provider_start_round(request, negotiation_id):
     return Response(read_serializer.data, status=status.HTTP_201_CREATED)
 
 @api_view(['PATCH'])
+@throttle_classes([HeavyReadThrottle])
 def patch_order_final_price(request, order_id):
     try:
         order = OrderService.objects.get(order_id=order_id)
@@ -320,6 +335,7 @@ def patch_order_final_price(request, order_id):
     
 
 @api_view(['GET'])
+@throttle_classes([HeavyReadThrottle])
 def negotiation_rounds_by_negotiation(request, negotiation_id):
     """
     Get all rounds for a specific negotiation by its ID.
@@ -333,6 +349,7 @@ def negotiation_rounds_by_negotiation(request, negotiation_id):
     return Response(serializer.data, status=status.HTTP_200_OK)
 
 @api_view(['POST'])
+@throttle_classes([HeavyReadThrottle])
 def client_start_round(request, negotiation_id):
     """
     Allows a client to start or respond to a negotiation round.
@@ -375,6 +392,7 @@ def client_start_round(request, negotiation_id):
     return Response(read_serializer.data, status=status.HTTP_201_CREATED)
 
 @api_view(['GET'])
+@throttle_classes([HeavyReadThrottle])
 def accepted_orders_by_provider_email(request, email):
     """
     Fetch all orders accepted by a provider using their email address.
@@ -392,6 +410,7 @@ def accepted_orders_by_provider_email(request, email):
         return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
     
 @api_view(['GET'])
+@throttle_classes([HeavyReadThrottle])
 def get_shipment_by_id(request, shipment_id):
     """
     Returns a single shipment by shipment_id.
@@ -411,6 +430,7 @@ def get_shipment_by_id(request, shipment_id):
 
 
 @api_view(['GET'])
+@throttle_classes([HeavyReadThrottle])
 def get_shipments_by_provider(request, provider_email):
     """
     Returns all shipments for a given provider based on provider email
@@ -453,6 +473,7 @@ def get_shipments_by_provider(request, provider_email):
 
 
 @api_view(['GET'])
+@throttle_classes([HeavyReadThrottle])
 def get_shipments_by_client(request, client_email):
     """
     Returns all shipments for a given client based on client email.
@@ -488,6 +509,7 @@ def get_shipments_by_client(request, client_email):
     return Response(serializer.data, status=status.HTTP_200_OK)
 
 @api_view(["POST"])
+@throttle_classes([BookingLikeWriteThrottle])
 def change_shipment_status(request, shipment_id):
     shipment = get_object_or_404(Shipment, pk=shipment_id)
 
@@ -520,6 +542,7 @@ def change_shipment_status(request, shipment_id):
 
 
 @api_view(["GET", "POST"])
+@throttle_classes([HeavyReadThrottle])
 # @permission_classes([IsAuthenticated])
 def shipment_routes_view(request, shipment_id):
     """
@@ -560,6 +583,7 @@ def shipment_routes_view(request, shipment_id):
         )
     
 @api_view(["POST"])
+@throttle_classes([BookingLikeWriteThrottle])
 def confirm_shipment(request, shipment_id):
     shipment = get_object_or_404(Shipment, shipment_id=shipment_id)
 
@@ -581,6 +605,7 @@ def confirm_shipment(request, shipment_id):
     return Response(serializer.data, status=status.HTTP_200_OK)
 
 @api_view(["GET"])
+@throttle_classes([HeavyReadThrottle])
 def get_checkin_token(request, shipment_id):
     """
     Client requests a QR code token for a delivered shipment.
@@ -626,6 +651,7 @@ def get_checkin_token(request, shipment_id):
 
 
 @api_view(["POST"])
+@throttle_classes([BookingLikeWriteThrottle])
 @transaction.atomic
 def confirm_checkin(request):
     serializer = ConfirmCheckinSerializer(data=request.data)
@@ -679,6 +705,7 @@ def confirm_checkin(request):
 
 
 @api_view(["GET"])
+@throttle_classes([HeavyReadThrottle])
 def get_session_by_shipment(request, shipment_id):
     """
     Retrieve the session associated with a shipment.
@@ -697,7 +724,7 @@ def get_session_by_shipment(request, shipment_id):
 
 
 @api_view(['POST'])
-
+@throttle_classes([HeavyReadThrottle])
 def session_geofence_check(request, session_id):
     """
     Check if the provider is inside the geofence for a session
@@ -751,6 +778,7 @@ def session_geofence_check(request, session_id):
 
 
 @api_view(['GET'])
+@throttle_classes([HeavyReadThrottle])
 # @permission_classes([IsAuthenticated])
 def session_location_pings(request, session_id):
     """
@@ -762,6 +790,7 @@ def session_location_pings(request, session_id):
     return Response(serializer.data)
 
 @api_view(['GET'])
+@throttle_classes([HeavyReadThrottle])
 # @permission_classes([IsAuthenticated])
 def session_latest_ping(request, session_id):
     """
@@ -785,6 +814,7 @@ def session_latest_ping(request, session_id):
 
 
 @api_view(['PATCH'])
+@throttle_classes([HeavyReadThrottle])
 def update_session_status(request, session_id):
 
     try:
@@ -836,6 +866,7 @@ def update_session_status(request, session_id):
     )
 
 @api_view(['GET'])
+@throttle_classes([HeavyReadThrottle])
 def get_ratings_by_provider_email(request, email):
     """
     Get ratings for a provider.
@@ -858,6 +889,7 @@ def get_ratings_by_provider_email(request, email):
 
 
 @api_view(['GET'])
+@throttle_classes([HeavyReadThrottle])
 # @permission_classes([IsAuthenticated])
 def get_ratings_by_client_email(request, email):
     """
@@ -879,6 +911,7 @@ def get_ratings_by_client_email(request, email):
     return Response(serializer.data)
 
 @api_view(['PATCH'])
+@throttle_classes([HeavyReadThrottle])
 # @permission_classes([IsAuthenticated])
 def submit_client_rating(request, session_id, client_email):
     """
@@ -910,6 +943,7 @@ def submit_client_rating(request, session_id, client_email):
     return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
 @api_view(['PATCH'])
+@throttle_classes([HeavyReadThrottle])
 # @permission_classes([IsAuthenticated])
 def submit_provider_rating(request, session_id, provider_email):
     """
@@ -940,6 +974,7 @@ def submit_provider_rating(request, session_id, provider_email):
     return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
 @api_view(['GET'])
+@throttle_classes([HeavyReadThrottle])
 def check_session_status(request, session_id):
     """
     Returns the current session status.

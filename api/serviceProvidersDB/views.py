@@ -7,7 +7,7 @@ from django.forms import ValidationError
 from django.shortcuts import get_object_or_404
 from rest_framework import status
 from rest_framework.response import Response
-from rest_framework.decorators import api_view
+from rest_framework.decorators import api_view, throttle_classes
 import logging
 from django.db.models import Count, Q, OuterRef, Subquery
 from rest_framework import status
@@ -17,6 +17,7 @@ from rest_framework.response import Response
 
 from api.clientsDB.models.models import DeviceToken
 from api.serviceProvidersDB.services.service_validator import validate_service_submission
+from plug_backend.throttles import AuthThrottle, LiveLocationReadThrottle, LiveLocationWriteThrottle, ProfileWriteThrottle, RegisterThrottle, UploadThrottle, UserReadThrottle
 from .models import CostOfService, CostOfServiceImage, ProviderService, SPLiveLocation, SPLocationHistory, SPProfile, ServiceGroup, Service, ServiceProvider, Address
 from .serializers import (
     CostOfServiceImageReadSerializer,
@@ -45,6 +46,7 @@ logger = logging.getLogger(__name__)  ##do not remove
 
 
 @api_view(['POST'])
+@throttle_classes([AuthThrottle])
 def sp_login(request):
     try:
         serializer = SPLoginSerializer(data=request.data)
@@ -82,6 +84,7 @@ def sp_login(request):
         }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 @api_view(["POST"])
+@throttle_classes([ProfileWriteThrottle])
 def sp_add_address_document(request):
     print("FILES RECEIVED:", request.FILES)
     print("POST DATA:", request.data)
@@ -139,6 +142,7 @@ def sp_add_address_document(request):
 
 
 @api_view(['POST'])
+@throttle_classes([RegisterThrottle])
 def sp_register(request):
 
     serializer = SPProfileWriteSerializer(data=request.data)
@@ -196,6 +200,7 @@ def sp_register(request):
         )
     
 @api_view(['POST'])
+@throttle_classes([RegisterThrottle])
 def register_device_token(request):
     serializer = DeviceTokenWriteSerializer(
         data=request.data,
@@ -221,6 +226,7 @@ def register_device_token(request):
     )
 
 @api_view(["PATCH"])
+@throttle_classes([ProfileWriteThrottle])
 def patch_sp_profile_by_email(request, email):
     try:
         service_provider = ServiceProvider.objects.select_related('sp_profile').get(
@@ -274,6 +280,7 @@ def patch_sp_profile_by_email(request, email):
 
 
 @api_view(["GET"])
+
 def approved_services_list(request):
     """
     Return only APPROVED services.
@@ -290,6 +297,7 @@ def approved_services_list(request):
 
 
 @api_view(['POST'])
+@throttle_classes([ProfileWriteThrottle])
 def submit_service(request, email):
 
     service_name = request.data.get("service_name")
@@ -415,6 +423,7 @@ def submit_service(request, email):
         )
     
 @api_view(['PATCH'])
+@throttle_classes([ProfileWriteThrottle])
 def update_cost_of_service(request, email, service_id):
     try:
         provider = ServiceProvider.objects.select_related('sp_profile').get(
@@ -473,6 +482,7 @@ def update_cost_of_service(request, email, service_id):
         
 
 @api_view(['GET', 'POST'])
+@throttle_classes([UserReadThrottle])
 def sp_profile_list(request):
     if request.method == 'GET':
         profiles = SPProfile.objects.all()
@@ -488,6 +498,7 @@ def sp_profile_list(request):
 
 
 @api_view(['GET', 'PUT', 'PATCH', 'DELETE'])
+@throttle_classes([UserReadThrottle])
 def sp_profile_detail(request, email):
     try:
         profile = SPProfile.objects.get(email_address=email)
@@ -510,6 +521,7 @@ def sp_profile_detail(request, email):
         return Response(status=204)
     
 @api_view(['PATCH'])
+@throttle_classes([ProfileWriteThrottle])
 def toggle_provider_active(request, email):
     try:
         provider = ServiceProvider.objects.get(
@@ -538,6 +550,7 @@ def toggle_provider_active(request, email):
     )
 
 @api_view(['GET'])
+@throttle_classes([UserReadThrottle])
 def get_provider_services_by_email(request, email):
     try:
         provider = ServiceProvider.objects.get(
@@ -571,6 +584,7 @@ def get_provider_services_by_email(request, email):
     )
 
 @api_view(['POST'])
+@throttle_classes([ProfileWriteThrottle])
 def upload_service_images(request, cost_id):
     try:
         cost = CostOfService.objects.get(id=cost_id)
@@ -622,6 +636,7 @@ def upload_service_images(request, cost_id):
 # -------- ServiceGroup --------
 
 @api_view(['GET', 'POST'])
+@throttle_classes([UserReadThrottle])
 def service_group_list(request):
     if request.method == 'GET':
         groups = ServiceGroup.objects.all()
@@ -637,6 +652,7 @@ def service_group_list(request):
 
 
 @api_view(['GET', 'PUT', 'PATCH', 'DELETE'])
+@throttle_classes([UserReadThrottle])
 def service_group_detail(request, group_id):
     try:
         group = ServiceGroup.objects.get(group_id=group_id)
@@ -664,6 +680,7 @@ def service_group_detail(request, group_id):
 # -------- Service --------
 
 @api_view(['GET'])
+@throttle_classes([UserReadThrottle])
 def service_list(request):
     services = Service.objects.filter(
         review_status="APPROVED"
@@ -682,6 +699,7 @@ def service_list(request):
 
 
 @api_view(['GET', 'PUT', 'PATCH', 'DELETE'])
+@throttle_classes([UserReadThrottle])
 def service_detail(request, pk):
     try:
         service = Service.objects.get(pk=pk)
@@ -708,6 +726,7 @@ def service_detail(request, pk):
 # -------- ServiceProvider --------
 
 @api_view(['GET', 'POST'])
+@throttle_classes([UserReadThrottle])
 def service_provider_list(request):
     if request.method == 'GET':
         providers = ServiceProvider.objects.all()
@@ -722,6 +741,7 @@ def service_provider_list(request):
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
     
 @api_view(['GET', 'POST'])
+@throttle_classes([UserReadThrottle])
 def service_provider_list_service(request):
     if request.method == 'GET':
         service_id = request.query_params.get('service_id', None)
@@ -750,6 +770,7 @@ MAX_RETRIES = 5
 RETRY_DELAY = 0.1  
 
 @api_view(['POST'])
+@throttle_classes([LiveLocationWriteThrottle])
 def update_sp_live_location(request):
     email = request.data.get("email")
     latitude = request.data.get("latitude")
@@ -850,6 +871,7 @@ def update_sp_live_location(request):
 
 
 @api_view(['GET', 'PUT', 'PATCH', 'DELETE'])
+@throttle_classes([ProfileWriteThrottle])
 def service_provider_detail(request, email):
     try:
         provider = ServiceProvider.objects.get(sp_profile__email_address=email)
@@ -874,6 +896,7 @@ def service_provider_detail(request, email):
     
 # -------- ServiceProvider Address --------
 @api_view(['GET', 'POST', 'PUT', 'PATCH', 'DELETE'])
+@throttle_classes([ProfileWriteThrottle])
 def service_provider_address_detail(request, id):
     try:
         address = Address.objects.get(id=id)
@@ -899,6 +922,7 @@ def service_provider_address_detail(request, id):
     return Response({'error': 'Method not allowed'}, status=status.HTTP_405_METHOD_NOT_ALLOWED)
 
 @api_view(['GET', 'PUT', 'PATCH', 'DELETE'])
+@throttle_classes([ProfileWriteThrottle])
 def service_provider_address(request,):
     try:
         address = Address.objects.all()
@@ -921,12 +945,14 @@ def service_provider_address(request,):
         return Response({'message': 'Address deleted successfully.'}, status=status.HTTP_204_NO_CONTENT)
     
 @api_view(['GET'])
+@throttle_classes([UserReadThrottle])
 def providers_by_service(request, service_id):
     providers = ServiceProvider.objects.filter(services__service_id=service_id)
     serializer = ServiceProviderReadSerializer(providers, many=True)
     return Response(serializer.data)
 
 @api_view(['GET'])
+@throttle_classes([UserReadThrottle])
 def get_cost_of_service_images_by_cost_id(request, cost_id):
     try:
         CostOfService.objects.get(id=cost_id)
@@ -948,6 +974,7 @@ def get_cost_of_service_images_by_cost_id(request, cost_id):
     return Response(serializer.data, status=status.HTTP_200_OK)
 
 @api_view(['GET'])
+@throttle_classes([UserReadThrottle])
 def costs_by_sp_email(request, email, service_id=None):
     try:
         sp = ServiceProvider.objects.get(sp_profile__email_address=email)
@@ -984,6 +1011,7 @@ def costs_by_sp_email(request, email, service_id=None):
 
 
 @api_view(['GET'])
+@throttle_classes([UserReadThrottle])
 def fetch_sp_addresses_by_service(request, service_id):
 
     # Get all providers for the service
@@ -1000,6 +1028,7 @@ def fetch_sp_addresses_by_service(request, service_id):
     return Response(data)
 
 @api_view(['GET'])
+@throttle_classes([LiveLocationReadThrottle])
 def fetch_sp_live_locations_by_service(request, service_id):
     """
     Fetch up to 10 active service providers for a service
@@ -1035,56 +1064,7 @@ def fetch_sp_live_locations_by_service(request, service_id):
 
 
 @api_view(['GET'])
-def sps_by_address(request, address_id):
-    """
-    GET: Fetch all service providers linked to a specific address ID.
-    """
-    try:
-        address = Address.objects.get(id=address_id)
-    except Address.DoesNotExist:
-        return Response({'error': 'Address not found.'}, status=status.HTTP_404_NOT_FOUND)
-
-    # Fetch all service providers linked to this address
-    sps = ServiceProvider.objects.filter(location=address).select_related("sp_profile", "location").prefetch_related("services")
-
-    if not sps.exists():
-        return Response({'error': 'No service providers found for this address.'}, status=status.HTTP_404_NOT_FOUND)
-
-    serializer = ServiceProviderReadSerializer(sps, many=True, context={'request': request})
-    return Response({'service_providers': serializer.data}, status=status.HTTP_200_OK)
-
-
-
-@api_view(['GET'])
-def sps_by_addresses(request):
-    """
-    GET: Fetch all active service providers linked to multiple address IDs.
-    Example: /api/clientsDB/sp-by-addresses/?ids=1,2,3
-    """
-    ids = request.GET.get('ids')
-    if not ids:
-        return Response({'error': 'Please provide address IDs.'}, status=status.HTTP_400_BAD_REQUEST)
-
-    id_list = [int(i) for i in ids.split(',') if i.isdigit()]
-
-    sps = (
-        ServiceProvider.objects
-        .filter(location__id__in=id_list, is_active=True)  # ✅ Only active
-        .select_related("sp_profile", "location")
-        .prefetch_related("services")
-    )
-
-    if not sps.exists():
-        return Response({'error': 'No active service providers found for the given addresses.'}, status=status.HTTP_404_NOT_FOUND)
-
-    serializer = ServiceProviderReadSerializer(sps, many=True, context={'request': request})
-    return Response({'service_providers': serializer.data}, status=status.HTTP_200_OK)
-
-
-
-
-
-@api_view(['GET'])
+@throttle_classes([LiveLocationReadThrottle])
 def sps_by_live_location(request):
     """
     GET: Fetch all active service providers linked to multiple live location IDs.

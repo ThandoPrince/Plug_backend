@@ -1,10 +1,12 @@
 from django.http import JsonResponse
 from django.shortcuts import get_object_or_404
-from rest_framework.decorators import api_view, parser_classes, permission_classes
+from rest_framework.decorators import api_view, parser_classes, permission_classes, throttle_classes
 from rest_framework.response import Response
 from rest_framework import status
 from rest_framework.parsers import MultiPartParser, FormParser
 from rest_framework.permissions import AllowAny
+
+from plug_backend.throttles import ProfileWriteThrottle, UserReadThrottle
 
 
 # from rest_framework.permissions import IsAuthenticated
@@ -12,6 +14,7 @@ from .models.models import ClientAuth, ClientDetails, Address, ClientAddress, Cl
 from .serializers import AddressClaimSerializer, AddressOnlySerializer, AddressVerificationCreateSerializer, ClientAddressNoDuplicatesSerializer, AddressSerializer, ClientAddressWriteSerializer, ClientAuthReadSerializer, ClientLoginSerializer, ClientProfileSerializer, ClientRegisterSerializer, ClientSerializer, ClientAddressSerializer, DefaultAddressSerializer, DeviceTokenWriteSerializer
 
 @api_view(['POST'])
+@throttle_classes([ProfileWriteThrottle])
 def register_client(request):
     serializer = ClientRegisterSerializer(data=request.data)
 
@@ -43,6 +46,7 @@ def register_client(request):
 
 
 @api_view(['GET'])
+@throttle_classes([UserReadThrottle])
 def get_client_by_email(request, email):
     try:
         client = ClientDetails.objects.get(client_profile__email_address=email)
@@ -56,6 +60,7 @@ def get_client_by_email(request, email):
     return Response(serializer.data)
 
 @api_view(['PATCH'])
+@throttle_classes([ProfileWriteThrottle])
 @parser_classes([MultiPartParser, FormParser])
 def complete_profile_by_email(request, email):
     try:
@@ -92,6 +97,7 @@ def complete_profile_by_email(request, email):
     return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
 @api_view(['PATCH'])
+@throttle_classes([ProfileWriteThrottle])
 def set_default_address(request, address_id):
     """
     PATCH endpoint to set a selected address as default.
@@ -123,6 +129,7 @@ def set_default_address(request, address_id):
 
 
 @api_view(['POST'])
+@throttle_classes([ProfileWriteThrottle])
 def add_residential_address(request, email):
 
     client = get_object_or_404(
@@ -153,6 +160,7 @@ def add_residential_address(request, email):
     )
 
 @api_view(['GET'])
+@throttle_classes([UserReadThrottle])
 def client_auth_by_email(request, email):
     """
     GET: Fetch client auth details (without password)
@@ -170,6 +178,7 @@ def client_auth_by_email(request, email):
     return Response(serializer.data, status=status.HTTP_200_OK)
 
 @api_view(["POST"])
+@throttle_classes([ProfileWriteThrottle])
 def submit_address_verification(request, client_address_id):
     # print("FILES RECEIVED:", request.FILES)
     # print("POST DATA:", request.data)
@@ -202,6 +211,7 @@ def submit_address_verification(request, client_address_id):
     return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
 @api_view(['POST'])
+@throttle_classes([ProfileWriteThrottle])
 def register_device_token(request):
     print("FILES RECEIVED:", request.FILES)
     print("POST DATA:", request.data)   
@@ -222,6 +232,7 @@ def register_device_token(request):
     )
 
 @api_view(['POST'])
+@throttle_classes([ProfileWriteThrottle])
 def client_login(request):
     print("FILES RECEIVED:", request.FILES)
     print("POST DATA:", request.data)
@@ -242,6 +253,7 @@ def client_login(request):
 
 
 @api_view(['GET', 'POST', 'PUT', 'DELETE'])
+@throttle_classes([UserReadThrottle])
 def clientProfile_list(request,format=None):
     if request.method == 'DELETE':
         client_profile_id = request.data.get('id')
@@ -258,6 +270,7 @@ def clientProfile_list(request,format=None):
         return Response({'Client Profiles': serializer.data})
 
 @api_view(['GET'])
+@throttle_classes([UserReadThrottle])
 @parser_classes([MultiPartParser, FormParser])
 def client_list(request, format=None):
     if request.method == 'GET':
@@ -270,8 +283,8 @@ def client_list(request, format=None):
 
 
 @api_view(['GET'])
+@throttle_classes([UserReadThrottle])
 def address_list(request,format=None):
-   
 
     if request.method == 'GET':
         addresses = Address.objects.all()
@@ -296,6 +309,7 @@ def address_list(request,format=None):
             return Response({'error': 'Address not found.'}, status=404)
 
 @api_view(['GET'])
+@throttle_classes([UserReadThrottle])
 def client_address_list(request,format=None):
     if request.method == 'POST':
         serializer = ClientAddressSerializer(data=request.data)
@@ -326,38 +340,9 @@ def client_address_list(request,format=None):
         except ClientAddress.DoesNotExist:
             return Response({'error': 'Client Address not found.'}, status=404)
         
-@api_view(['GET', 'POST', 'PUT', 'DELETE'])
-def client_address_list_emai(request,format=None):
-    if request.method == 'POST':
-        serializer = ClientAddressSerializer(data=request.data)
-        if serializer.is_valid():
-            serializer.save()
-            return Response({'message': 'Client Address created successfully.', 'data': serializer.data}, status=201)
-        return Response({'error': 'Invalid data provided.', 'details': serializer.errors}, status=400)
-
-    if request.method == 'PUT':
-        serializer = ClientAddressSerializer(data=request.data)
-        if serializer.is_valid():
-            client_address = ClientAddress.objects.get(id=request.data.get('id'))
-            serializer.update(client_address, request.data)
-            return Response({'message': 'Client Address updated successfully.', 'data': serializer.data}, status=200)
-        return Response({'error': 'Invalid data provided.', 'details': serializer.errors}, status=400)
-
-    if request.method == 'GET':
-        client_addresses = ClientAddress.objects.all()
-        serializer = ClientAddressSerializer(client_addresses, many=True)
-        return Response({'Client Addresses': serializer.data})
-
-    if request.method == 'DELETE':
-        client_address_id = request.data.get('id')
-        try:
-            client_address = ClientAddress.objects.get(id=client_address_id)
-            client_address.delete()
-            return Response({'message': 'Client Address deleted successfully.'}, status=204)
-        except ClientAddress.DoesNotExist:
-            return Response({'error': 'Client Address not found.'}, status=404)
 
 @api_view(['GET', 'PUT', 'PATCH', 'DELETE'])
+@throttle_classes([UserReadThrottle])
 # @permission_classes([IsAuthenticated])
 def clientProfile_detail(request, email,format=None):
     try:
@@ -388,6 +373,7 @@ def clientProfile_detail(request, email,format=None):
     return Response({'error': 'Method not allowed.'}, status=status.HTTP_405_METHOD_NOT_ALLOWED)
 
 @api_view(['GET', 'PUT', 'DELETE'])
+@throttle_classes([UserReadThrottle])
 def client_detail(request, email,format=None):
     try:
         client = ClientDetails.objects.get(client_profile__email_address=email)
@@ -410,6 +396,7 @@ def client_detail(request, email,format=None):
         return Response({'message': 'Client deleted successfully.'}, status=status.HTTP_204_NO_CONTENT)
 
 @api_view(['GET', 'PUT', 'PATCH', 'DELETE'])
+@throttle_classes([UserReadThrottle])
 # @permission_classes([IsAuthenticated])
 def address_detail(request, id,format=None):
     try:
@@ -433,6 +420,7 @@ def address_detail(request, id,format=None):
         return Response({'message': 'Address deleted successfully.'}, status=status.HTTP_204_NO_CONTENT)
 
 @api_view(['GET'])
+@throttle_classes([UserReadThrottle])
 def client_address_detail(request, email, format=None):
     # Fetch addresses for the client, default first
     client_addresses = ClientAddress.objects.filter(
@@ -449,6 +437,7 @@ def client_address_detail(request, email, format=None):
     
 
 @api_view(['GET', 'PUT'])
+@throttle_classes([UserReadThrottle])
 @parser_classes([MultiPartParser, FormParser])
 # @permission_classes([IsAuthenticated])
 def client_profile_me(request):
@@ -469,6 +458,7 @@ def client_profile_me(request):
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
     
 @api_view(['GET'])
+@throttle_classes([UserReadThrottle])
 def client_saved_addresses(request, email):
     try:
         client = ClientDetails.objects.get(client_profile__email_address=email)
@@ -489,10 +479,8 @@ def client_saved_addresses(request, email):
 
 
 
-
-
-
 @api_view(['GET'])
+@throttle_classes([UserReadThrottle])
 def client_default_address(request, email, format=None):
     """
     GET: Retrieve the client's address where is_default=True
@@ -513,6 +501,7 @@ def client_default_address(request, email, format=None):
 
 
 @api_view(['GET'])
+@throttle_classes([UserReadThrottle])
 def clients_by_addresses(request):
 
     # Get ids from query params
@@ -547,6 +536,7 @@ def clients_by_addresses(request):
     return Response({'clients': serializer.data}, status=status.HTTP_200_OK)
 
 @api_view(['GET'])
+@throttle_classes([UserReadThrottle])
 def clients_by_address(request, address_id):
     """
     GET: Fetch all clients linked to a specific address ID.

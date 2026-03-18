@@ -133,6 +133,31 @@ MEDIA_ROOT = BASE_DIR / "media"
 
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
+REST_FRAMEWORK = {
+    "DEFAULT_THROTTLE_CLASSES": [
+        "rest_framework.throttling.AnonRateThrottle",
+        "rest_framework.throttling.UserRateThrottle",
+    ],
+    "DEFAULT_THROTTLE_RATES": {
+        "anon": "30/min",
+        "user": "100/min",
+
+        "auth": "5/min",
+        "register": "3/min",
+
+        "public_read": "30/min",
+        "user_read": "60/min",
+        "heavy_read": "20/min",
+
+        "live_location_write": "30/min",
+        "live_location_read": "20/min",
+
+        "upload": "10/min",
+        "profile_write": "20/min",
+        "booking_like_write": "15/min",
+    }
+}
+
 SESSION_GEOFENCE_RADIUS_METERS = int(get_env("SESSION_GEOFENCE_RADIUS_METERS", "45"))
 SESSION_GEOFENCE_GRACE_SECONDS = int(get_env("SESSION_GEOFENCE_GRACE_SECONDS", "120"))
 SESSION_GEOFENCE_PING_INTERVAL_SECONDS = int(get_env("SESSION_GEOFENCE_PING_INTERVAL_SECONDS", "20"))
