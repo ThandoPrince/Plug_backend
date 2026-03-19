@@ -162,17 +162,17 @@ REST_FRAMEWORK = {
     }
 }
 
-REDIS_URL = get_env("REDIS_URL", "redis://127.0.0.1:6379/0", )
+REDIS_URL = get_env("REDIS_URL", "")  # optional, no crash
 
-if DEBUG:
+if DEBUG or not REDIS_URL:
+    # Local or fallback (no Redis)
     CHANNEL_LAYERS = {
         "default": {
             "BACKEND": "channels.layers.InMemoryChannelLayer",
         }
     }
 else:
-    REDIS_URL = get_env("REDIS_URL", required=True)
-
+    # Production with Redis
     CHANNEL_LAYERS = {
         "default": {
             "BACKEND": "channels_redis.core.RedisChannelLayer",
