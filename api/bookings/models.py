@@ -4,7 +4,7 @@ from django.utils import timezone
 import uuid
 from django.conf import settings
 from django.db import models
-
+from api.bookings.ws_events import notify_provider_booking_invite, notify_provider_booking_update, notify_client_booking
 from api.bookings.services.order_status_service import OrderStatusService
 from api.clientsDB.notifications.services.client_push_notification_service import send_push_to_client
 from api.serviceProvidersDB.notifications.services.provider_push_notification_service import send_push_to_provider
@@ -81,6 +81,7 @@ class OrderService(models.Model):
         if not is_new and old_status != self.status:
             self._log_order_history(old_status=old_status, new_status=self.status)
             self._send_status_notification()
+            self._send_status_websocket_updates()
 
     def _log_order_history(self, old_status, new_status):
         try:
@@ -92,6 +93,66 @@ class OrderService(models.Model):
         except Exception as e:
             print(f"Failed to create order history for Order {self.order_id}: {e}")
 
+    def _get_client_name(self):
+        client_name = "A client"
+
+        if self.client:
+            first_name = getattr(self.client, "first_name", "") or ""
+            last_name = getattr(self.client, "last_name", "") or ""
+            full_name = f"{first_name} {last_name}".strip()
+
+            if full_name:
+                client_name = full_name
+
+        return client_name
+
+    def _get_service_name(self):
+        return (
+            self.service_required.service_name
+            if self.service_required
+            else "a service"
+        )
+
+    def _get_booking_title(self):
+        return self.title or f"New booking for {self._get_service_name()}"
+
+    def _build_provider_invite_payload(self):
+        return {
+            "type": "new_booking_invite",
+            "order_id": str(self.order_id),
+            "status": self.status,
+            "title": self._get_booking_title(),
+            "service_name": self._get_service_name(),
+            "client_name": self._get_client_name(),
+            "requested_date": self.requested_date.isoformat() if self.requested_date else None,
+            "requested_date_time": self.requested_date_time.isoformat() if self.requested_date_time else None,
+            "created_at": self.date_and_time_created.isoformat() if self.date_and_time_created else None,
+            "proposal_price": str(self.proposal_price) if self.proposal_price is not None else None,
+            "notes": self.notes,
+        }
+
+    def _build_client_status_payload(self):
+        return {
+            "type": "order_status_update",
+            "order_id": str(self.order_id),
+            "status": self.status,
+            "title": self._get_booking_title(),
+            "service_name": self._get_service_name(),
+            "provider_service_id": self.provider_for_service_id,
+            "updated_at": timezone.now().isoformat(),
+        }
+
+    def _build_provider_status_payload(self):
+        return {
+            "type": "booking_update",
+            "order_id": str(self.order_id),
+            "status": self.status,
+            "title": self._get_booking_title(),
+            "service_name": self._get_service_name(),
+            "client_name": self._get_client_name(),
+            "updated_at": timezone.now().isoformat(),
+        }
+
     def _send_status_notification(self):
         if not self.client:
             return
@@ -100,11 +161,7 @@ class OrderService(models.Model):
         if not client_auth_user:
             return
 
-        service_name = (
-            self.service_required.service_name
-            if self.service_required else
-            'your service'
-        )
+        service_name = self._get_service_name()
 
         notification_map = {
             "accepted": {
@@ -142,55 +199,88 @@ class OrderService(models.Model):
         except Exception as e:
             print(f"Push notification failed for Order {self.order_id}: {e}")
 
-    def notify_invited_providers_of_new_booking(self):
-        print(f"[Push] notify_invited_providers_of_new_booking CALLED for order {self.order_id}")
+    def _send_status_websocket_updates(self):
+        client_profile = getattr(self.client, "client_profile", None)
+        client_email = getattr(client_profile, "email_address", None)
 
-        invited_provider_services = self.invited_providers.select_related(
-        "provider",
-        "service",
-        "provider__sp_profile",
-    )
+        if client_email:
+            try:
+                notify_client_booking(
+                    client_email,
+                    self._build_client_status_payload()
+                )
+                print(f"[WS] Client booking update sent to {client_email}")
+            except Exception as e:
+                print(f"[WS ERROR] Failed client booking update for Order {self.order_id}: {e}")
 
-        print(f"[Push] invited providers count: {invited_provider_services.count()}")
-
-        if not invited_provider_services.exists():
-            print(f"[Push] No invited providers found for Order {self.order_id}.")
+        provider_service = self.provider_for_service
+        if not provider_service:
             return
 
-        client_name = "A client"
+        provider = getattr(provider_service, "provider", None)
+        if not provider:
+            return
 
-        if self.client:
-            first_name = getattr(self.client, "first_name", "") or ""
-            last_name = getattr(self.client, "last_name", "") or ""
-            full_name = f"{first_name} {last_name}".strip()
+        sp_profile = getattr(provider, "sp_profile", None)
+        provider_email = getattr(sp_profile, "email_address", None)
 
-            if full_name:
-                client_name = full_name
+        if provider_email:
+            try:
+                notify_provider_booking_update(
+                    provider_email,
+                    self._build_provider_status_payload()
+                )
+                print(f"[WS] Provider booking update sent to {provider_email}")
+            except Exception as e:
+                print(f"[WS ERROR] Failed provider booking update for Order {self.order_id}: {e}")
 
-        service_name = (
-        self.service_required.service_name
-        if self.service_required
-        else "a service"
-    )
+    def notify_invited_providers_of_new_booking(self):
+        print(f"[Notify] notify_invited_providers_of_new_booking CALLED for order {self.order_id}")
 
-        booking_title = self.title or f"New booking for {service_name}"
+        invited_provider_services = self.invited_providers.select_related(
+            "provider",
+            "service",
+            "provider__sp_profile",
+        )
+
+        invited_count = invited_provider_services.count()
+        print(f"[Notify] invited providers count: {invited_count}")
+
+        if invited_count == 0:
+            print(f"[Notify] No invited providers found for Order {self.order_id}.")
+            return
+
+        client_name = self._get_client_name()
+        service_name = self._get_service_name()
+        booking_title = self._get_booking_title()
+        payload = self._build_provider_invite_payload()
 
         for provider_service in invited_provider_services:
             provider = getattr(provider_service, "provider", None)
-
-            print(f"[Push] ProviderService ID: {provider_service.pk}")
+            print(f"[Notify] ProviderService ID: {provider_service.pk}")
 
             if not provider:
-                print("[Push] provider missing")
+                print("[Notify] provider missing")
                 continue
 
             sp_profile = getattr(provider, "sp_profile", None)
-
-            print(f"[Push] SP Profile: {sp_profile}")
+            print(f"[Notify] SP Profile: {sp_profile}")
 
             if not sp_profile:
-                print("[Push] sp_profile missing")
+                print("[Notify] sp_profile missing")
                 continue
+
+            provider_email = getattr(sp_profile, "email_address", None)
+
+            if provider_email:
+                try:
+                    notify_provider_booking_invite(provider_email, payload)
+                    print(f"[WS] Booking invite sent to {provider_email}")
+                except Exception as e:
+                    print(
+                        f"[WS ERROR] Failed sending WebSocket invite for "
+                        f"Order {self.order_id}, ProviderService {provider_service.pk}: {e}"
+                    )
 
             try:
                 send_push_to_provider(
@@ -198,22 +288,21 @@ class OrderService(models.Model):
                     title="New Booking Request 📩",
                     body=f"{client_name} created a new booking for {service_name}.",
                     data={
-                    "type": "new_booking_invite",
-                    "order_id": str(self.order_id),
-                    "status": self.status,
-                    "title": booking_title,
-                    "service_name": service_name,
-                    "client_name": client_name,
-                }
-            )
-
+                        "type": "new_booking_invite",
+                        "order_id": str(self.order_id),
+                        "status": self.status,
+                        "title": booking_title,
+                        "service_name": service_name,
+                        "client_name": client_name,
+                    }
+                )
                 print(f"[Push] Notification sent to SPProfile {sp_profile.pk}")
 
             except Exception as e:
                 print(
-                f"[Push ERROR] Failed sending notification for "
-                f"Order {self.order_id}, ProviderService {provider_service.pk}: {e}"
-            )
+                    f"[Push ERROR] Failed sending notification for "
+                    f"Order {self.order_id}, ProviderService {provider_service.pk}: {e}"
+                )
 
 
 class ServicePicture(models.Model):

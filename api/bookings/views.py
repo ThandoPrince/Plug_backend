@@ -55,16 +55,31 @@ def order_service_list(request):
 def order_service_create(request):
     print("FILES RECEIVED:", request.FILES)
     print("POST DATA:", request.data)
-    """Create a new order"""
-    serializer = OrderServiceWriteSerializer(data=request.data, context={'request': request})
-    if serializer.is_valid():
+
+    serializer = OrderServiceWriteSerializer(
+        data=request.data,
+        context={'request': request}
+    )
+
+    if not serializer.is_valid():
+        return Response(
+            serializer.errors,
+            status=status.HTTP_400_BAD_REQUEST
+        )
+
+    with transaction.atomic():
         order = serializer.save()
-        order.notify_invited_providers_of_new_booking()
-        read_serializer = OrderServiceReadSerializer(order)
-        return Response(read_serializer.data, status=status.HTTP_201_CREATED)
-    return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
+        transaction.on_commit(
+            lambda: order.notify_invited_providers_of_new_booking()
+        )
 
+    read_serializer = OrderServiceReadSerializer(order)
+
+    return Response(
+        read_serializer.data,
+        status=status.HTTP_201_CREATED
+    )
 @api_view(['GET', 'PUT', 'PATCH', 'DELETE'])
 @throttle_classes([HeavyReadThrottle])
 def order_service_detail(request, pk):

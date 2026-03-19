@@ -2,7 +2,7 @@ from datetime import datetime, timedelta
 
 from rest_framework import serializers
 from django.utils import timezone
-
+from django.db import transaction
 from api.serviceProvidersDB.models import ProviderService
 from .models import Negotiation, NegotiationRound, OrderService, BookingItem, Rating, ServicePicture, Session, SessionLocationPing, SessionToken, Shipment, ShipmentRoute
 from api.serviceProvidersDB.serializers import ProviderSeviceSerializer, ServiceSerializer
@@ -251,28 +251,47 @@ class OrderServiceWriteSerializer(serializers.ModelSerializer):
         request = self.context.get("request")
         service_required = validated_data.get("service_required")
 
-        provider_services = ProviderService.objects.filter(
-            provider__sp_profile__email_address__in=invited_emails,
-            service=service_required
-        )
+        normalized_emails = list({
+            email.strip().lower()
+            for email in invited_emails
+            if email and email.strip()
+        })
 
-        if len(provider_services) != len(invited_emails):
-            raise serializers.ValidationError(
-                "One or more invited providers do not offer this service."
+        with transaction.atomic():
+            provider_services = ProviderService.objects.select_related(
+                "provider",
+                "provider__sp_profile",
+                "service",
+            ).filter(
+                provider__sp_profile__email_address__in=normalized_emails,
+                service=service_required
             )
 
-        order = OrderService.objects.create(**validated_data)
+            found_emails = {
+                ps.provider.sp_profile.email_address.strip().lower()
+                for ps in provider_services
+                if ps.provider and ps.provider.sp_profile and ps.provider.sp_profile.email_address
+            }
 
-        order.invited_providers.set(provider_services)
+            missing_emails = set(normalized_emails) - found_emails
+            if missing_emails:
+                raise serializers.ValidationError({
+                    "invited_providers": (
+                        "One or more invited providers do not offer this service."
+                    )
+                })
 
-        
+            order = OrderService.objects.create(**validated_data)
 
-        if request and hasattr(request, "FILES"):
-            for file in request.FILES.getlist("service_pictures"):
-                ServicePicture.objects.create(
-                    order=order,
-                    image=file
-                )
+            if provider_services.exists():
+                order.invited_providers.set(provider_services)
+
+            if request and hasattr(request, "FILES"):
+                for file in request.FILES.getlist("service_pictures"):
+                    ServicePicture.objects.create(
+                        order=order,
+                        image=file
+                    )
 
         return order
 

@@ -6,11 +6,13 @@ import dj_database_url
 BASE_DIR = Path(__file__).resolve().parent.parent
 load_dotenv(BASE_DIR / ".env")
 
+
 def get_env(name: str, default: str | None = None, required: bool = False) -> str:
     value = os.getenv(name, default)
     if required and not value:
         raise ValueError(f"Missing required environment variable: {name}")
     return value
+
 
 SECRET_KEY = get_env("DJANGO_SECRET_KEY", required=True)
 DEBUG = get_env("DJANGO_DEBUG", "False").lower() == "true"
@@ -19,16 +21,16 @@ ALLOWED_HOSTS = [
     host.strip()
     for host in get_env(
         "DJANGO_ALLOWED_HOSTS",
-        "localhost,127.0.0.1",
-        "https://web-production-7dfca.up.railway.app/"
+        "localhost,127.0.0.1,web-production-7dfca.up.railway.app"
     ).split(",")
     if host.strip()
 ]
+
 CSRF_TRUSTED_ORIGINS = [
     origin.strip()
     for origin in get_env(
         "DJANGO_CSRF_TRUSTED_ORIGINS",
-        "http://127.0.0.1,http://localhost"
+        "http://127.0.0.1,http://localhost,https://web-production-7dfca.up.railway.app"
     ).split(",")
     if origin.strip()
 ]
@@ -39,12 +41,14 @@ CORS_ALLOWED_ORIGINS = [
     origin.strip()
     for origin in get_env(
         "DJANGO_CORS_ALLOWED_ORIGINS",
-        "http://127.0.0.1:8000,http://localhost:8000"
+        "http://127.0.0.1:8000,http://localhost:8000,https://web-production-7dfca.up.railway.app"
     ).split(",")
     if origin.strip()
 ]
 
 INSTALLED_APPS = [
+    "daphne",
+    "channels",
     "corsheaders",
     "rest_framework",
     "django.contrib.admin",
@@ -91,6 +95,7 @@ TEMPLATES = [
 ]
 
 WSGI_APPLICATION = "plug_backend.wsgi.application"
+ASGI_APPLICATION = "plug_backend.asgi.application"
 
 DATABASES = {
     "default": dj_database_url.config(
@@ -117,7 +122,10 @@ HMS_APP_ID = get_env("HMS_APP_ID", "")
 HMS_APP_SECRET = get_env("HMS_APP_SECRET", "")
 PROVIDER_HMS_APP_ID = get_env("PROVIDER_HMS_APP_ID", "")
 PROVIDER_HMS_APP_SECRET = get_env("PROVIDER_HMS_APP_SECRET", "")
-FIREBASE_KEY_PATH = get_env("FIREBASE_KEY_PATH", str(BASE_DIR / "config" / "firebase-adminsdk.json"))
+FIREBASE_KEY_PATH = get_env(
+    "FIREBASE_KEY_PATH",
+    str(BASE_DIR / "config" / "firebase-adminsdk.json")
+)
 
 LANGUAGE_CODE = "en-us"
 TIME_ZONE = "Africa/Johannesburg"
@@ -141,22 +149,38 @@ REST_FRAMEWORK = {
     "DEFAULT_THROTTLE_RATES": {
         "anon": "30/min",
         "user": "100/min",
-
         "auth": "5/min",
         "register": "3/min",
-
         "public_read": "30/min",
         "user_read": "60/min",
         "heavy_read": "20/min",
-
         "live_location_write": "30/min",
         "live_location_read": "20/min",
-
         "upload": "10/min",
         "profile_write": "20/min",
         "booking_like_write": "15/min",
     }
 }
+
+REDIS_URL = get_env("REDIS_URL", "redis://127.0.0.1:6379/0", )
+
+if DEBUG:
+    CHANNEL_LAYERS = {
+        "default": {
+            "BACKEND": "channels.layers.InMemoryChannelLayer",
+        }
+    }
+else:
+    REDIS_URL = get_env("REDIS_URL", required=True)
+
+    CHANNEL_LAYERS = {
+        "default": {
+            "BACKEND": "channels_redis.core.RedisChannelLayer",
+            "CONFIG": {
+                "hosts": [REDIS_URL],
+            },
+        }
+    }
 
 SESSION_GEOFENCE_RADIUS_METERS = int(get_env("SESSION_GEOFENCE_RADIUS_METERS", "45"))
 SESSION_GEOFENCE_GRACE_SECONDS = int(get_env("SESSION_GEOFENCE_GRACE_SECONDS", "120"))
