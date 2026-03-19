@@ -94,7 +94,7 @@ TEMPLATES = [
     },
 ]
 
-WSGI_APPLICATION = "plug_backend.wsgi.application"
+
 ASGI_APPLICATION = "plug_backend.asgi.application"
 
 DATABASES = {
