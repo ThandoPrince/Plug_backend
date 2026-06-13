@@ -110,6 +110,7 @@ urlpatterns = [
     path('api/serviceProvider/cost/<int:cost_id>/images/',sp_views.upload_service_images,name='upload_service_images'),
     path('api/providers/toggle-active/',sp_views.toggle_provider_active,name='toggle-provider-active'),
     path('api/sp/register/device-token/', sp_views.register_device_token, name='register-device-token'),
+    path('api/sp/register/device-tokenn/', sp_views.register_device_token, name='register-device-token'),
     
 
 
