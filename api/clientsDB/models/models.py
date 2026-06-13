@@ -5,6 +5,7 @@ import uuid
 from django.utils import timezone
 from datetime import timedelta
 
+from django.db import models
 from api.bookings.utils.choices import BUILDING_TYPE_CHOICES
 
 
@@ -67,23 +68,49 @@ class Address(models.Model):
 
     def __str__(self):
      return self.formatted_address or self.get_formatted_address()
+    
+
+
 
 
 class ClientAuth(models.Model):
     id = models.AutoField(primary_key=True)
-    email_address = models.EmailField(unique=True, max_length=100)
-    mobile_number = models.CharField(max_length=60, default='0719503706')
+
+    email_address = models.EmailField(
+        unique=True,
+        max_length=100
+    )
+
+    mobile_number = models.CharField(
+        max_length=60,
+        blank=True,
+        null=True,
+        unique=True
+    )
+
     password = models.CharField(max_length=128)
+
     Profile_CHOICES = [
         ("in-details", "In-Details"),
         ("in-address", "In-Address"),
         ("completed", "Completed"),
     ]
-    is_profile_completed = models.CharField(default="in-details", choices=Profile_CHOICES, max_length= 20)
 
+    is_profile_completed = models.CharField(
+        default="in-details",
+        choices=Profile_CHOICES,
+        max_length=20
+    )
+
+    @property
+    def is_authenticated(self):
+        return True
+    @property
+    def is_anonymous(self):
+        return False
 
     def __str__(self):
-        return f"{self.email_address} - {self.password}"
+        return f"{self.email_address}"
 
 class DeviceToken(models.Model):
     DEVICE_TYPES = (

@@ -5,6 +5,7 @@ from django.core.validators import RegexValidator
 from django.core.exceptions import ValidationError as DjangoValidationError
 from .models.models import AddressSuperUserVerification, ClientAuth, Address, ClientDetails, ClientAddress, ClientNotification, DeviceToken
 import re
+from django.db.models import Q
 from django.contrib.auth.hashers import check_password
 import phonenumbers
 from datetime import date
@@ -233,26 +234,24 @@ class ClientAddressSerializer(serializers.ModelSerializer):
         fields = '__all__'
 
 class DeviceTokenWriteSerializer(serializers.ModelSerializer):
-    email = serializers.EmailField(write_only=True, required=True)
-    push_token = serializers.CharField(write_only=True, required=True, source='fcm_token')
+
+    push_token = serializers.CharField(
+        source='fcm_token'
+    )
 
     class Meta:
         model = DeviceToken
-        fields = '__all__'
-        extra_kwargs = {
-            'client': {'read_only': True},
-            'fcm_token': {'required': False},  # prevent DRF from expecting it separately
-        }
+        fields = ['push_token']
 
     def create(self, validated_data):
-        email = validated_data.pop('email')
-        try:
-            client_user = ClientAuth.objects.get(email_address=email)
-        except ClientAuth.DoesNotExist:
-            raise serializers.ValidationError({"email": "No client found with this email."})
 
-        validated_data['client'] = client_user
-        return super().create(validated_data)
+        validated_data['client'] = self.context[
+            'request'
+        ].user
+
+        return DeviceToken.objects.create(
+            **validated_data
+        )
     
 class DeviceTokenReadSerializer(serializers.ModelSerializer):
     client_email = serializers.CharField(source='client.email_address', read_only=True)
@@ -400,40 +399,37 @@ class AddressVerificationCreateSerializer(serializers.ModelSerializer):
 
     
 class ClientLoginSerializer(serializers.Serializer):
-    email = serializers.EmailField(required=True)
+    identifier = serializers.CharField(required=True)
     password = serializers.CharField(write_only=True, required=True, min_length=6)
 
-    first_name = serializers.CharField(source='clientdetails.first_name', read_only=True)
-    last_name = serializers.CharField(source='clientdetails.last_name', read_only=True)
-    is_profile_completed = serializers.BooleanField(read_only=True)
-
     def validate(self, data):
-        email = data.get('email')
-        password = data.get('password')
+        identifier = data.get("identifier")
+        password = data.get("password")
+        print("ALL USERS:")
+        print(ClientAuth.objects.all().values("id", "email_address", "mobile_number"))
 
-        if not email:
+        user = ClientAuth.objects.filter(
+            Q(email_address__iexact=identifier) |
+            Q(mobile_number=identifier)
+        ).first()
+
+        if not user:
+            print("LOGIN FAILED: USER NOT FOUND")
             raise serializers.ValidationError({
-                "email": ["Email is required."]
-            })
-        if not password:
-            raise serializers.ValidationError({
-                "password": ["Password is required."]
+                "non_field_errors": ["Invalid email/mobile number or password."]
             })
 
-        try:
-            user = ClientAuth.objects.get(email_address=email)
-        except ClientAuth.DoesNotExist:
-            raise serializers.ValidationError({
-                "non_field_errors": ["Invalid email or password."]
-            })
+        print("USER FOUND:", user.email_address)
 
         if not check_password(password, user.password):
+            print("LOGIN FAILED: WRONG PASSWORD")
             raise serializers.ValidationError({
-                "non_field_errors": ["Invalid email or password."]
+                "non_field_errors": ["Invalid email/mobile number or password."]
             })
 
-        data['user'] = user
+        data["user"] = user
         return data
+        
 
 
 

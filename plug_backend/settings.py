@@ -2,6 +2,7 @@ from pathlib import Path
 import os
 from dotenv import load_dotenv
 import dj_database_url
+from datetime import timedelta
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 load_dotenv(BASE_DIR / ".env")
@@ -13,6 +14,14 @@ def get_env(name: str, default: str | None = None, required: bool = False) -> st
         raise ValueError(f"Missing required environment variable: {name}")
     return value
 
+SIMPLE_JWT = {
+    "ACCESS_TOKEN_LIFETIME": timedelta(hours=1),
+    "REFRESH_TOKEN_LIFETIME": timedelta(days=30),
+    "ROTATE_REFRESH_TOKENS": True,
+    "BLACKLIST_AFTER_ROTATION": True,
+}
+
+
 
 SECRET_KEY = get_env("DJANGO_SECRET_KEY", required=True)
 DEBUG = get_env("DJANGO_DEBUG", "False").lower() == "true"
@@ -21,7 +30,7 @@ ALLOWED_HOSTS = [
     host.strip()
     for host in get_env(
         "DJANGO_ALLOWED_HOSTS",
-        "localhost,127.0.0.1,web-production-7dfca.up.railway.app"
+        "localhost,127.0.0.1,web-production-7dfca.up.railway.app,10.0.2.2"
     ).split(",")
     if host.strip()
 ]
@@ -50,6 +59,8 @@ INSTALLED_APPS = [
     "daphne",
     "channels",
     "corsheaders",
+    "rest_framework_simplejwt",
+    "rest_framework_simplejwt.token_blacklist",
     "rest_framework",
     "django.contrib.admin",
     "django.contrib.auth",

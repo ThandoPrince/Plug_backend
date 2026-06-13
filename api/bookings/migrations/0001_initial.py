@@ -210,11 +210,11 @@ class Migration(migrations.Migration):
         ),
         migrations.AddConstraint(
             model_name='rating',
-            constraint=models.CheckConstraint(check=models.Q(('rater_client__isnull', False), ('rater_provider__isnull', False), _connector='OR'), name='rating_must_have_a_rater'),
+            constraint=models.CheckConstraint(condition=models.Q(('rater_client__isnull', False), ('rater_provider__isnull', False), _connector='OR'), name='rating_must_have_a_rater'),
         ),
         migrations.AddConstraint(
             model_name='rating',
-            constraint=models.CheckConstraint(check=models.Q(('rater_client__isnull', False), ('rater_provider__isnull', False), _negated=True), name='rating_only_one_rater'),
+            constraint=models.CheckConstraint(condition=~models.Q(('rater_client__isnull', False), ('rater_provider__isnull', False)), name='rating_only_one_rater'),
         ),
         migrations.AddConstraint(
             model_name='rating',

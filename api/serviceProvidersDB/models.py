@@ -147,6 +147,18 @@ class SPProfile(models.Model):
     ]
     is_profile_completed = models.CharField(default="in-details", choices=Profile_CHOICES, max_length= 20)
     is_active = models.BooleanField(default=True)
+    class Meta:
+        db_table = 'sp_profiles'
+        indexes = [
+            models.Index(fields=['email_address', 'is_active', 'is_profile_completed'],name='sp_profile_lookup_idx'),
+        ]
+
+    @property
+    def is_authenticated(self):
+        return True
+    @property
+    def is_anonymous(self):
+        return False
 
     def set_password(self, raw_password):
         self.password = make_password(raw_password)
@@ -157,6 +169,7 @@ class SPProfile(models.Model):
     
     
 class ServiceProvider(models.Model):
+    
     rating = models.DecimalField(max_digits=3, decimal_places=2, null=True, blank=True, default=0.0)
     full_name = models.CharField(max_length=85)
     gender = models.CharField(max_length=50, null=True, blank=True)

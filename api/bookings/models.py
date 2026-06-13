@@ -832,7 +832,7 @@ class Rating(models.Model):
         constraints = [
             # Prevent both being NULL
             models.CheckConstraint(
-                check=(
+                condition=(
                     models.Q(rater_client__isnull=False) |
                     models.Q(rater_provider__isnull=False)
                 ),
@@ -841,7 +841,7 @@ class Rating(models.Model):
 
             # Prevent both being filled
             models.CheckConstraint(
-                check=~(
+                condition=~(
                     models.Q(rater_client__isnull=False) &
                     models.Q(rater_provider__isnull=False)
                 ),

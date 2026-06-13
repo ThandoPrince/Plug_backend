@@ -7,17 +7,21 @@ from django.forms import ValidationError
 from django.shortcuts import get_object_or_404
 from rest_framework import status
 from rest_framework.response import Response
-from rest_framework.decorators import api_view, throttle_classes
+from rest_framework.decorators import api_view, authentication_classes, permission_classes, throttle_classes
 import logging
 from django.db.models import Count, Q, OuterRef, Subquery
 from rest_framework import status
 from rest_framework.decorators import api_view, parser_classes
 from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 from rest_framework.response import Response
-
+from rest_framework.permissions import IsAuthenticated
 from api.clientsDB.models.models import DeviceToken
+from api.clientsDB.services.jwt_client_authentication import ClientJWTAuthentication
 from api.serviceProvidersDB.services.service_validator import validate_service_submission
+from api.serviceProvidersDB.services.sp_jwt_authentication import SPJWTAuthentication
+from plug_backend.helpers.auth_helpers import get_service_provider
 from plug_backend.throttles import AuthThrottle, LiveLocationReadThrottle, LiveLocationWriteThrottle, ProfileWriteThrottle, RegisterThrottle, UploadThrottle, UserReadThrottle
+from plug_backend.utils.sp_jwt_helper import generate_sp_tokens
 from .models import CostOfService, CostOfServiceImage, ProviderService, SPLiveLocation, SPLocationHistory, SPProfile, ServiceGroup, Service, ServiceProvider, Address
 from .serializers import (
     CostOfServiceImageReadSerializer,
@@ -53,6 +57,7 @@ def sp_login(request):
         
         if serializer.is_valid():
             user = serializer.validated_data["user"]
+            tokens = generate_sp_tokens(user)
             
             return Response({
                 "success": True,
@@ -60,7 +65,11 @@ def sp_login(request):
                 "data": {
                     "email": user.email_address,
                     "is_profile_completed": user.is_profile_completed,
-                    # If using JWT, return token here
+                    "access_token": tokens["access"],
+                    "refresh_token": tokens["refresh"],
+
+
+                    
                 }
             }, status=status.HTTP_200_OK)
 
@@ -85,6 +94,8 @@ def sp_login(request):
 
 @api_view(["POST"])
 @throttle_classes([ProfileWriteThrottle])
+@authentication_classes([SPJWTAuthentication])
+@permission_classes([IsAuthenticated])
 def sp_add_address_document(request):
     print("FILES RECEIVED:", request.FILES)
     print("POST DATA:", request.data)
@@ -164,14 +175,19 @@ def sp_register(request):
                 is_profile_completed="in-details"
             )
 
+            tokens = generate_sp_tokens(sp_profile)
+
         return Response(
             {
                 "success": True,
                 "message": "Service Provider registered successfully.",
                 "data": {
+                    "id": sp_profile.id,
                     "email": sp_profile.email_address,
                     "mobile": sp_profile.mobile_number,
-                    "profile_status": sp_profile.is_profile_completed
+                    "profile_status": sp_profile.is_profile_completed,
+                    "access_token": tokens["access"],
+                    "refresh_token": tokens["refresh"],
                 }
             },
             status=status.HTTP_201_CREATED
@@ -201,6 +217,8 @@ def sp_register(request):
     
 @api_view(['POST'])
 @throttle_classes([RegisterThrottle])
+@authentication_classes([SPJWTAuthentication])
+@permission_classes([IsAuthenticated])
 def register_device_token(request):
     serializer = DeviceTokenWriteSerializer(
         data=request.data,
@@ -227,11 +245,15 @@ def register_device_token(request):
 
 @api_view(["PATCH"])
 @throttle_classes([ProfileWriteThrottle])
-def patch_sp_profile_by_email(request, email):
+@authentication_classes([SPJWTAuthentication])
+@permission_classes([IsAuthenticated])
+def patch_sp_profile(request):
+
     try:
-        service_provider = ServiceProvider.objects.select_related('sp_profile').get(
-            sp_profile__email_address=email
-        )
+        service_provider = ServiceProvider.objects.select_related(
+            'sp_profile'
+        ).get(sp_profile=request.user)
+
     except ServiceProvider.DoesNotExist:
         return Response({
             "success": False,
@@ -246,30 +268,20 @@ def patch_sp_profile_by_email(request, email):
     )
 
     if serializer.is_valid():
-        try:
-            serializer.save()
+        serializer.save()
 
-            # Update onboarding step after successful details completion
-            sp_profile = service_provider.sp_profile
-            service_provider.sp_profile.is_profile_completed = "in-address"
-            sp_profile.save(update_fields=["is_profile_completed"])
+        sp_profile = service_provider.sp_profile
+        sp_profile.is_profile_completed = "in-address"
+        sp_profile.save(update_fields=["is_profile_completed"])
 
-            return Response({
-                "success": True,
-                "message": "Profile updated successfully.",
-                "data": {
-                    **serializer.data,
-                    "profile_status": sp_profile.is_profile_completed,
-                }
-            }, status=status.HTTP_200_OK)
-
-        except Exception as e:
-            import logging
-            logging.getLogger(__name__).error(f"Patch Error: {str(e)}")
-            return Response({
-                "success": False,
-                "message": "A server error occurred while saving your data."
-            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        return Response({
+            "success": True,
+            "message": "Profile updated successfully.",
+            "data": {
+                **serializer.data,
+                "profile_status": sp_profile.is_profile_completed,
+            }
+        }, status=status.HTTP_200_OK)
 
     return Response({
         "success": False,
@@ -280,7 +292,8 @@ def patch_sp_profile_by_email(request, email):
 
 
 @api_view(["GET"])
-
+@authentication_classes([SPJWTAuthentication])
+@permission_classes([IsAuthenticated])
 def approved_services_list(request):
     """
     Return only APPROVED services.
@@ -298,7 +311,9 @@ def approved_services_list(request):
 
 @api_view(['POST'])
 @throttle_classes([ProfileWriteThrottle])
-def submit_service(request, email):
+@authentication_classes([SPJWTAuthentication])
+@permission_classes([IsAuthenticated])
+def submit_service(request, provider_id):
 
     service_name = request.data.get("service_name")
     description = request.data.get("description", "")
@@ -313,7 +328,7 @@ def submit_service(request, email):
     # Get Provider
     try:
         provider = ServiceProvider.objects.select_related('sp_profile').get(
-            sp_profile__email_address=email
+            sp_profile__id=provider_id
         )
     except ServiceProvider.DoesNotExist:
         return Response(
@@ -424,11 +439,13 @@ def submit_service(request, email):
     
 @api_view(['PATCH'])
 @throttle_classes([ProfileWriteThrottle])
-def update_cost_of_service(request, email, service_id):
+@authentication_classes([SPJWTAuthentication])
+@permission_classes([IsAuthenticated])
+def update_cost_of_service(request, service_id):
     try:
-        provider = ServiceProvider.objects.select_related('sp_profile').get(
-            sp_profile__email_address=email
-        )
+        provider = ServiceProvider.objects.select_related(
+            'sp_profile'
+        ).get(sp_profile=request.user)
     except ServiceProvider.DoesNotExist:
         return Response({"error": "Provider not found"}, status=404)
 
@@ -483,13 +500,11 @@ def update_cost_of_service(request, email, service_id):
 
 @api_view(['GET', 'POST'])
 @throttle_classes([UserReadThrottle])
+@authentication_classes([SPJWTAuthentication])
+@permission_classes([IsAuthenticated])
 def sp_profile_list(request):
-    if request.method == 'GET':
-        profiles = SPProfile.objects.all()
-        serializer = SPProfileReadSerializer(profiles, many=True)
-        return Response(serializer.data)
-
-    elif request.method == 'POST':
+    
+    if request.method == 'POST':
         serializer = SPProfileReadSerializer(data=request.data)
         if serializer.is_valid():
             serializer.save()
@@ -499,9 +514,11 @@ def sp_profile_list(request):
 
 @api_view(['GET', 'PUT', 'PATCH', 'DELETE'])
 @throttle_classes([UserReadThrottle])
-def sp_profile_detail(request, email):
+@authentication_classes([SPJWTAuthentication])
+@permission_classes([IsAuthenticated])
+def sp_profile_detail(request):
     try:
-        profile = SPProfile.objects.get(email_address=email)
+        profile = request.user
     except SPProfile.DoesNotExist:
         return Response({'error': 'Profile not found.'}, status=status.HTTP_404_NOT_FOUND)
 
@@ -522,11 +539,13 @@ def sp_profile_detail(request, email):
     
 @api_view(['PATCH'])
 @throttle_classes([ProfileWriteThrottle])
-def toggle_provider_active(request, email):
+@authentication_classes([SPJWTAuthentication])
+@permission_classes([IsAuthenticated])
+def toggle_provider_active(request):
     try:
         provider = ServiceProvider.objects.get(
-            sp_profile__email_address=email
-        )
+    sp_profile=request.user
+)
     except ServiceProvider.DoesNotExist:
         return Response(
             {
@@ -544,18 +563,20 @@ def toggle_provider_active(request, email):
             "success": True,
             "message": "Provider active status updated",
             "is_active": provider.is_active,
-            "email": email,
+            
         },
         status=status.HTTP_200_OK,
     )
 
 @api_view(['GET'])
 @throttle_classes([UserReadThrottle])
-def get_provider_services_by_email(request, email):
+def get_provider_services(request, provider_id):
     try:
-        provider = ServiceProvider.objects.get(
-            sp_profile__email_address=email
-        )
+        provider = get_object_or_404(
+    ServiceProvider,
+    sp_profile__id=provider_id,
+    is_active=True
+)
     except ServiceProvider.DoesNotExist:
         return Response(
             {
@@ -585,58 +606,92 @@ def get_provider_services_by_email(request, email):
 
 @api_view(['POST'])
 @throttle_classes([ProfileWriteThrottle])
+@authentication_classes([SPJWTAuthentication])
+@permission_classes([IsAuthenticated])
 def upload_service_images(request, cost_id):
+
     try:
-        cost = CostOfService.objects.get(id=cost_id)
-    except CostOfService.DoesNotExist:
+        provider = ServiceProvider.objects.select_related(
+            'sp_profile'
+        ).get(
+            sp_profile=request.user
+        )
+    except ServiceProvider.DoesNotExist:
         return Response(
-            {"error": "CostOfService not found"},
-            status=404
+            {
+                "success": False,
+                "message": "Provider not found."
+            },
+            status=status.HTTP_404_NOT_FOUND
         )
 
-    images = request.FILES.getlist('images')
+    try:
+        cost = CostOfService.objects.get(
+            id=cost_id,
+            provider_service__provider=provider
+        )
+    except CostOfService.DoesNotExist:
+        return Response(
+            {
+                "success": False,
+                "message": "Cost of service not found or you do not have permission to modify it."
+            },
+            status=status.HTTP_404_NOT_FOUND
+        )
+
+    images = request.FILES.getlist("images")
 
     if not images:
         return Response(
-            {"error": "No images provided"},
-            status=400
+            {
+                "success": False,
+                "message": "No images provided."
+            },
+            status=status.HTTP_400_BAD_REQUEST
         )
 
-    if cost.images.count() + len(images) > 5:
+    current_count = cost.images.count()
+
+    if current_count + len(images) > 5:
         return Response(
-            {"error": "Maximum 5 images allowed"},
-            status=400
+            {
+                "success": False,
+                "message": f"Maximum 5 images allowed. Currently stored: {current_count}."
+            },
+            status=status.HTTP_400_BAD_REQUEST
         )
 
     created_images = []
 
-    for img in images:
+    for image_file in images:
         image = CostOfServiceImage.objects.create(
             cost_of_service=cost,
-            image=img
+            image=image_file
         )
         created_images.append(image)
 
     serializer = CostOfServiceImageReadSerializer(
         created_images,
         many=True,
-        context={'request': request},
+        context={"request": request}
     )
 
     return Response(
         {
             "success": True,
-            "images": serializer.data
+            "message": "Images uploaded successfully.",
+            "count": len(created_images),
+            "images": serializer.data,
         },
-        status=201
+        status=status.HTTP_201_CREATED
     )
-
-
 
 # -------- ServiceGroup --------
 
 @api_view(['GET', 'POST'])
 @throttle_classes([UserReadThrottle])
+@authentication_classes([SPJWTAuthentication])
+@permission_classes([IsAuthenticated])
 def service_group_list(request):
     if request.method == 'GET':
         groups = ServiceGroup.objects.all()
@@ -681,6 +736,8 @@ def service_group_detail(request, group_id):
 
 @api_view(['GET'])
 @throttle_classes([UserReadThrottle])
+@authentication_classes([ClientJWTAuthentication])
+@permission_classes([IsAuthenticated])
 def service_list(request):
     services = Service.objects.filter(
         review_status="APPROVED"
@@ -700,6 +757,8 @@ def service_list(request):
 
 @api_view(['GET', 'PUT', 'PATCH', 'DELETE'])
 @throttle_classes([UserReadThrottle])
+@authentication_classes([SPJWTAuthentication])
+@permission_classes([IsAuthenticated])
 def service_detail(request, pk):
     try:
         service = Service.objects.get(pk=pk)
@@ -727,6 +786,8 @@ def service_detail(request, pk):
 
 @api_view(['GET', 'POST'])
 @throttle_classes([UserReadThrottle])
+@authentication_classes([SPJWTAuthentication])
+@permission_classes([IsAuthenticated])
 def service_provider_list(request):
     if request.method == 'GET':
         providers = ServiceProvider.objects.all()
@@ -742,6 +803,8 @@ def service_provider_list(request):
     
 @api_view(['GET', 'POST'])
 @throttle_classes([UserReadThrottle])
+@authentication_classes([ClientJWTAuthentication])
+@permission_classes([IsAuthenticated])
 def service_provider_list_service(request):
     if request.method == 'GET':
         service_id = request.query_params.get('service_id', None)
@@ -771,21 +834,21 @@ RETRY_DELAY = 0.1
 
 @api_view(['POST'])
 @throttle_classes([LiveLocationWriteThrottle])
+@authentication_classes([SPJWTAuthentication])
+@permission_classes([IsAuthenticated])
 def update_sp_live_location(request):
-    email = request.data.get("email")
+    
     latitude = request.data.get("latitude")
     longitude = request.data.get("longitude")
 
-    if not email or not latitude or not longitude:
+    if not latitude or not longitude:
         return Response(
-            {"error": "email, latitude and longitude are required"},
+            {"error": "latitude and longitude are required"},
             status=status.HTTP_400_BAD_REQUEST
         )
 
     try:
-        provider = ServiceProvider.objects.select_related("sp_profile").get(
-            sp_profile__email_address=email
-        )
+        provider = get_service_provider(request)
     except ServiceProvider.DoesNotExist:
         return Response(
             {"error": "Service provider not found for this email"},
@@ -807,7 +870,7 @@ def update_sp_live_location(request):
                         {
                             "message": "Location unchanged. No update needed.",
                             "data": {
-                                "provider_email": provider.sp_profile.email_address,
+                                "provider_id": provider.id,
                                 "latitude": str(live_location.latitude),
                                 "longitude": str(live_location.longitude),
                                 "updated_at": live_location.updated_at,
@@ -870,88 +933,141 @@ def update_sp_live_location(request):
 
 
 
-@api_view(['GET', 'PUT', 'PATCH', 'DELETE'])
-@throttle_classes([ProfileWriteThrottle])
-def service_provider_detail(request, email):
+@api_view(['GET'])
+@authentication_classes([ClientJWTAuthentication])
+
+
+@permission_classes([IsAuthenticated])
+def service_provider_detail(request, id):
     try:
-        provider = ServiceProvider.objects.get(sp_profile__email_address=email)
+        provider = ServiceProvider.objects.get(sp_profile__id=id)
     except ServiceProvider.DoesNotExist:
-        return Response({'error': 'Service Provider not found.'}, status=status.HTTP_404_NOT_FOUND)
+        return Response(
+            {'error': 'Service Provider not found.'},
+            status=status.HTTP_404_NOT_FOUND
+        )
+
+    if request.method == 'GET':
+        serializer = ServiceProviderReadSerializer(provider)
+        return Response(serializer.data)
+    
+
+@api_view(['GET', 'PUT', 'PATCH'])
+@authentication_classes([SPJWTAuthentication])
+@permission_classes([IsAuthenticated])
+def service_provider_details(request, id):
+    try:
+        provider = ServiceProvider.objects.get(sp_profile__id=id)
+    except ServiceProvider.DoesNotExist:
+        return Response(
+            {'error': 'Service Provider not found.'},
+            status=status.HTTP_404_NOT_FOUND
+        )
 
     if request.method == 'GET':
         serializer = ServiceProviderReadSerializer(provider)
         return Response(serializer.data)
 
-    elif request.method in ['PUT', 'PATCH']:
-        partial = request.method == 'PATCH'
-        serializer = ServiceProviderWriteSerializer(provider, data=request.data, partial=partial)
-        if serializer.is_valid():
-            serializer.save()
-            return Response(ServiceProviderReadSerializer(provider).data)
-        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
-    elif request.method == 'DELETE':
-        provider.delete()
-        return Response(status=status.HTTP_204_NO_CONTENT)
     
 # -------- ServiceProvider Address --------
-@api_view(['GET', 'POST', 'PUT', 'PATCH', 'DELETE'])
+@api_view(['GET', 'PUT', 'PATCH', 'DELETE'])
 @throttle_classes([ProfileWriteThrottle])
+@authentication_classes([SPJWTAuthentication])
+@permission_classes([IsAuthenticated])
 def service_provider_address_detail(request, id):
+
+    provider = get_service_provider(request)
+
     try:
-        address = Address.objects.get(id=id)
+        address = Address.objects.get(
+            id=id,
+            serviceprovider=provider
+        )
+
     except Address.DoesNotExist:
-        return Response({'error': 'Address not found.'}, status=status.HTTP_404_NOT_FOUND)
+        return Response(
+            {
+                "success": False,
+                "message": "Address not found."
+            },
+            status=status.HTTP_404_NOT_FOUND
+        )
 
     if request.method == 'GET':
         serializer = SPAddressSerializer(address)
-        return Response(serializer.data, status=status.HTTP_200_OK)
+        return Response(serializer.data)
 
     elif request.method in ['PUT', 'PATCH']:
-        serializer = SPAddressSerializer(address, data=request.data, partial=True)
+
+        serializer = SPAddressSerializer(
+            address,
+            data=request.data,
+            partial=True
+        )
+
         if serializer.is_valid():
             serializer.save()
-            
             return Response(serializer.data)
-        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        return Response(
+            serializer.errors,
+            status=status.HTTP_400_BAD_REQUEST
+        )
 
     elif request.method == 'DELETE':
+
+        if provider.location_id == address.id:
+            provider.location = None
+            provider.save(update_fields=["location"])
+
         address.delete()
-        return Response(status=status.HTTP_204_NO_CONTENT)
-    
-    return Response({'error': 'Method not allowed'}, status=status.HTTP_405_METHOD_NOT_ALLOWED)
+
+        return Response(
+            status=status.HTTP_204_NO_CONTENT
+        )
 
 @api_view(['GET', 'PUT', 'PATCH', 'DELETE'])
 @throttle_classes([ProfileWriteThrottle])
+@authentication_classes([SPJWTAuthentication])
+@permission_classes([IsAuthenticated])
 def service_provider_address(request,):
     try:
-        address = Address.objects.all()
+        provider = get_service_provider(request)
+
+        addresses = Address.objects.filter(
+        serviceprovider=provider
+        )
     except Address.DoesNotExist:
         return Response({'error': 'Address not found.'}, status=status.HTTP_404_NOT_FOUND)
 
     if request.method == 'GET':
-        serializer = SPAddressSerializer(address, many=True)
+        serializer = SPAddressSerializer(addresses , many=True)
         return Response(serializer.data, status=status.HTTP_200_OK)
 
     elif request.method in ['PUT', 'PATCH']:
-        serializer = SPAddressSerializer(address, data=request.data, partial=(request.method == 'PATCH'))
+        serializer = SPAddressSerializer(addresses, data=request.data, partial=(request.method == 'PATCH'))
         if serializer.is_valid():
             serializer.save()
             return Response({'message': 'Address updated successfully.', 'data': serializer.data}, status=status.HTTP_200_OK)
         return Response({'error': 'Invalid data provided.', 'details': serializer.errors}, status=status.HTTP_400_BAD_REQUEST)
 
     elif request.method == 'DELETE':
-        address.delete()
+        addresses.delete()
         return Response({'message': 'Address deleted successfully.'}, status=status.HTTP_204_NO_CONTENT)
     
 @api_view(['GET'])
 @throttle_classes([UserReadThrottle])
+@authentication_classes([SPJWTAuthentication])
+@permission_classes([IsAuthenticated])
 def providers_by_service(request, service_id):
     providers = ServiceProvider.objects.filter(services__service_id=service_id)
     serializer = ServiceProviderReadSerializer(providers, many=True)
     return Response(serializer.data)
 
 @api_view(['GET'])
+@authentication_classes([ClientJWTAuthentication])
+@permission_classes([IsAuthenticated])
 @throttle_classes([UserReadThrottle])
 def get_cost_of_service_images_by_cost_id(request, cost_id):
     try:
@@ -975,9 +1091,12 @@ def get_cost_of_service_images_by_cost_id(request, cost_id):
 
 @api_view(['GET'])
 @throttle_classes([UserReadThrottle])
-def costs_by_sp_email(request, email, service_id=None):
+@authentication_classes([ClientJWTAuthentication])
+@permission_classes([IsAuthenticated])
+def costs_by_sp(request, provider_id, service_id=None):
     try:
-        sp = ServiceProvider.objects.get(sp_profile__email_address=email)
+        
+        sp = ServiceProvider.objects.get(sp_profile__id=provider_id, is_active=True)
     except ServiceProvider.DoesNotExist:
         return Response(
             {"detail": "Service provider not found."},
@@ -1012,6 +1131,8 @@ def costs_by_sp_email(request, email, service_id=None):
 
 @api_view(['GET'])
 @throttle_classes([UserReadThrottle])
+@authentication_classes([SPJWTAuthentication])
+@permission_classes([IsAuthenticated])
 def fetch_sp_addresses_by_service(request, service_id):
 
     # Get all providers for the service
@@ -1028,6 +1149,8 @@ def fetch_sp_addresses_by_service(request, service_id):
     return Response(data)
 
 @api_view(['GET'])
+@authentication_classes([ClientJWTAuthentication])
+@permission_classes([IsAuthenticated])
 @throttle_classes([LiveLocationReadThrottle])
 def fetch_sp_live_locations_by_service(request, service_id):
     """
@@ -1064,8 +1187,59 @@ def fetch_sp_live_locations_by_service(request, service_id):
 
 
 @api_view(['GET'])
+@authentication_classes([ClientJWTAuthentication])
+@permission_classes([IsAuthenticated])
 @throttle_classes([LiveLocationReadThrottle])
 def sps_by_live_location(request):
+    """
+    GET: Fetch all active service providers linked to multiple live location IDs.
+    Example: /api/service_providersDB/sp-by-live-locations/?ids=1,2,3
+    """
+    ids = request.GET.get('ids')
+    if not ids:
+        return Response(
+            {'error': 'Please provide live location IDs.'},
+            status=status.HTTP_400_BAD_REQUEST
+        )
+
+    id_list = [int(i) for i in ids.split(',') if i.isdigit()]
+
+    live_locations = SPLiveLocation.objects.filter(
+        id__in=id_list
+    ).select_related('provider')
+
+    sps = ServiceProvider.objects.filter(
+        sp_profile__in=[loc.provider.sp_profile for loc in live_locations],
+        is_active=True
+    ).select_related(
+        'sp_profile',
+        'location'
+    ).prefetch_related(
+        'provider_services__service'   # ✅ FIXED
+    ).distinct()
+
+    if not sps.exists():
+        return Response(
+            {'error': 'No active service providers found for the given live location IDs.'},
+            status=status.HTTP_404_NOT_FOUND
+        )
+
+    serializer = ServiceProviderReadSerializer(
+        sps,
+        many=True,
+        context={'request': request}
+    )
+
+    return Response(
+        {'service_providers': serializer.data},
+        status=status.HTTP_200_OK
+    )
+
+@api_view(['GET'])
+@authentication_classes([ClientJWTAuthentication])
+@permission_classes([IsAuthenticated])
+@throttle_classes([LiveLocationReadThrottle])
+def client_get_sps_by_live_location(request):
     """
     GET: Fetch all active service providers linked to multiple live location IDs.
     Example: /api/service_providersDB/sp-by-live-locations/?ids=1,2,3

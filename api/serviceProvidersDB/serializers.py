@@ -2,6 +2,7 @@ from rest_framework import serializers
 from django.contrib.auth.hashers import check_password, make_password
 from django.db import transaction
 import re
+from django.db import models
 from rest_framework import serializers
 from django.core.validators import validate_email
 from django.core.exceptions import ValidationError as DjangoValidationError
@@ -365,30 +366,35 @@ class CostOfServiceImageReadSerializer(serializers.ModelSerializer):
     
 
 class SPLoginSerializer(serializers.Serializer):
-    email = serializers.EmailField(
-        error_messages={"invalid": "Please enter a valid email address."}
-    )
+    identifier = serializers.CharField()
     password = serializers.CharField(write_only=True)
 
     def validate(self, attrs):
-        email = attrs.get("email")
+        identifier = attrs.get("identifier")
         password = attrs.get("password")
 
-        # 1. Check if user exists
+        # Find user by email OR mobile number
         try:
-            user = SPProfile.objects.get(email_address=email)
+            user = SPProfile.objects.get(
+                models.Q(email_address__iexact=identifier) |
+                models.Q(mobile_number=identifier)
+            )
         except SPProfile.DoesNotExist:
-            # Raising a non-field error for security (prevents email harvesting)
-            # or keep it specific if that's your UX preference
-            raise serializers.ValidationError({"email": "No account found with this email. Please register first."})
+            raise serializers.ValidationError({
+                "identifier": "No account found with this email address or mobile number."
+            })
 
-        # 2. Check Password
+        # Check password
         if not check_password(password, user.password):
-            raise serializers.ValidationError({"password": "The password you entered is incorrect."})
+            raise serializers.ValidationError({
+                "password": "The password you entered is incorrect."
+            })
 
-        # 3. Check Account Status
+        # Check account status
         if not user.is_active:
-            raise serializers.ValidationError({"non_field_errors": "This account has been deactivated. Please contact support."})
+            raise serializers.ValidationError({
+                "non_field_errors": "This account has been deactivated. Please contact support."
+            })
 
         attrs["user"] = user
         return attrs
@@ -408,7 +414,7 @@ class SPProfileReadSerializer(serializers.ModelSerializer):
         exclude = ['password']
         # OR, alternatively, explicitly include fields you want:
         # fields = ['id', 'email_address', 'mobile_number', 'is_profile_completed']
-        read_only_fields = ['id', 'email_address', 'mobile_number', 'is_profile_completed']
+        read_only_fields = ['id', 'email_address', 'mobile_number', 'is_profile_completed','id']
 
 class ServiceProviderSerializer(serializers.ModelSerializer):
 

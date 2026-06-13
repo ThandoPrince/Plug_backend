@@ -1,12 +1,19 @@
+from sqlite3 import IntegrityError
+
 from django.http import JsonResponse
 from django.shortcuts import get_object_or_404
-from rest_framework.decorators import api_view, parser_classes, permission_classes, throttle_classes
+from psycopg import logger
+from rest_framework.decorators import api_view, authentication_classes, parser_classes, permission_classes, throttle_classes
 from rest_framework.response import Response
 from rest_framework import status
 from rest_framework.parsers import MultiPartParser, FormParser
 from rest_framework.permissions import AllowAny
-
+from rest_framework.permissions import IsAuthenticated
+from django.db import transaction
+from api.clientsDB.services.jwt_client_authentication import ClientJWTAuthentication
+from plug_backend.helpers.auth_helpers import get_client_details
 from plug_backend.throttles import ProfileWriteThrottle, UserReadThrottle
+from plug_backend.utils.client_jwt_helper import generate_client_tokens
 
 
 # from rest_framework.permissions import IsAuthenticated
@@ -16,57 +23,114 @@ from .serializers import AddressClaimSerializer, AddressOnlySerializer, AddressV
 @api_view(['POST'])
 @throttle_classes([ProfileWriteThrottle])
 def register_client(request):
+
     serializer = ClientRegisterSerializer(data=request.data)
 
     if serializer.is_valid():
+
         email = serializer.validated_data['email_address'].lower()
-        
-        # Check if a client with this email already exists
+
+        # Prevent duplicate accounts
         if ClientAuth.objects.filter(email_address=email).exists():
             return Response(
                 {"error": "A user with this email already exists."},
                 status=status.HTTP_400_BAD_REQUEST
             )
+        if ClientAuth.objects.filter(
+            mobile_number=serializer.validated_data["mobile_number"]
+                ).exists():
+            return Response(
+                {"error": "A user with this mobile number already exists."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
 
-        # Create authentication record
-        client_auth = serializer.save()
+        try:
+            with transaction.atomic():
 
-        # Create empty profile if not exists
-        ClientDetails.objects.get_or_create(client_profile=client_auth)
+                
+                client_auth = serializer.save()
 
-        return Response(
-            {
-                "message": "Registration successful.",
-                "email": client_auth.email_address
-            },
-            status=status.HTTP_201_CREATED
-        )
+                # Ensure profile exists
+                ClientDetails.objects.get_or_create(
+                    client_profile=client_auth
+                )
+
+                
+                tokens = generate_client_tokens(client_auth)
+
+            return Response(
+                {
+                    "success": True,
+                    "message": "Registration successful.",
+                    "data": {
+                        "id": client_auth.id,
+                        "email": client_auth.email_address,
+                        "mobile_number": client_auth.mobile_number,
+                        "access_token": tokens["access"],
+                        "refresh_token": tokens["refresh"],
+                    }
+                },
+                status=status.HTTP_201_CREATED
+            )
+
+        except IntegrityError:
+            return Response(
+                {
+                    "success": False,
+                    "message": "A user with this email or mobile already exists."
+                },
+                status=status.HTTP_409_CONFLICT
+            )
+
+        except Exception as e:
+            logger.error(f"Client Registration Error: {str(e)}")
+            return Response(
+                {
+                    "success": False,
+                    "message": "A server error occurred. Please try again later."
+                },
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
 
     return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
 
 @api_view(['GET'])
+@authentication_classes([ClientJWTAuthentication])
+@permission_classes([IsAuthenticated])
 @throttle_classes([UserReadThrottle])
-def get_client_by_email(request, email):
+def get_my_profile(request):
+
     try:
-        client = ClientDetails.objects.get(client_profile__email_address=email)
+        client = ClientDetails.objects.select_related(
+            'client_profile'
+        ).get(
+            client_profile=request.user
+        )
     except ClientDetails.DoesNotExist:
         return Response(
             {"error": "Client not found."},
             status=status.HTTP_404_NOT_FOUND
         )
 
-    serializer = ClientSerializer(client, context={'request': request})
+    serializer = ClientSerializer(
+        client,
+        context={'request': request}
+    )
+
     return Response(serializer.data)
 
 @api_view(['PATCH'])
 @throttle_classes([ProfileWriteThrottle])
 @parser_classes([MultiPartParser, FormParser])
-def complete_profile_by_email(request, email):
+@authentication_classes([ClientJWTAuthentication])
+@permission_classes([IsAuthenticated])
+def complete_profile(request):
+    print("FILES RECEIVED:", request.FILES)
+    print("POST DATA:", request.data) 
     try:
-        client = ClientDetails.objects.get(
-            client_profile__email_address=email
-        )
+        client = get_client_details(request)
+
     except ClientDetails.DoesNotExist:
         return Response(
             {"error": "Client not found."},
@@ -81,61 +145,83 @@ def complete_profile_by_email(request, email):
     )
 
     if serializer.is_valid():
+
         updated_client = serializer.save()
 
-        # ✅ Move to next onboarding stage
         if (
             updated_client.first_name and
             updated_client.last_name and
             updated_client.date_of_birth
         ):
             updated_client.client_profile.is_profile_completed = "in-address"
-            updated_client.client_profile.save()
+            updated_client.client_profile.save(
+                update_fields=["is_profile_completed"]
+            )
 
-        return Response(serializer.data)
+        return Response({
+            "success": True,
+            "data": serializer.data,
+            "profile_status": updated_client.client_profile.is_profile_completed,
+        })
 
-    return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+    return Response(
+        serializer.errors,
+        status=status.HTTP_400_BAD_REQUEST
+    )
 
 @api_view(['PATCH'])
+@authentication_classes([ClientJWTAuthentication])
+@permission_classes([IsAuthenticated])
 @throttle_classes([ProfileWriteThrottle])
 def set_default_address(request, address_id):
-    """
-    PATCH endpoint to set a selected address as default.
-    Client is identified via query param ?email=<client_email>
-    """
-    client_email = request.query_params.get('email')
-    if not client_email:
-        return Response({"detail": "Client email is required."},
-                        status=status.HTTP_400_BAD_REQUEST)
-    
+
     try:
-        client = ClientDetails.objects.get(client_profile__email_address=client_email)
+        client = get_client_details(request)
+
     except ClientDetails.DoesNotExist:
-        return Response({"detail": "Client not found."},
-                        status=status.HTTP_404_NOT_FOUND)
+        return Response(
+            {"detail": "Client not found."},
+            status=status.HTTP_404_NOT_FOUND
+        )
 
     try:
-        client_address = ClientAddress.objects.get(pk=address_id, client=client)
+        client_address = ClientAddress.objects.get(
+            pk=address_id,
+            client=client
+        )
+
     except ClientAddress.DoesNotExist:
-        return Response({"detail": "Address not found for this client."},
-                        status=status.HTTP_404_NOT_FOUND)
+        return Response(
+            {"detail": "Address not found for this client."},
+            status=status.HTTP_404_NOT_FOUND
+        )
 
-    # Patch default
     client_address.is_default = True
-    client_address.save()  # your model will unset previous defaults
+    client_address.save()
 
-    return Response({"detail": f"Address {client_address.address} is now default."},
-                    status=status.HTTP_200_OK)
+    return Response(
+        {
+            "success": True,
+            "detail": f"Address {client_address.address} is now default."
+        },
+        status=status.HTTP_200_OK
+    )
 
 
 @api_view(['POST'])
 @throttle_classes([ProfileWriteThrottle])
-def add_residential_address(request, email):
+@authentication_classes([ClientJWTAuthentication])
+@permission_classes([IsAuthenticated])
+def add_residential_address(request):
 
-    client = get_object_or_404(
-        ClientDetails,
-        client_profile__email_address=email
-    )
+    try:
+        client = get_client_details(request)
+
+    except ClientDetails.DoesNotExist:
+        return Response(
+            {"error": "Client not found."},
+            status=status.HTTP_404_NOT_FOUND
+        )
 
     serializer = ClientAddressWriteSerializer(
         data=request.data,
@@ -143,48 +229,58 @@ def add_residential_address(request, email):
     )
 
     if not serializer.is_valid():
-        return Response(serializer.errors, status=400)
+        return Response(
+            serializer.errors,
+            status=status.HTTP_400_BAD_REQUEST
+        )
 
     client_address = serializer.save()
 
-    # ✅ Final onboarding stage
     client.client_profile.is_profile_completed = "completed"
-    client.client_profile.save()
+    client.client_profile.save(
+        update_fields=["is_profile_completed"]
+    )
 
     return Response(
         {
+            "success": True,
             "message": "Address added successfully.",
-            "data": ClientAddressSerializer(client_address).data
+            "data": ClientAddressSerializer(client_address).data,
+            "profile_status": client.client_profile.is_profile_completed,
         },
         status=status.HTTP_201_CREATED
     )
 
 @api_view(['GET'])
 @throttle_classes([UserReadThrottle])
-def client_auth_by_email(request, email):
-    """
-    GET: Fetch client auth details (without password)
-    Example:
-    /api/client-auth/thando@gmail.com/
-    """
-
-    client_auth = get_object_or_404(ClientAuth, email_address=email)
+@authentication_classes([ClientJWTAuthentication])
+@permission_classes([IsAuthenticated])
+def get_my_auth(request):
 
     serializer = ClientAuthReadSerializer(
-        client_auth,
-        context={'request': request}
+        request.user,
+        context={"request": request}
     )
 
-    return Response(serializer.data, status=status.HTTP_200_OK)
+    return Response(
+        serializer.data,
+        status=status.HTTP_200_OK
+    )
 
 @api_view(["POST"])
+@authentication_classes([ClientJWTAuthentication])
+@permission_classes([IsAuthenticated])
 @throttle_classes([ProfileWriteThrottle])
 def submit_address_verification(request, client_address_id):
-    # print("FILES RECEIVED:", request.FILES)
-    # print("POST DATA:", request.data)
-    
+
     try:
-        client_address = ClientAddress.objects.get(id=client_address_id)
+        client = get_client_details(request)
+
+        client_address = ClientAddress.objects.get(
+            id=client_address_id,
+            client=client
+        )
+
     except ClientAddress.DoesNotExist:
         return Response(
             {"error": "Client address not found."},
@@ -202,16 +298,25 @@ def submit_address_verification(request, client_address_id):
 
     if serializer.is_valid():
         verification = serializer.save()
+
         return Response(
-            {"message": "Verification submitted successfully.", "status": verification.status},
+            {
+                "success": True,
+                "message": "Verification submitted successfully.",
+                "status": verification.status,
+            },
             status=status.HTTP_201_CREATED
         )
 
-    print("SERIALIZER ERRORS:", serializer.errors)
-    return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+    return Response(
+        serializer.errors,
+        status=status.HTTP_400_BAD_REQUEST
+    )
 
 @api_view(['POST'])
 @throttle_classes([ProfileWriteThrottle])
+@authentication_classes([ClientJWTAuthentication])
+@permission_classes([IsAuthenticated])
 def register_device_token(request):
     print("FILES RECEIVED:", request.FILES)
     print("POST DATA:", request.data)   
@@ -221,8 +326,12 @@ def register_device_token(request):
 
     token = serializer.validated_data["fcm_token"]
 
-    # Remove duplicate tokens across all users
-    DeviceToken.objects.filter(fcm_token=token).delete()
+    
+    DeviceToken.objects.filter(
+    fcm_token=token
+).exclude(
+    client=request.user
+).delete()
 
     device_token = serializer.save()
 
@@ -233,63 +342,48 @@ def register_device_token(request):
 
 @api_view(['POST'])
 @throttle_classes([ProfileWriteThrottle])
+
+
 def client_login(request):
-    print("FILES RECEIVED:", request.FILES)
-    print("POST DATA:", request.data)
+
     serializer = ClientLoginSerializer(data=request.data)
+
     if serializer.is_valid():
-        user = serializer.validated_data['user']
-        client_details = getattr(user, 'clientdetails', None)
+
+        user = serializer.validated_data["user"]
+
+        client_details = getattr(user, "clientdetails", None)
+
+        tokens = generate_client_tokens(user)
 
         return Response({
-            "email": user.email_address,
-            "first_name": getattr(client_details, 'first_name', ''),
-            "last_name": getattr(client_details, 'last_name', ''),
-            "is_profile_completed": user.is_profile_completed,
+            "success": True,
+            "message": "Login successful",
+            "data": {
+                "id": user.id,
+                "email": user.email_address,
+                "mobile_number": user.mobile_number,
+                "first_name": getattr(client_details, "first_name", ""),
+                "last_name": getattr(client_details, "last_name", ""),
+                "is_profile_completed": user.is_profile_completed,
+
+                "access_token": tokens["access"],
+                "refresh_token": tokens["refresh"],
+            }
         }, status=status.HTTP_200_OK)
 
-    return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-
-
-
-@api_view(['GET', 'POST', 'PUT', 'DELETE'])
-@throttle_classes([UserReadThrottle])
-def clientProfile_list(request,format=None):
-    if request.method == 'DELETE':
-        client_profile_id = request.data.get('id')
-        try:
-            client_profile = ClientAuth.objects.get(id=client_profile_id)
-            client_profile.delete()
-            return Response({'message': 'Client Profile deleted successfully.'}, status=204)
-        except ClientAuth.DoesNotExist:
-            return Response({'error': 'Client Profile not found.'}, status=404)
-
-    if request.method == 'GET':
-        client_profiles = ClientAuth.objects.all()
-        serializer = ClientProfileSerializer(client_profiles, many=True)
-        return Response({'Client Profiles': serializer.data})
-
-@api_view(['GET'])
-@throttle_classes([UserReadThrottle])
-@parser_classes([MultiPartParser, FormParser])
-def client_list(request, format=None):
-    if request.method == 'GET':
-        clients = ClientDetails.objects.all()
-        serializer = ClientSerializer(clients, many=True, context={'request': request})
-        return Response(serializer.data)
-
-    
+    return Response({
+        "success": False,
+        "errors": serializer.errors
+    }, status=status.HTTP_400_BAD_REQUEST)
 
 
 
 @api_view(['GET'])
 @throttle_classes([UserReadThrottle])
+@authentication_classes([ClientJWTAuthentication])
+@permission_classes([IsAuthenticated])
 def address_list(request,format=None):
-
-    if request.method == 'GET':
-        addresses = Address.objects.all()
-        serializer = AddressSerializer(addresses, many=True)
-        return Response({'Addresses': serializer.data})
 
     if request.method == 'PUT':
         serializer = AddressSerializer(data=request.data)
@@ -310,6 +404,8 @@ def address_list(request,format=None):
 
 @api_view(['GET'])
 @throttle_classes([UserReadThrottle])
+@authentication_classes([ClientJWTAuthentication])
+@permission_classes([IsAuthenticated])
 def client_address_list(request,format=None):
     if request.method == 'POST':
         serializer = ClientAddressSerializer(data=request.data)
@@ -318,35 +414,15 @@ def client_address_list(request,format=None):
             return Response({'message': 'Client Address created successfully.', 'data': serializer.data}, status=201)
         return Response({'error': 'Invalid data provided.', 'details': serializer.errors}, status=400)
 
-    if request.method == 'PUT':
-        serializer = ClientAddressSerializer(data=request.data)
-        if serializer.is_valid():
-            client_address = ClientAddress.objects.get(id=request.data.get('id'))
-            serializer.update(client_address, request.data)
-            return Response({'message': 'Client Address updated successfully.', 'data': serializer.data}, status=200)
-        return Response({'error': 'Invalid data provided.', 'details': serializer.errors}, status=400)
-
-    if request.method == 'GET':
-        client_addresses = ClientAddress.objects.all()
-        serializer = ClientAddressSerializer(client_addresses, many=True)
-        return Response({'Client Addresses': serializer.data})
-
-    if request.method == 'DELETE':
-        client_address_id = request.data.get('id')
-        try:
-            client_address = ClientAddress.objects.get(id=client_address_id)
-            client_address.delete()
-            return Response({'message': 'Client Address deleted successfully.'}, status=204)
-        except ClientAddress.DoesNotExist:
-            return Response({'error': 'Client Address not found.'}, status=404)
         
 
-@api_view(['GET', 'PUT', 'PATCH', 'DELETE'])
+@api_view(['GET', 'PUT', 'PATCH'])
+@authentication_classes([ClientJWTAuthentication])
+@permission_classes([IsAuthenticated])
 @throttle_classes([UserReadThrottle])
-# @permission_classes([IsAuthenticated])
-def clientProfile_detail(request, email,format=None):
+def clientProfile_detail(request, format=None):
     try:
-        client_profile = ClientAuth.objects.get(email_address=email)
+        client_profile = get_client_details(request)
     except ClientAuth.DoesNotExist:
         return Response({'error': 'Client Profile not found.'}, status=status.HTTP_404_NOT_FOUND)
 
@@ -366,17 +442,14 @@ def clientProfile_detail(request, email,format=None):
             return Response({'message': 'Client Profile updated successfully.', 'data': serializer.data}, status=status.HTTP_200_OK)
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
-    elif request.method == 'DELETE':
-        client_profile.delete()
-        return Response({'message': 'Client Profile deleted successfully.'}, status=status.HTTP_204_NO_CONTENT)
 
-    return Response({'error': 'Method not allowed.'}, status=status.HTTP_405_METHOD_NOT_ALLOWED)
-
-@api_view(['GET', 'PUT', 'DELETE'])
+@api_view(['GET', 'PUT', ])
 @throttle_classes([UserReadThrottle])
-def client_detail(request, email,format=None):
+@authentication_classes([ClientJWTAuthentication])
+@permission_classes([IsAuthenticated])
+def client_detail(request,format=None):
     try:
-        client = ClientDetails.objects.get(client_profile__email_address=email)
+        client = get_client_details(request)
     except ClientDetails.DoesNotExist:
         return Response({'error': 'Client not found.'}, status=status.HTTP_404_NOT_FOUND)
 
@@ -391,13 +464,12 @@ def client_detail(request, email,format=None):
             return Response({'message': 'Client updated successfully.', 'client': serializer.data})
         return Response({'error': 'Invalid data provided.', 'details': serializer.errors}, status=status.HTTP_400_BAD_REQUEST)
 
-    elif request.method == 'DELETE':
-        client.delete()
-        return Response({'message': 'Client deleted successfully.'}, status=status.HTTP_204_NO_CONTENT)
+
 
 @api_view(['GET', 'PUT', 'PATCH', 'DELETE'])
 @throttle_classes([UserReadThrottle])
-# @permission_classes([IsAuthenticated])
+@authentication_classes([ClientJWTAuthentication])
+@permission_classes([IsAuthenticated])
 def address_detail(request, id,format=None):
     try:
         address = Address.objects.get(id=id)
@@ -421,14 +493,32 @@ def address_detail(request, id,format=None):
 
 @api_view(['GET'])
 @throttle_classes([UserReadThrottle])
-def client_address_detail(request, email, format=None):
-    # Fetch addresses for the client, default first
-    client_addresses = ClientAddress.objects.filter(
-        client__client_profile__email_address=email
-    ).order_by('-is_default', 'id')  # default first, then by id
+@authentication_classes([ClientJWTAuthentication])
+@permission_classes([IsAuthenticated])
+def client_address_detail(request, client_id, format=None):
+    try:
+        # RLS-style enforcement: user can only access their own client record
+        client = ClientDetails.objects.get(
+            client_profile__id=client_id,
+            client_profile=request.user
+        )
+    except ClientDetails.DoesNotExist:
+        return Response(
+            {'error': 'Client not found or access denied.'},
+            status=status.HTTP_404_NOT_FOUND
+        )
+
+    client_addresses = (
+        ClientAddress.objects
+        .filter(client=client)
+        .order_by('-is_default', 'id')
+    )
 
     if not client_addresses.exists():
-        return Response({'error': 'Client Address not found.'}, status=status.HTTP_404_NOT_FOUND)
+        return Response(
+            {'error': 'Client Address not found.'},
+            status=status.HTTP_404_NOT_FOUND
+        )
 
     serializer = ClientAddressSerializer(client_addresses, many=True)
     return Response(serializer.data, status=status.HTTP_200_OK)
@@ -438,8 +528,9 @@ def client_address_detail(request, email, format=None):
 
 @api_view(['GET', 'PUT'])
 @throttle_classes([UserReadThrottle])
+@authentication_classes([ClientJWTAuthentication])
+@permission_classes([IsAuthenticated])
 @parser_classes([MultiPartParser, FormParser])
-# @permission_classes([IsAuthenticated])
 def client_profile_me(request):
     try:
         client = ClientDetails.objects.get(client_profile=request.user)
@@ -459,110 +550,167 @@ def client_profile_me(request):
     
 @api_view(['GET'])
 @throttle_classes([UserReadThrottle])
-def client_saved_addresses(request, email):
+@authentication_classes([ClientJWTAuthentication])
+@permission_classes([IsAuthenticated])
+def client_saved_addresses(request, client_id):
     try:
-        client = ClientDetails.objects.get(client_profile__email_address=email)
+        # RLS-style enforcement: ensure user can only access their own client record
+        client = ClientDetails.objects.get(
+            id=client_id,
+            client_profile=request.user  # enforce ownership via auth context
+        )
     except ClientDetails.DoesNotExist:
-        return Response({'error': 'Client not found.'}, status=status.HTTP_404_NOT_FOUND)
+        return Response(
+            {'error': 'Client not found or access denied.'},
+            status=status.HTTP_404_NOT_FOUND
+        )
 
-    client_addresses = ClientAddress.objects.filter(client=client).select_related('address')
-    addresses = [ca.address for ca in client_addresses]
+    client_addresses = (
+        ClientAddress.objects
+        .filter(client=client)
+        .select_related('address')
+    )
 
-    # Inject clientaddress info into the address object dynamically
-    for addr in addresses:
-        ca = next((ca for ca in client_addresses if ca.address.id == addr.id), None)
-        addr.clientaddress = ca
+    # Attach relation metadata efficiently
+    address_data = []
+    for ca in client_addresses:
+        addr = ca.address
+        addr.clientaddress = ca  # keep your existing serializer dependency
+        address_data.append(addr)
 
-    serializer = AddressOnlySerializer(addresses, many=True)
-    return Response({'addresses': serializer.data}, status=status.HTTP_200_OK)
+    serializer = AddressOnlySerializer(address_data, many=True)
+    return Response(
+        {'addresses': serializer.data},
+        status=status.HTTP_200_OK
+    )
 
 
 
 
 @api_view(['GET'])
 @throttle_classes([UserReadThrottle])
-def client_default_address(request, email, format=None):
-    """
-    GET: Retrieve the client's address where is_default=True
-    """
+@authentication_classes([ClientJWTAuthentication])
+@permission_classes([IsAuthenticated])
+def client_default_address(request):
+
     try:
+        client = get_client_details(request)
+
         default_address = ClientAddress.objects.get(
-            client__client_profile__email_address=email,
+            client=client,
             is_default=True
         )
+
     except ClientAddress.DoesNotExist:
-        return Response({'error': 'No default address found.'}, status=status.HTTP_404_NOT_FOUND)
+        return Response(
+            {"error": "No default address found."},
+            status=status.HTTP_404_NOT_FOUND
+        )
 
-    serializer = ClientAddressNoDuplicatesSerializer(default_address)
-    return Response({'Client Address': serializer.data}, status=status.HTTP_200_OK)
+    serializer = ClientAddressNoDuplicatesSerializer(
+        default_address
+    )
 
-
-
-
+    return Response(
+        {
+            "client_address": serializer.data
+        },
+        status=status.HTTP_200_OK
+    )
 
 @api_view(['GET'])
 @throttle_classes([UserReadThrottle])
+@authentication_classes([ClientJWTAuthentication])
+@permission_classes([IsAuthenticated])
 def clients_by_addresses(request):
 
-    # Get ids from query params
-    ids_param = request.query_params.get('ids')
+    try:
+        client = get_client_details(request)
+    except ClientDetails.DoesNotExist:
+        return Response(
+            {"error": "Client not found."},
+            status=status.HTTP_404_NOT_FOUND
+        )
+
+    ids_param = request.query_params.get("ids")
+
     if not ids_param:
-        return Response({'error': 'Address IDs are required. Use ?ids=1,2,3'}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(
+            {"error": "Address IDs are required. Use ?ids=1,2,3"},
+            status=status.HTTP_400_BAD_REQUEST
+        )
 
     try:
-        address_ids = [int(x) for x in ids_param.split(',')]
+        address_ids = [
+            int(x.strip())
+            for x in ids_param.split(",")
+        ]
     except ValueError:
-        return Response({'error': 'Invalid address IDs format.'}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(
+            {"error": "Invalid address IDs format."},
+            status=status.HTTP_400_BAD_REQUEST
+        )
 
-    # Fetch client addresses for all given IDs
     client_addresses = ClientAddress.objects.filter(
-        address__id__in=address_ids
-    ).select_related("client", "client__client_profile")
+        client=client,
+        address_id__in=address_ids
+    ).select_related(
+        "address"
+    )
 
-    if not client_addresses.exists():
-        return Response({'error': 'No clients found for these addresses.'}, status=status.HTTP_404_NOT_FOUND)
+    serializer = ClientAddressSerializer(
+        client_addresses,
+        many=True,
+        context={"request": request}
+    )
 
-    # Deduplicate clients by email
-    seen = set()
-    unique_clients = []
-    for ca in client_addresses:
-        client = ca.client
-        email = client.client_profile.email_address
-        if email not in seen:
-            seen.add(email)
-            unique_clients.append(client)
-
-    serializer = ClientSerializer(unique_clients, many=True, context={'request': request})
-    return Response({'clients': serializer.data}, status=status.HTTP_200_OK)
+    return Response(
+        {
+            "addresses": serializer.data
+        },
+        status=status.HTTP_200_OK
+    )
 
 @api_view(['GET'])
 @throttle_classes([UserReadThrottle])
+@authentication_classes([ClientJWTAuthentication])
+@permission_classes([IsAuthenticated])
 def clients_by_address(request, address_id):
-    """
-    GET: Fetch all clients linked to a specific address ID.
-    """
+
     try:
-        address = Address.objects.get(id=address_id)
-    except Address.DoesNotExist:
-        return Response({'error': 'Address not found.'}, status=status.HTTP_404_NOT_FOUND)
+        client = get_client_details(request)
 
-    # Fetch all client links to this address
-    client_addresses = ClientAddress.objects.filter(address=address).select_related("client", "client__client_profile")
+    except ClientDetails.DoesNotExist:
+        return Response(
+            {"error": "Client not found."},
+            status=status.HTTP_404_NOT_FOUND
+        )
 
-    if not client_addresses.exists():
-        return Response({'error': 'No clients found for this address.'}, status=status.HTTP_404_NOT_FOUND)
+    try:
+        client_address = ClientAddress.objects.select_related(
+            "address"
+        ).get(
+            client=client,
+            address_id=address_id
+        )
 
-    # Extract unique clients
-    seen = set()
-    unique_clients = []
-    for ca in client_addresses:
-        client = ca.client
-        email = client.client_profile.email_address
-        if email not in seen:
-            seen.add(email)
-            unique_clients.append(client)
+    except ClientAddress.DoesNotExist:
+        return Response(
+            {
+                "error": "Address not found or does not belong to you."
+            },
+            status=status.HTTP_404_NOT_FOUND
+        )
 
-    serializer = ClientSerializer(unique_clients, many=True, context={'request': request})
-    return Response({'clients': serializer.data}, status=status.HTTP_200_OK)
+    serializer = ClientAddressSerializer(
+        client_address,
+        context={"request": request}
+    )
 
-
+    return Response(
+        {
+            "success": True,
+            "data": serializer.data
+        },
+        status=status.HTTP_200_OK
+    )
