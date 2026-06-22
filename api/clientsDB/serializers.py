@@ -3,12 +3,15 @@ from django.contrib.auth.hashers import make_password
 from django.contrib.auth.password_validation import validate_password
 from django.core.validators import RegexValidator
 from django.core.exceptions import ValidationError as DjangoValidationError
-from .models.models import AddressSuperUserVerification, ClientAuth, Address, ClientDetails, ClientAddress, ClientNotification, DeviceToken
+from django.utils import timezone
+from api.clientsDB.services.client_ip_address_helper import get_client_ip
+from api.clientsDB.services.sa_phone_number_helper import normalize_sa_mobile
+from .models.models import AddressSuperUserVerification, ClientAuth, Address, ClientDetails, ClientAddress, ClientLoginHistory, ClientNotification, DeviceToken
 import re
 from django.db.models import Q
 from django.contrib.auth.hashers import check_password
 import phonenumbers
-from datetime import date
+from datetime import date, timedelta
 from django.db import transaction
 
 class ClientProfileSerializer(serializers.ModelSerializer):
@@ -70,37 +73,49 @@ class ClientRegisterSerializer(serializers.ModelSerializer):
         return value
 
     def validate_mobile_number(self, value):
-    # Remove spaces, dashes, brackets
-        cleaned = re.sub(r'\D', '', value)
 
-    # Must be exactly 10 digits
-        if not re.fullmatch(r'\d{10}', cleaned):
+        normalized = normalize_sa_mobile(value)
+
+        if not normalized:
             raise serializers.ValidationError(
-                "Phone number must be exactly 10 digits."
+                "Enter a valid South African mobile number."
             )
 
-    # Must start with 0 (SA local format)
-        if not cleaned.startswith('0'):
-            raise serializers.ValidationError(
-                "Phone number must start with 0."
-            )
-
-    # Convert to international format (+27)
-        normalized = '+27' + cleaned[1:]
-
-    # Validate properly using phonenumbers
         try:
-            number = phonenumbers.parse(normalized)
-            if not phonenumbers.is_valid_number(number):
-                raise serializers.ValidationError("Enter a valid South African mobile number.")
-        except phonenumbers.NumberParseException:
-            raise serializers.ValidationError("Invalid phone number format.")
+            number = phonenumbers.parse(
+                normalized,
+                None
+            )
 
-    # Ensure uniqueness
-        if ClientAuth.objects.filter(mobile_number=normalized).exists():
+            if not phonenumbers.is_valid_number(number):
+                raise serializers.ValidationError(
+                    "Enter a valid South African mobile number."
+                )
+
+        except phonenumbers.NumberParseException:
+            raise serializers.ValidationError(
+                "Invalid phone number format."
+            )
+
+        if ClientAuth.objects.filter(
+            mobile_number=normalized
+        ).exists():
             raise serializers.ValidationError(
                 "A user with this mobile number already exists."
             )
+
+        return normalized
+
+    # --------------------------------------
+    # Uniqueness check
+    # --------------------------------------
+
+        if ClientAuth.objects.filter(
+            mobile_number=normalized
+        ).exists():
+            raise serializers.ValidationError(
+            "A user with this mobile number already exists."
+        )
 
         return normalized
 
@@ -116,6 +131,8 @@ class ClientRegisterSerializer(serializers.ModelSerializer):
         if errors:
             raise serializers.ValidationError(errors)
         return value
+    
+    
 
     def create(self, validated_data):
         validated_data['password'] = make_password(validated_data['password'])
@@ -158,58 +175,40 @@ class ClientProfileSerializer(serializers.ModelSerializer):
         return instance
 
 class ClientSerializer(serializers.ModelSerializer):
-    client_profile = ClientProfileSerializer()
+    client_profile = ClientProfileSerializer(read_only=True)  # Lock nested profiles from modifications here
     client_pp = serializers.ImageField(required=False, allow_null=True)
 
     class Meta:
         model = ClientDetails
         fields = '__all__'
 
+    def to_internal_value(self, data):
+        """
+        Interceptors to patch incoming multi-part data behavior.
+        Fixes errors where clients pass raw JSON string arrays or null representations.
+        """
+       
+        mutable_data = data.copy()
+        for field in ['date_of_birth', 'client_pp']:
+            if field in mutable_data and (mutable_data[field] in ['null', 'None', '']):
+                mutable_data[field] = None
+                
+        return super().to_internal_value(mutable_data)
+
     def validate_date_of_birth(self, value):
-        """Validate date_of_birth field if provided"""
         if value:
             if value > date.today():
                 raise serializers.ValidationError("Date of birth cannot be in the future.")
+            
+            # Precise age math calculation
             age = (date.today() - value).days // 365
             if age < 18:
                 raise serializers.ValidationError("Client must be at least 18 years old.")
         return value
 
-    def validate(self, data):
-        # Validate DOB in nested updates (PATCH)
-        dob = data.get('date_of_birth')
-        if not dob and 'client_profile' in data:
-            dob = data['client_profile'].get('date_of_birth')
-        if dob:
-            self.validate_date_of_birth(dob)
-        return data
-
-    def create(self, validated_data):
-        profile_data = validated_data.pop('client_profile')
-        email = profile_data['email_address']
-
-        if ClientDetails.objects.filter(client_profile__email_address=email).exists():
-            raise serializers.ValidationError({
-                "client_profile": {
-                    "email_address": "A profile with this email already exists and is linked to a client."
-                }
-            })
-
-        profile_data['password'] = make_password(profile_data['password'])
-        client_profile = ClientAuth.objects.create(**profile_data)
-        validated_data['client_profile'] = client_profile
-
-        client = ClientDetails.objects.create(**validated_data)
-        return client
-
     def update(self, instance, validated_data):
-        profile_data = validated_data.pop('client_profile', None)
-        if profile_data:
-            for attr, value in profile_data.items():
-                if attr == 'password':
-                    value = make_password(value)
-                setattr(instance.client_profile, attr, value)
-            instance.client_profile.save()
+        # Explicit protection: Remove client_profile variations to prevent write manipulation
+        validated_data.pop('client_profile', None)
 
         if 'client_pp' in validated_data:
             instance.client_pp = validated_data.pop('client_pp')
@@ -233,25 +232,28 @@ class ClientAddressSerializer(serializers.ModelSerializer):
         model = ClientAddress
         fields = '__all__'
 
-class DeviceTokenWriteSerializer(serializers.ModelSerializer):
 
-    push_token = serializers.CharField(
-        source='fcm_token'
-    )
+
+class DeviceTokenWriteSerializer(serializers.ModelSerializer):
+    # Map the incoming JSON key 'push_token' to the database column 'fcm_token'
+    push_token = serializers.CharField(source='fcm_token', max_length=512)
 
     class Meta:
         model = DeviceToken
-        fields = ['push_token']
+        fields = [
+            'push_token', 
+            'device_type', 
+            'device_name', 
+            'os_version', 
+            'app_version', 
+            'provider'
+        ]
 
-    def create(self, validated_data):
-
-        validated_data['client'] = self.context[
-            'request'
-        ].user
-
-        return DeviceToken.objects.create(
-            **validated_data
-        )
+    def validate(self, attrs):
+        # Fallback to defaults if provider or device_type aren't explicitly passed
+        if 'provider' not in attrs:
+            attrs['provider'] = 'firebase'
+        return attrs
     
 class DeviceTokenReadSerializer(serializers.ModelSerializer):
     client_email = serializers.CharField(source='client.email_address', read_only=True)
@@ -294,6 +296,9 @@ class AddressWriteSerializer(serializers.ModelSerializer):
         return attrs
 
 
+from rest_framework import serializers
+from django.db import transaction
+
 class ClientAddressWriteSerializer(serializers.ModelSerializer):
     address = AddressWriteSerializer()
 
@@ -307,57 +312,88 @@ class ClientAddressWriteSerializer(serializers.ModelSerializer):
             "house_administrator"
         ]
 
+    # -------------------------------------------------
+    # CLEAN VALIDATION LAYER (NO DB SIDE EFFECTS)
+    # -------------------------------------------------
+    def validate(self, attrs):
+        address_data = attrs.get("address", {})
+        building_type = address_data.get("building_type", "house")
+        unit_number = address_data.get("unit_number")
+
+        if unit_number:
+            unit_number = str(unit_number).strip()
+
+        errors = {}
+
+        # ---- Business rules
+        if building_type == "apartment" and not unit_number:
+            errors["unit_number"] = ["Unit number is required for apartments."]
+
+        if building_type == "house" and unit_number:
+            errors["unit_number"] = ["Houses cannot have a unit number."]
+
+        if errors:
+            raise serializers.ValidationError({"address": errors})
+
+        attrs["address"]["unit_number"] = unit_number or ""
+        return attrs
+
+    # -------------------------------------------------
+    # CREATE LAYER (DB OPERATIONS ONLY)
+    # -------------------------------------------------
     @transaction.atomic
     def create(self, validated_data):
         address_data = validated_data.pop("address")
         client = self.context["client"]
 
-     
-        building_type = address_data.get("building_type", "house")
-        unit_number = address_data.get("unit_number")
+        unit_number = address_data.get("unit_number") or ""
 
-        if building_type == "apartment" and not unit_number:
-            raise serializers.ValidationError("Unit number is required for apartments.")
-        if building_type == "house" and unit_number:
-            raise serializers.ValidationError("Houses cannot have a unit number.")
-
-   
-        address, created = Address.objects.get_or_create(
+        address = Address.objects.filter(
             place_id=address_data.get("place_id"),
-            unit_number=unit_number or "",
-            defaults={
-                "street_number": address_data.get("street_number"),
-                "route": address_data.get("route"),
-                "locality": address_data.get("locality"),
-                "administrative_area_level_1": address_data.get("administrative_area_level_1"),
-                "postal_code": address_data.get("postal_code"),
-                "country": address_data.get("country"),
-                "latitude": address_data.get("latitude"),
-                "longitude": address_data.get("longitude"),
-                "building_type": building_type,
-            }
-        )
+            unit_number=unit_number
+        ).first()
 
-    
-        if not created and not address.place_id and address_data.get("place_id"):
-            address.place_id = address_data["place_id"]
-            address.save(update_fields=["place_id"])
+        if not address:
+            address = Address.objects.create(
+                place_id=address_data.get("place_id"),
+                street_number=address_data.get("street_number"),
+                route=address_data.get("route"),
+                locality=address_data.get("locality"),
+                administrative_area_level_1=address_data.get("administrative_area_level_1"),
+                postal_code=address_data.get("postal_code"),
+                country=address_data.get("country"),
+                latitude=address_data.get("latitude"),
+                longitude=address_data.get("longitude"),
+                building_type=address_data.get("building_type", "house"),
+                unit_number=unit_number,
+            )
 
- 
+        # ---- Duplicate prevention (STRUCTURED ERROR)
         if ClientAddress.objects.filter(client=client, address=address).exists():
-            raise serializers.ValidationError("You have already added this address.")
+            raise serializers.ValidationError({
+                "non_field_errors": [
+                    "You have already added this address."
+                ]
+            })
 
-     
-        client_address = ClientAddress.objects.create(
+        return ClientAddress.objects.create(
             client=client,
             address=address,
             **validated_data
         )
 
-        return client_address
+class ClientAddressSerializerr(serializers.ModelSerializer):
+    
+    # Lift the verification state from the Address object up to the root ClientAddress map
+    is_verified = serializers.ReadOnlyField(source='address.is_verified')
+
+    class Meta:
+        model = ClientAddress
+        fields = '__all__'
     
 
 class AddressVerificationCreateSerializer(serializers.ModelSerializer):
+
     client_address = serializers.PrimaryKeyRelatedField(
         queryset=ClientAddress.objects.all()
     )
@@ -371,68 +407,195 @@ class AddressVerificationCreateSerializer(serializers.ModelSerializer):
         ]
 
     def validate(self, attrs):
-        client_address = attrs["client_address"]
+        errors = {}
 
-        if hasattr(client_address, "verification_request"):
-            existing = client_address.verification_request
+        client_address = attrs.get("client_address")
 
-            if existing.status == "approved":
-                raise serializers.ValidationError(
-                    "This address has already been verified."
-                )
+        if not client_address:
+            errors["client_address"] = ["Client address is required."]
 
-            if existing.status == "pending":
-                raise serializers.ValidationError(
-                    "Verification request is already pending."
-                )
+        # -------------------------------------------------
+        # Existing verification logic
+        # -------------------------------------------------
+        if client_address:
+            existing = getattr(client_address, "verification_request", None)
 
-  
-        if not attrs.get("proof_of_residence") or not attrs.get("id_document"):
-            raise serializers.ValidationError(
-                "Both proof of residence and ID document must be uploaded."
-            )
+            if existing:
+                if existing.status == "approved":
+                    errors["client_address"] = [
+                        "This address has already been verified."
+                    ]
+
+                elif existing.status == "pending":
+                    errors["client_address"] = [
+                        "Verification request is already pending."
+                    ]
+
+        # -------------------------------------------------
+        # Required file validation (clean DRF style)
+        # -------------------------------------------------
+        if not attrs.get("proof_of_residence"):
+            errors["proof_of_residence"] = [
+                "Proof of residence document is required."
+            ]
+
+        if not attrs.get("id_document"):
+            errors["id_document"] = [
+                "ID document is required."
+            ]
+
+        # -------------------------------------------------
+        # Raise all errors together (not one-by-one)
+        # -------------------------------------------------
+        if errors:
+            raise serializers.ValidationError(errors)
 
         return attrs
 
     def create(self, validated_data):
-        return AddressSuperUserVerification.objects.create(**validated_data)
-
+        return AddressSuperUserVerification.objects.create(
+            **validated_data
+        )
     
 class ClientLoginSerializer(serializers.Serializer):
-    identifier = serializers.CharField(required=True)
+
+    identifier = serializers.CharField(required=True, max_length=100)
     password = serializers.CharField(write_only=True, required=True, min_length=6)
 
     def validate(self, data):
-        identifier = data.get("identifier")
+
+        request = self.context.get("request")
+
+        # -------------------------------------------------
+        # 1. RAW INPUT
+        # -------------------------------------------------
+        raw_identifier = data.get("identifier", "").strip()
         password = data.get("password")
-        print("ALL USERS:")
-        print(ClientAuth.objects.all().values("id", "email_address", "mobile_number"))
 
-        user = ClientAuth.objects.filter(
-            Q(email_address__iexact=identifier) |
-            Q(mobile_number=identifier)
-        ).first()
+        if not raw_identifier:
+            raise serializers.ValidationError({
+                "non_field_errors": ["Invalid credentials."]
+            })
 
+        # -------------------------------------------------
+        # 2. IDENTITY TYPE DETECTION
+        # -------------------------------------------------
+        is_email = re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", raw_identifier) is not None
+        normalized_phone = None
+
+        if not is_email:
+            normalized_phone = normalize_sa_mobile(raw_identifier)
+
+        # -------------------------------------------------
+        # 3. BUILD SAFE QUERY
+        # -------------------------------------------------
+        query = Q()
+
+        if is_email:
+            query = Q(email_address__iexact=raw_identifier)
+
+        elif normalized_phone:
+            query = Q(mobile_number=normalized_phone)
+
+        else:
+            # Prevent invalid identity injection
+            raise serializers.ValidationError({
+                "non_field_errors": ["Invalid credentials."]
+            })
+
+        user = ClientAuth.objects.filter(query).first()
+
+        # -------------------------------------------------
+        # 4. GENERIC FAILURE (NO ENUMERATION)
+        # -------------------------------------------------
         if not user:
-            print("LOGIN FAILED: USER NOT FOUND")
             raise serializers.ValidationError({
-                "non_field_errors": ["Invalid email/mobile number or password."]
+                "non_field_errors": ["Invalid credentials."]
             })
 
-        print("USER FOUND:", user.email_address)
+        now = timezone.now()
 
+        # -------------------------------------------------
+        # 5. ACCOUNT LOCK CHECK
+        # -------------------------------------------------
+        if (
+            user.account_locked_until and
+            user.account_locked_until > now
+        ):
+            remaining_minutes = max(
+                1,
+                int((user.account_locked_until - now).total_seconds() / 60)
+            )
+
+            raise serializers.ValidationError({
+                "non_field_errors": [
+                    f"Account temporarily locked. Try again in {remaining_minutes} minute(s)."
+                ]
+            })
+
+        # -------------------------------------------------
+        # 6. PASSWORD CHECK
+        # -------------------------------------------------
         if not check_password(password, user.password):
-            print("LOGIN FAILED: WRONG PASSWORD")
+
+            user.failed_login_attempts = (user.failed_login_attempts or 0) + 1
+            user.total_failed_login_attempts = (user.total_failed_login_attempts or 0) + 1
+
+            attempts = user.failed_login_attempts
+            MAX_ATTEMPTS = 5
+
+            remaining_attempts = max(0, MAX_ATTEMPTS - attempts)
+
+            # Progressive lock strategy
+            if attempts >= 15:
+                lock_duration = timedelta(hours=24)
+
+            elif attempts >= 10:
+                lock_duration = timedelta(hours=1)
+
+            elif attempts >= 5:
+                lock_duration = timedelta(minutes=15)
+
+            else:
+                lock_duration = None
+
+            if lock_duration:
+                user.account_locked_until = now + lock_duration
+
+            user.save(update_fields=[
+                "failed_login_attempts",
+                "total_failed_login_attempts",
+                "account_locked_until"
+            ])
+
             raise serializers.ValidationError({
-                "non_field_errors": ["Invalid email/mobile number or password."]
+                "non_field_errors": ["Invalid credentials."],
+                "meta": {
+                    "remaining_attempts": remaining_attempts
+                }
             })
+
+        # -------------------------------------------------
+        # 7. SUCCESS STATE RESET
+        # -------------------------------------------------
+        user.failed_login_attempts = 0
+        user.account_locked_until = None
+        user.last_login_at = timezone.now()
+
+        if request:
+            user.last_login_ip = get_client_ip(request)
+
+        user.save(update_fields=[
+            "failed_login_attempts",
+            "account_locked_until",
+            "last_login_at",
+            "last_login_ip"
+        ])
 
         data["user"] = user
         return data
-        
-
-
-
+    
+    
 class ClientProfileUpdateSerializer(serializers.ModelSerializer):
     class Meta:
         model = ClientAuth

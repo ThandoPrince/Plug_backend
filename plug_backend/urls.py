@@ -31,7 +31,7 @@ urlpatterns = [
         'api/client-auth/',
         views.get_my_auth,
         name='client-auth-by-email'
-    ),
+    ), ##used
     path(
         "api/sp/token/refresh/",
         TokenRefreshView.as_view(),
@@ -46,21 +46,27 @@ urlpatterns = [
     path('api/clientsDB/addresses/', views.address_list, name='address-list'),
     path('api/clientsDB/address-only/<int:client_id>', views.client_saved_addresses, name='address-only-list'),
     path('api/clientsDB/client-addresses/', views.client_address_list, name='client-address-list'),
-    path("api/client_devices/register-device-token/", views.register_device_token, name="register-device-token"),
+    path("api/client_devices/register-device-token/", views.register_device_token, name="register-device-token"), ##used
     path('api/clientsDB/client-profiles/', views.clientProfile_detail, name='client-profile-detail'),
     path('api/clientsDB/clients/', views.client_detail, name='client-detail'),
-    path('api/clientsDB/addresses/<int:id>/', views.address_detail),
+    path('api/clientsDB/addresses/<int:id>/', views.address_detail), ##used
     path('api/clientsDB/client-addresses/<int:client_id>/', views.client_address_detail),
     path('api/clientsDB/default-addresses/', views.client_default_address, name='client-default-addresses'),
     path("api/clientsDB/by-address/<int:address_id>/", views.clients_by_address, name="clients-by-address"),
     path("api/clientsDB/by-addresses/", views.clients_by_addresses, name="clients-by-addresses"),
-    path("api/clientsDB/client/register/", views.register_client, name="client-register"),
+    path("api/clientsDB/client/register/", views.register_client, name="client-register"), 
     path("api/address-client/set-default/<int:address_id>/", views.set_default_address, name="set-default-address"),
     path("api/clientsDB/client/", views.get_my_profile, name="get-my-profile"),
-    path("api/clientsDB/client/profile/complete/", views.complete_profile, name="complete-client-profile"),
-    path("api/clientsDB/client/add-residential-address/", views.add_residential_address, name="add-residential-address"),
-    path("api/clientsDB/login/", views.client_login, name="client-login"),
-    path("api/clientsDB/address/verify/<int:client_address_id>/", views.submit_address_verification, name="client-address-verification"),
+    path("api/clientsDB/client/profile/complete/", views.complete_profile, name="complete-client-profile"), ##used
+    path("api/clientsDB/client/add-residential-address/", views.add_residential_address, name="add-residential-address"), ##used
+    path("api/clientsDB/login/", views.client_login, name="client-login"),  ##used
+    path("clientsDB/address/verify/<int:client_address_id>/", views.submit_address_verification, name="client-address-verification"),
+    path(
+    "api/client/reset-password/",
+    views.reset_client_password,
+    name="reset_client_password"
+),
+path('api/client/get-sp-ratings/<int:sp_id>/', booking_views.get_sp_ratings, name='service_provider_address_detail'),
     
 
     # Service Providers DB
@@ -84,18 +90,23 @@ urlpatterns = [
         sp_views.get_cost_of_service_images_by_cost_id,
         name='get_cost_of_service_images_by_cost_id'
     ),
-    path('api/service_groups/', sp_views.service_group_list, name='service_group_list'),
-    path('api/service_groups/<str:group_id>/', sp_views.service_group_detail, name='service_group_detail'),
-    path('api/services/', sp_views.service_list, name='service_list'),
+    # path('api/service_groups/', sp_views.service_group_list, name='service_group_list'),
+    # path('api/service_groups/<str:group_id>/', sp_views.service_group_detail, name='service_group_detail'),
+    # path('api/services/<int:pk>/', sp_views.service_detail, name='service_detail'),
+    path('api/services/', sp_views.service_list, name='service_list'), ##NEEDS TO BE CACHED
     path('api/approved_services/', sp_views.approved_services_list, name='service_list'),
-    path('api/services/<int:pk>/', sp_views.service_detail, name='service_detail'),
+    
 
-
+path(
+    'api/service_providerDB/sps_by_live_location/',
+    sp_views.sps_by_live_location,
+    name='service_provider_by_live_location'
+),
 
 
     
     path('api/service_providers/', sp_views.service_provider_list_service, name='service_provider_list'),
-    path('api/service_providers/<int:id>/', sp_views.service_provider_detail, name='service_provider_detail_by_email'),
+    path('api/service_providers/<int:provider_id>/', sp_views.service_provider_detail, name='service_provider_detail_by_email'),
     path('api/service_provider_my/<int:id>/', sp_views.service_provider_details, name='service_provider_details_by_email'),
     path('api/service_providers/by-service/<int:service_id>/', sp_views.providers_by_service, name='service_provider_detail_by_service'),
     path('api/serviceProvidersDB/address/<int:id>/', sp_views.service_provider_address_detail, name='service_provider_address'),
@@ -104,7 +115,7 @@ urlpatterns = [
   
     path('api/service_providers/sp/update-live-location/', sp_views.update_sp_live_location, name='service_provider_update_live_location'),
     path('api/service_providersDB/live-loc-by-service/<int:service_id>/', sp_views.fetch_sp_live_locations_by_service, name='fetch_service_provider_live_location_by_service'),
-    path('api/service_providersDB/sps_by_live_location/', sp_views.sps_by_live_location, name='service_provider_by_live_location'),
+    
     
     path('api/service_provider/services/<int:provider_id>/',sp_views.get_provider_services,name='get_provider_services_by_email'),
     path('api/serviceProvider/cost/<int:cost_id>/images/',sp_views.upload_service_images,name='upload_service_images'),
@@ -121,7 +132,7 @@ urlpatterns = [
     path('api/bookings/order_a_service/', booking_views.order_service_create, name='order_a_service'),
     path('api/bookings/get_shipment/by_sp_email/<str:provider_email>/', booking_views.get_shipments_by_provider, name='get_shipments_by_provider_email'),
     path('api/bookings/get_shipment/by_shipment_id/<int:shipment_id>/', booking_views.get_shipment_by_id, name='get_shipment_by_id'),
-    path('api/bookings/get_shipment/by_client_email/<str:client_email>/', booking_views.get_shipments_by_client, name='get_shipments_by_client_email'),
+    path('api/bookings/get_shipment/by_client_email/<int:client_id>/', booking_views.get_shipments_by_client, name='get_shipments_by_client_email'),
     path('api/bookings/shipment/<int:shipment_id>/route/', booking_views.shipment_routes_view, name='shipment_routes'),
     path('api/bookings/shipment/<int:shipment_id>/change_status/', booking_views.change_shipment_status, name='change_shipment_status'),
     path('api/bookings/shipment/<int:shipment_id>/confirm/', booking_views.confirm_shipment, name='confirm_shipment'),
@@ -143,12 +154,13 @@ urlpatterns = [
   
 
     # Provider & Client endpoints
-    path('api/bookings/sp_active_orders/<str:email>/', booking_views.bookings_by_invited_provider, name='sp_active_orders'),
-    path('api/bookings/client_active_orders/<str:email>/', booking_views.pending_orders_by_client_email, name='client_active_orders'),
-    path('api/bookings/get_ratings/by_client_email/<str:email>/', booking_views.get_ratings_by_client_email, name='client_ratings'),
+    path('api/bookings/sp_active_orders/<int:id>/', booking_views.bookings_by_invited_provider, name='sp_active_orders'),
+    path('api/bookings/client_active_orders/<int:client_id>/', booking_views.pending_orders_by_client_id, name='client_active_orders'),
+    path('api/bookings/get_ratings/by_client_email/<int:client_id>/', booking_views.get_ratings_by_client_email, name='client_ratings'),
     path('api/bookings/get_ratings/by_provider_email/<str:email>/', booking_views.get_ratings_by_provider_email, name='provider_ratings'),
     path('api/bookings/<int:session_id>/rate-provider/<str:client_email>/', booking_views.submit_client_rating, name='client_submit_rating'),
     path('api/bookings/<int:session_id>/rate-client/<str:provider_email>/', booking_views.submit_provider_rating, name='provider_submit_rating'),
+    path('api/bookings/cancel_order/', booking_views.cancel_order, name='client_cancel_order'),
 
     # Negotiation endpoints
     path('api/bookings/service_orders/negotiations/', booking_views.negotiation_list, name='negotiation_list'),
@@ -159,6 +171,11 @@ urlpatterns = [
     path('api/bookings/service_orders/negotiation/rounds/<int:negotiation_id>/', booking_views.negotiation_rounds_by_negotiation, name='negotiation_round_list'),
     path('api/bookings/service_orders/negotiation/rounds/<int:negotiation_id>/client_start_round/', booking_views.client_start_round, name='negotiation_round_client_start_round'),
     path('api/bookings/service_orders/negotiation/provider_accepts_negotiation/<int:negotiation_id>/', booking_views.provider_accept_negotiation, name='provider_accepts_negotiation'),
+    path(
+        "api/bookings/service_orders/<int:order_id>/update/",
+        booking_views.update_order_service,
+        name="update_order_service"
+    ),
     path("media-debug/", media_debug),
 
   

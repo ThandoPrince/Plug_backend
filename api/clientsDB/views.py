@@ -1,3 +1,4 @@
+import re
 from sqlite3 import IntegrityError
 
 from django.http import JsonResponse
@@ -10,90 +11,258 @@ from rest_framework.parsers import MultiPartParser, FormParser
 from rest_framework.permissions import AllowAny
 from rest_framework.permissions import IsAuthenticated
 from django.db import transaction
+from api.clientsDB.services.client_ip_address_helper import get_client_ip
 from api.clientsDB.services.jwt_client_authentication import ClientJWTAuthentication
-from plug_backend.helpers.auth_helpers import get_client_details
+from api.clientsDB.services.sa_phone_number_helper import normalize_sa_mobile
+from plug_backend.helpers.auth_helpers import get_client_auth, get_client_details
 from plug_backend.throttles import ProfileWriteThrottle, UserReadThrottle
 from plug_backend.utils.client_jwt_helper import generate_client_tokens
+from django.db.models import Q
+from django.utils import timezone
+from .models.models import ClientAuth, ClientDetails, Address, ClientAddress, ClientLoginHistory, ClientNotification, DeviceToken 
+from .serializers import AddressClaimSerializer, AddressOnlySerializer, AddressVerificationCreateSerializer, ClientAddressNoDuplicatesSerializer, AddressSerializer, ClientAddressSerializerr, ClientAddressWriteSerializer, ClientAuthReadSerializer, ClientLoginSerializer, ClientProfileSerializer, ClientRegisterSerializer, ClientSerializer, ClientAddressSerializer, DefaultAddressSerializer, DeviceTokenWriteSerializer
+from django.contrib.auth.hashers import check_password, make_password
 
 
-# from rest_framework.permissions import IsAuthenticated
-from .models.models import ClientAuth, ClientDetails, Address, ClientAddress, ClientNotification, DeviceToken 
-from .serializers import AddressClaimSerializer, AddressOnlySerializer, AddressVerificationCreateSerializer, ClientAddressNoDuplicatesSerializer, AddressSerializer, ClientAddressWriteSerializer, ClientAuthReadSerializer, ClientLoginSerializer, ClientProfileSerializer, ClientRegisterSerializer, ClientSerializer, ClientAddressSerializer, DefaultAddressSerializer, DeviceTokenWriteSerializer
+@api_view(["POST"])
+@throttle_classes([ProfileWriteThrottle])
+def reset_client_password(request):
 
+    try:
+        email = request.data.get("email")
+        mobile_number = request.data.get("mobile_number")
+        new_password = request.data.get("new_password")
+
+        # ------------------------
+        # Basic validation
+        # ------------------------
+        if not new_password:
+            return Response(
+                {"error": "new_password is required"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        if not email and not mobile_number:
+            return Response(
+                {"error": "Provide email or mobile_number"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # ------------------------
+        # Normalize inputs
+        # ------------------------
+        if email:
+            email = email.strip().lower()
+
+        if mobile_number:
+            mobile_number = normalize_sa_mobile(mobile_number)
+
+            if not mobile_number:
+                return Response(
+                    {"error": "Invalid mobile number format"},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+        # ------------------------
+        # Password complexity rules
+        # ------------------------
+        errors = []
+
+        if len(new_password) < 8:
+            errors.append("Password must be at least 8 characters.")
+
+        if not re.search(r'[A-Z]', new_password):
+            errors.append("Password must contain at least one uppercase letter.")
+
+        if not re.search(r'[a-z]', new_password):
+            errors.append("Password must contain at least one lowercase letter.")
+
+        if not re.search(r'\d', new_password):
+            errors.append("Password must contain at least one digit.")
+
+        if errors:
+            return Response(
+                {"error": errors},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # ------------------------
+        # Safe lookup (strict)
+        # ------------------------
+        query = Q()
+
+        if email:
+            query |= Q(email_address__iexact=email)
+
+        if mobile_number:
+            query |= Q(mobile_number=mobile_number)
+
+        try:
+            client = ClientAuth.objects.get(query)
+
+        except ClientAuth.DoesNotExist:
+            return Response(
+                {"error": "Client not found"},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+        except ClientAuth.MultipleObjectsReturned:
+            return Response(
+                {"error": "Multiple accounts found. Contact support."},
+                status=status.HTTP_409_CONFLICT
+            )
+
+        # ------------------------
+        # BLOCK: account locked
+        # ------------------------
+        if (
+            client.account_locked_until and
+            client.account_locked_until > timezone.now()
+        ):
+            remaining_minutes = int(
+                (client.account_locked_until - timezone.now())
+                .total_seconds() / 60
+            )
+
+            return Response(
+                {
+                    "error": [
+                        f"Account is temporarily locked. Try again in {remaining_minutes} minute(s)."
+                    ]
+                },
+                status=status.HTTP_403_FORBIDDEN
+            )
+
+        # ------------------------
+        # Prevent password reuse
+        # ------------------------
+        if check_password(new_password, client.password):
+            return Response(
+                {
+                    "error": [
+                        "New password cannot be the same as the old password."
+                    ]
+                },
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # ------------------------
+        # Update password
+        # ------------------------
+        client.password = make_password(new_password)
+
+        client.failed_login_attempts = 0
+        client.account_locked_until = None
+
+        client.save(update_fields=[
+            "password",
+            "failed_login_attempts",
+            "account_locked_until"
+        ])
+
+        return Response(
+            {"message": "Password reset successfully"},
+            status=status.HTTP_200_OK
+        )
+
+    except Exception:
+        logger.exception("Unexpected error in reset_client_password")
+
+        return Response(
+            {
+                "error": "Unable to reset password at this time."
+            },
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR
+        )
+
+
+    
 @api_view(['POST'])
 @throttle_classes([ProfileWriteThrottle])
 def register_client(request):
 
-    serializer = ClientRegisterSerializer(data=request.data)
+    try:
+        serializer = ClientRegisterSerializer(data=request.data)
 
-    if serializer.is_valid():
+        if serializer.is_valid():
 
-        email = serializer.validated_data['email_address'].lower()
+            email = serializer.validated_data['email_address'].lower()
 
-        # Prevent duplicate accounts
-        if ClientAuth.objects.filter(email_address=email).exists():
-            return Response(
-                {"error": "A user with this email already exists."},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-        if ClientAuth.objects.filter(
-            mobile_number=serializer.validated_data["mobile_number"]
-                ).exists():
-            return Response(
-                {"error": "A user with this mobile number already exists."},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-
-        try:
-            with transaction.atomic():
-
-                
-                client_auth = serializer.save()
-
-                # Ensure profile exists
-                ClientDetails.objects.get_or_create(
-                    client_profile=client_auth
+            if ClientAuth.objects.filter(email_address=email).exists():
+                return Response(
+                    {"error": "A user with this email already exists."},
+                    status=status.HTTP_400_BAD_REQUEST
                 )
 
-                
-                tokens = generate_client_tokens(client_auth)
+            if ClientAuth.objects.filter(
+                mobile_number=serializer.validated_data["mobile_number"]
+            ).exists():
+                return Response(
+                    {"error": "A user with this mobile number already exists."},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
 
-            return Response(
-                {
-                    "success": True,
-                    "message": "Registration successful.",
-                    "data": {
-                        "id": client_auth.id,
-                        "email": client_auth.email_address,
-                        "mobile_number": client_auth.mobile_number,
-                        "access_token": tokens["access"],
-                        "refresh_token": tokens["refresh"],
-                    }
-                },
-                status=status.HTTP_201_CREATED
-            )
+            try:
+                with transaction.atomic():
 
-        except IntegrityError:
-            return Response(
-                {
-                    "success": False,
-                    "message": "A user with this email or mobile already exists."
-                },
-                status=status.HTTP_409_CONFLICT
-            )
+                    client_auth = serializer.save()
 
-        except Exception as e:
-            logger.error(f"Client Registration Error: {str(e)}")
-            return Response(
-                {
-                    "success": False,
-                    "message": "A server error occurred. Please try again later."
-                },
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR
-            )
+                    ClientDetails.objects.get_or_create(
+                        client_profile=client_auth
+                    )
 
-    return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+                    tokens = generate_client_tokens(client_auth)
 
+                return Response(
+                    {
+                        "success": True,
+                        "message": "Registration successful.",
+                        "data": {
+                            "id": client_auth.id,
+                            "email": client_auth.email_address,
+                            "mobile_number": client_auth.mobile_number,
+                            "access_token": tokens["access"],
+                            "refresh_token": tokens["refresh"],
+                        }
+                    },
+                    status=status.HTTP_201_CREATED
+                )
+
+            except IntegrityError:
+                return Response(
+                    {
+                        "success": False,
+                        "message": "A user with this email or mobile already exists."
+                    },
+                    status=status.HTTP_409_CONFLICT
+                )
+
+            except Exception:
+                logger.exception("Client registration failed")
+
+                return Response(
+                    {
+                        "success": False,
+                        "message": "A server error occurred. Please try again later."
+                    },
+                    status=status.HTTP_500_INTERNAL_SERVER_ERROR
+                )
+
+        return Response(
+            serializer.errors,
+            status=status.HTTP_400_BAD_REQUEST
+        )
+
+    except Exception:
+        logger.exception("Unexpected error in register_client")
+
+        return Response(
+            {
+                "success": False,
+                "message": "A server error occurred. Please try again later."
+            },
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR
+        )
 
 @api_view(['GET'])
 @authentication_classes([ClientJWTAuthentication])
@@ -102,23 +271,41 @@ def register_client(request):
 def get_my_profile(request):
 
     try:
-        client = ClientDetails.objects.select_related(
-            'client_profile'
-        ).get(
-            client_profile=request.user
+        try:
+            client = ClientDetails.objects.select_related(
+                'client_profile'
+            ).get(
+                client_profile=request.user
+            )
+
+        except ClientDetails.DoesNotExist:
+            return Response(
+                {"error": "Client not found."},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+        serializer = ClientSerializer(
+            client,
+            context={'request': request}
         )
-    except ClientDetails.DoesNotExist:
+
         return Response(
-            {"error": "Client not found."},
-            status=status.HTTP_404_NOT_FOUND
+            serializer.data,
+            status=status.HTTP_200_OK
         )
 
-    serializer = ClientSerializer(
-        client,
-        context={'request': request}
-    )
+    except Exception:
+        logger.exception(
+            "Unexpected error in get_my_profile"
+        )
 
-    return Response(serializer.data)
+        return Response(
+            {
+                "error": "Unable to retrieve profile at this time."
+            },
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR
+        )
+
 
 @api_view(['PATCH'])
 @throttle_classes([ProfileWriteThrottle])
@@ -126,16 +313,8 @@ def get_my_profile(request):
 @authentication_classes([ClientJWTAuthentication])
 @permission_classes([IsAuthenticated])
 def complete_profile(request):
-    print("FILES RECEIVED:", request.FILES)
-    print("POST DATA:", request.data) 
-    try:
-        client = get_client_details(request)
-
-    except ClientDetails.DoesNotExist:
-        return Response(
-            {"error": "Client not found."},
-            status=status.HTTP_404_NOT_FOUND
-        )
+    # Enforce strict ownership profile isolation (RLS)
+    client = get_object_or_404(ClientDetails, client_profile=request.user)
 
     serializer = ClientSerializer(
         client,
@@ -145,18 +324,16 @@ def complete_profile(request):
     )
 
     if serializer.is_valid():
-
         updated_client = serializer.save()
 
+        # Update lifecycle state tracking
         if (
             updated_client.first_name and
             updated_client.last_name and
             updated_client.date_of_birth
         ):
             updated_client.client_profile.is_profile_completed = "in-address"
-            updated_client.client_profile.save(
-                update_fields=["is_profile_completed"]
-            )
+            updated_client.client_profile.save(update_fields=["is_profile_completed"])
 
         return Response({
             "success": True,
@@ -208,20 +385,15 @@ def set_default_address(request, address_id):
     )
 
 
+
 @api_view(['POST'])
 @throttle_classes([ProfileWriteThrottle])
 @authentication_classes([ClientJWTAuthentication])
 @permission_classes([IsAuthenticated])
 def add_residential_address(request):
-
-    try:
-        client = get_client_details(request)
-
-    except ClientDetails.DoesNotExist:
-        return Response(
-            {"error": "Client not found."},
-            status=status.HTTP_404_NOT_FOUND
-        )
+    # --- Row-Level Security Enforced ---
+    # Guarantees the address is uniquely attached to the authenticated user's ClientDetails
+    client = get_object_or_404(ClientDetails, client_profile=request.user)
 
     serializer = ClientAddressWriteSerializer(
         data=request.data,
@@ -236,16 +408,15 @@ def add_residential_address(request):
 
     client_address = serializer.save()
 
+    # Cascade application lifecycle status change cleanly
     client.client_profile.is_profile_completed = "completed"
-    client.client_profile.save(
-        update_fields=["is_profile_completed"]
-    )
+    client.client_profile.save(update_fields=["is_profile_completed"])
 
     return Response(
         {
             "success": True,
             "message": "Address added successfully.",
-            "data": ClientAddressSerializer(client_address).data,
+            "data": ClientAddressSerializerr(client_address).data,
             "profile_status": client.client_profile.is_profile_completed,
         },
         status=status.HTTP_201_CREATED
@@ -272,10 +443,10 @@ def get_my_auth(request):
 @permission_classes([IsAuthenticated])
 @throttle_classes([ProfileWriteThrottle])
 def submit_address_verification(request, client_address_id):
-
     try:
         client = get_client_details(request)
 
+        # RLS enforcement
         client_address = ClientAddress.objects.get(
             id=client_address_id,
             client=client
@@ -308,6 +479,8 @@ def submit_address_verification(request, client_address_id):
             status=status.HTTP_201_CREATED
         )
 
+
+
     return Response(
         serializer.errors,
         status=status.HTTP_400_BAD_REQUEST
@@ -318,41 +491,65 @@ def submit_address_verification(request, client_address_id):
 @authentication_classes([ClientJWTAuthentication])
 @permission_classes([IsAuthenticated])
 def register_device_token(request):
-    print("FILES RECEIVED:", request.FILES)
-    print("POST DATA:", request.data)   
-    serializer = DeviceTokenWriteSerializer(data=request.data, context={'request': request})
-    if not serializer.is_valid():
-        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+    """
+    Registers or updates a device push notification token for a ClientAuth user.
+    Enforces RLS ensuring a matching ClientDetails registration profile exists.
+    """
+    # --- Row-Level Security (RLS) ---
+    # Intercepts requests immediately if the ClientAuth user has no matching ClientDetails 
+    get_object_or_404(ClientDetails, client_profile=request.user)
 
+    serializer = DeviceTokenWriteSerializer(
+        data=request.data,
+        context={'request': request}
+    )
+    serializer.is_valid(raise_exception=True)
+    
     token = serializer.validated_data["fcm_token"]
 
-    
-    DeviceToken.objects.filter(
-    fcm_token=token
-).exclude(
-    client=request.user
-).delete()
+    # Deduplication Step 1: Evict this specific token if registered to other users
+    DeviceToken.objects.filter(fcm_token=token).exclude(client=request.user).delete()
+    ip_address = get_client_ip(request)
 
-    device_token = serializer.save()
+    # Deduplication Step 2: Update existing entry or insert a new unique token for this user
+    device_token, created = DeviceToken.objects.update_or_create(
+        client=request.user,
+        fcm_token=token,
+        defaults={
+            "device_type": serializer.validated_data.get("device_type"),
+            "device_name": serializer.validated_data.get("device_name"),
+            "os_version": serializer.validated_data.get("os_version"),
+            "app_version": serializer.validated_data.get("app_version"),
+            "provider": serializer.validated_data.get("provider", "firebase"),
+            "ip_address": ip_address,
+        }
+    )
+    
 
     return Response(
-        {"message": "Device token registered successfully", "token_id": device_token.id},
-        status=status.HTTP_201_CREATED
+        {
+            "message": (
+                "Device token registered successfully"
+                if created
+                else "Device token updated successfully"
+            ),
+            "token_id": device_token.id,
+        },
+        status=status.HTTP_201_CREATED if created else status.HTTP_200_OK,
     )
 
 @api_view(['POST'])
 @throttle_classes([ProfileWriteThrottle])
-
-
 def client_login(request):
 
-    serializer = ClientLoginSerializer(data=request.data)
+    serializer = ClientLoginSerializer(
+        data=request.data,
+        context={"request": request}
+    )
 
     if serializer.is_valid():
 
         user = serializer.validated_data["user"]
-
-        client_details = getattr(user, "clientdetails", None)
 
         tokens = generate_client_tokens(user)
 
@@ -361,12 +558,7 @@ def client_login(request):
             "message": "Login successful",
             "data": {
                 "id": user.id,
-                "email": user.email_address,
-                "mobile_number": user.mobile_number,
-                "first_name": getattr(client_details, "first_name", ""),
-                "last_name": getattr(client_details, "last_name", ""),
                 "is_profile_completed": user.is_profile_completed,
-
                 "access_token": tokens["access"],
                 "refresh_token": tokens["refresh"],
             }
@@ -466,7 +658,7 @@ def client_detail(request,format=None):
 
 
 
-@api_view(['GET', 'PUT', 'PATCH', 'DELETE'])
+@api_view(['GET'])
 @throttle_classes([UserReadThrottle])
 @authentication_classes([ClientJWTAuthentication])
 @permission_classes([IsAuthenticated])
@@ -480,16 +672,7 @@ def address_detail(request, id,format=None):
         serializer = AddressSerializer(address)
         return Response(serializer.data, status=status.HTTP_200_OK)
 
-    elif request.method in ['PUT', 'PATCH']:
-        serializer = AddressSerializer(address, data=request.data, partial=(request.method == 'PATCH'))
-        if serializer.is_valid():
-            serializer.save()
-            return Response({'message': 'Address updated successfully.', 'data': serializer.data}, status=status.HTTP_200_OK)
-        return Response({'error': 'Invalid data provided.', 'details': serializer.errors}, status=status.HTTP_400_BAD_REQUEST)
-
-    elif request.method == 'DELETE':
-        address.delete()
-        return Response({'message': 'Address deleted successfully.'}, status=status.HTTP_204_NO_CONTENT)
+    
 
 @api_view(['GET'])
 @throttle_classes([UserReadThrottle])
@@ -497,7 +680,7 @@ def address_detail(request, id,format=None):
 @permission_classes([IsAuthenticated])
 def client_address_detail(request, client_id, format=None):
     try:
-        # RLS-style enforcement: user can only access their own client record
+        
         client = ClientDetails.objects.get(
             client_profile__id=client_id,
             client_profile=request.user
@@ -526,7 +709,7 @@ def client_address_detail(request, client_id, format=None):
     
     
 
-@api_view(['GET', 'PUT'])
+@api_view(['GET'])
 @throttle_classes([UserReadThrottle])
 @authentication_classes([ClientJWTAuthentication])
 @permission_classes([IsAuthenticated])
@@ -541,12 +724,7 @@ def client_profile_me(request):
         serializer = ClientSerializer(client, context={'request': request})
         return Response(serializer.data)
 
-    elif request.method == 'PUT':
-        serializer = ClientSerializer(client, data=request.data, partial=True, context={'request': request})
-        if serializer.is_valid():
-            serializer.save()
-            return Response(serializer.data)
-        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
     
 @api_view(['GET'])
 @throttle_classes([UserReadThrottle])

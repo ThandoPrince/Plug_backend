@@ -34,7 +34,7 @@ ALLOWED_HOSTS = [
     ).split(",")
     if host.strip()
 ]
-
+FILE_UPLOAD_MAX_MEMORY_SIZE = 2 * 1024 * 1024
 CSRF_TRUSTED_ORIGINS = [
     origin.strip()
     for origin in get_env(

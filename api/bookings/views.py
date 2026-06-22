@@ -1,4 +1,6 @@
 from datetime import timedelta
+import json
+import logging
 from django.conf import settings
 from django.utils import timezone
 from django.shortcuts import get_object_or_404
@@ -8,18 +10,23 @@ from rest_framework import status
 from django.db import transaction
 from django.db.models import Exists, OuterRef
 from api.bookings.services.calculate_distance_meters import calculate_distance_meters
+from api.bookings.services.order_status_service import OrderStatusService
 from api.bookings.services.shipment_transition_function import InvalidShipmentTransition, transition_shipment
+from api.clientsDB.models.models import ClientDetails
 from api.clientsDB.services.jwt_client_authentication import ClientJWTAuthentication
 from api.serviceProvidersDB.models import ProviderService, ServiceProvider
 from api.serviceProvidersDB.services.sp_jwt_authentication import SPJWTAuthentication
-from plug_backend.throttles import BookingLikeWriteThrottle, HeavyReadThrottle, UserReadThrottle
+from plug_backend.throttles import BookingLikeWriteThrottle, HeavyReadThrottle, ProfileWriteThrottle, UserReadThrottle
 
 from .models import BookingItem, NegotiationRound, OrderService, Negotiation, Rating, Session, SessionLocationPing, SessionToken, Shipment, ShipmentRoute
 from .serializers import (
+    CancelOrderSerializer,
+    ClientRatingReadSerializer,
     ConfirmCheckinResponseSerializer,
     ConfirmCheckinSerializer,
     NegotiationRoundWriteSerializer,
     OrderFinalPricePatchSerializer,
+    OrderServicePatchSerializer,
     OrderServiceReadSerializer,
     OrderServiceWriteSerializer,
     NegotiationReadSerializer,
@@ -58,12 +65,27 @@ def order_service_list(request):
 @authentication_classes([ClientJWTAuthentication])
 @permission_classes([IsAuthenticated])
 def order_service_create(request):
-    print("FILES RECEIVED:", request.FILES)
-    print("POST DATA:", request.data)
+    # 1. Convert QueryDict to a standard Python dict to avoid QueryDict list nesting bugs
+    data = request.data.dict()
 
+    # 2. Extract and parse the JSON string of provider IDs securely
+    raw_invited = request.data.get("invited_providers")
+    if raw_invited:
+        try:
+            data["invited_providers"] = json.loads(raw_invited)
+        except (json.JSONDecodeError, TypeError):
+            data["invited_providers"] = []
+    else:
+        data["invited_providers"] = []
+
+    # 3. Explicitly re-attach files since request.data.dict() only captures the last item in a file list
+    if request.FILES:
+        data["service_pictures"] = request.FILES.getlist("service_pictures")
+
+    # 4. Initialize serializer with clean python data structures
     serializer = OrderServiceWriteSerializer(
-        data=request.data,
-        context={'request': request}
+        data=data,
+        context={"request": request}
     )
 
     if not serializer.is_valid():
@@ -85,6 +107,8 @@ def order_service_create(request):
         read_serializer.data,
         status=status.HTTP_201_CREATED
     )
+
+
 @api_view(['GET', 'PUT', 'PATCH'])
 @throttle_classes([HeavyReadThrottle])
 @authentication_classes([ClientJWTAuthentication])
@@ -230,11 +254,35 @@ def provider_accept_negotiation(request, negotiation_id):
 
 @api_view(['GET'])
 @throttle_classes([HeavyReadThrottle])
+@permission_classes([IsAuthenticated])
+@authentication_classes([ClientJWTAuthentication])
 def negotiations_by_order(request, order_id):
-    """Get all negotiations for a specific order"""
+    """
+    Get all negotiations for a specific order
+    Only allowed for pending and in-negotiation orders
+    """
+
     order = get_object_or_404(OrderService, pk=order_id)
-    negotiations = Negotiation.objects.filter(service_order=order).order_by('-created_at')
+
+    allowed_statuses = ['pending', 'in-negotiation']
+
+    if order.status not in allowed_statuses:
+        return Response(
+            {
+                "detail": "Negotiations are not available for this order status.",
+                "status": order.status
+            },
+            status=403
+        )
+
+    negotiations = (
+        Negotiation.objects
+        .filter(service_order=order)
+        .order_by('-created_at')
+    )
+
     serializer = NegotiationReadSerializer(negotiations, many=True)
+
     return Response(serializer.data)
 
 
@@ -257,23 +305,115 @@ def negotiations_by_order_and_provider(request, order_id, email):
 @throttle_classes([HeavyReadThrottle])
 @authentication_classes([SPJWTAuthentication])
 @permission_classes([IsAuthenticated])
-def bookings_by_invited_provider(request, email):
+def bookings_by_invited_provider(request, id):
     """Get all bookings where the given provider email is invited"""
     orders = OrderService.objects.filter(
-        invited_providers__provider__sp_profile__email_address=email,
+        invited_providers__provider__sp_profile__id=id,
         status__in=['pending', 'in_progress', 'in-negotiation']
     ).distinct().order_by('-date_and_time_created')
 
     serializer = OrderServiceReadSerializer(orders, many=True)
     return Response(serializer.data)
 
+
+@api_view(["PATCH"])
+@throttle_classes([BookingLikeWriteThrottle])
+@authentication_classes([ClientJWTAuthentication])
+@permission_classes([IsAuthenticated])
+def update_order_service(request, order_id):
+
+    # RLS
+    client = get_object_or_404(
+        ClientDetails,
+        client_profile=request.user
+    )
+
+    order = get_object_or_404(
+        OrderService,
+        order_id=order_id,
+        client=client,
+    )
+
+    serializer = OrderServicePatchSerializer(
+        order,
+        data=request.data,
+        partial=True,
+        context={"request": request},
+    )
+
+    if not serializer.is_valid():
+        return Response(
+            serializer.errors,
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    updated_order = serializer.save()
+
+    return Response(
+        {
+            "success": True,
+            "message": "Order updated successfully.",
+            "data": OrderServiceReadSerializer(
+                updated_order
+            ).data,
+        },
+        status=status.HTTP_200_OK,
+    )
+
+@api_view(["POST"])
+@throttle_classes([ProfileWriteThrottle])
+@authentication_classes([ClientJWTAuthentication])
+@permission_classes([IsAuthenticated])
+def cancel_order(request):
+    
+
+    serializer = CancelOrderSerializer(data=request.data)
+    if not serializer.is_valid():
+        print(f"[Diagnostic] Serializer validation failed: {serializer.errors}")
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+    order_id = serializer.validated_data["order_id"]
+
+    try:
+        order = OrderService.objects.get(
+            order_id=order_id,
+            client__client_profile=request.user
+        )
+    except OrderService.DoesNotExist:
+        print(f"[Diagnostic] Order {order_id} not found for User {request.user}")
+        return Response(
+            {"success": False, "message": "Order not found or permission denied."},
+            status=status.HTTP_404_NOT_FOUND
+        )
+
+    try:
+        OrderStatusService.set_status(order, "canceled")
+        return Response(
+            {"success": True, "message": "Order cancelled successfully."},
+            status=status.HTTP_200_OK
+        )
+    except Exception as engine_error:
+        
+       
+        return Response(
+            {"success": False, "error_details": str(engine_error)},
+            status=status.HTTP_400_BAD_REQUEST
+        )
+    
+    
 @api_view(['GET'])
+@permission_classes([IsAuthenticated])
+@authentication_classes([ClientJWTAuthentication])
 @throttle_classes([HeavyReadThrottle])
-def pending_orders_by_client_email(request, email):
-    """
-    Fetch pending orders for a given client email,
-    including whether each order is in negotiation.
-    """
+def pending_orders_by_client_id(request, client_id):
+   
+    # Application-Layer RLS: Validate request.user.id matches the URL resource ID
+    if getattr(request.user, 'id', None) != client_id:
+        return Response(
+            {"detail": "You do not have permission to access records for this profile."},
+            status=status.HTTP_403_FORBIDDEN
+        )
+
     try:
         negotiation_subquery = Negotiation.objects.filter(
             service_order=OuterRef('pk')
@@ -281,7 +421,7 @@ def pending_orders_by_client_email(request, email):
 
         orders = (
             OrderService.objects.filter(
-                client__client_profile__email_address=email,
+                client_id=client_id,  # Direct foreign key lookup (efficient integer scan)
                 status__in=['pending', 'in-negotiation']
             )
             .annotate(in_negotiation=Exists(negotiation_subquery))
@@ -291,6 +431,17 @@ def pending_orders_by_client_email(request, email):
         serializer = OrderServiceReadSerializer(orders, many=True)
         data = serializer.data
 
+        # Inject subquery results into payload response map
+        for i, order in enumerate(orders):
+            data[i]['in_negotiation'] = order.in_negotiation
+
+        return Response(data, status=status.HTTP_200_OK)
+
+    except Exception as e:
+        return Response(
+            {"error": str(e)},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR
+        )
         for i, order in enumerate(orders):
             data[i]['in_negotiation'] = order.in_negotiation
 
@@ -532,39 +683,62 @@ def get_shipments_by_provider(request, provider_email):
 @throttle_classes([HeavyReadThrottle])
 @authentication_classes([ClientJWTAuthentication])
 @permission_classes([IsAuthenticated])
-def get_shipments_by_client(request, client_email):
-    """
-    Returns all shipments for a given client based on client email.
-    Only includes shipments with statuses: pending, in_transit, arrived, delivered, in_session.
-    Newest shipments are returned first.
-    """
+def get_shipments_by_client(request, client_id):
 
-    # 1️⃣ Get all orders belonging to this client
-    client_orders = OrderService.objects.filter(
-        client__client_profile__email_address=client_email
-    )
+    try:
+        # 1️⃣ Get client (ownership-safe lookup)
+        client_orders = OrderService.objects.filter(
+            client_id=client_id
+        )
 
-    if not client_orders.exists():
-        return Response([], status=status.HTTP_200_OK)
+        if not client_orders.exists():
+            return Response(
+                {
+                    "success": True,
+                    "data": []
+                },
+                status=status.HTTP_200_OK
+            )
 
-    # 2️⃣ Get booking items linked to these orders
-    booking_items = BookingItem.objects.filter(order__in=client_orders)
+        # 2️⃣ Booking items
+        booking_items = BookingItem.objects.filter(
+            order__in=client_orders
+        )
 
-    # 3️⃣ Get shipments linked to these booking items with specific statuses
-    shipments = Shipment.objects.filter(
-        service_ordered__in=booking_items,
-        shipment_status__in=[
-            "Pending",
-            "in_transit",
-            "arrived",
-            "delivered",
-            "in_session"
-        ]
-    ).order_by('-shipment_schedule_date', '-shipment_schedule_time')
+        # 3️⃣ Shipments
+        shipments = Shipment.objects.filter(
+            service_ordered__in=booking_items,
+            shipment_status__in=[
+                "Pending",
+                "in_transit",
+                "arrived",
+                "delivered",
+                "in_session"
+            ]
+        ).order_by('-shipment_schedule_date', '-shipment_schedule_time')
 
-    # 4️⃣ Serialize and return
-    serializer = ShipmentReadSerializer(shipments, many=True)
-    return Response(serializer.data, status=status.HTTP_200_OK)
+        serializer = ShipmentReadSerializer(shipments, many=True)
+
+        return Response(
+            {
+                "success": True,
+                "data": serializer.data
+            },
+            status=status.HTTP_200_OK
+        )
+
+    except Exception:
+        logger.error("Unexpected error in get_shipments_by_client", exc_info=True)
+
+        return Response(
+            {
+                "success": False,
+                "message": "Unexpected server error."
+            },
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR
+        )
+    
+
 
 @api_view(["POST"])
 @throttle_classes([BookingLikeWriteThrottle])
@@ -961,30 +1135,79 @@ def get_ratings_by_provider_email(request, email):
     serializer = RatingReadSerializer(ratings, many=True)
     return Response(serializer.data)
 
-
+logger = logging.getLogger(__name__)
 
 @api_view(['GET'])
 @throttle_classes([HeavyReadThrottle])
 @authentication_classes([ClientJWTAuthentication])
 @permission_classes([IsAuthenticated])
-def get_ratings_by_client_email(request, email):
+def get_ratings_by_client_email(request, client_id):
     """
     Get ratings for a client.
-    Optional query param:
-            
+
+    Optional query params:
+        - session_id
     """
 
-    session_id = request.query_params.get("session_id")
+    try:
+        session_id = request.query_params.get("session_id")
 
-    ratings = Rating.objects.filter(
-        rater_client__client_profile__email_address=email
+        ratings = Rating.objects.filter(
+            rater_client_id=client_id
+        )
+
+        if session_id:
+            ratings = ratings.filter(
+                session__session_id=session_id
+            )
+
+        serializer = RatingReadSerializer(
+            ratings,
+            many=True
+        )
+
+        return Response(
+            serializer.data,
+            status=status.HTTP_200_OK
+        )
+
+    except Exception:
+        logger.error(
+            "Unexpected error in get_ratings_by_client",
+            exc_info=True
+        )
+
+        return Response(
+            {
+                "success": False,
+                "message": "Unexpected server error."
+            },
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR
+        )
+
+##public
+@api_view(['GET'])
+@throttle_classes([HeavyReadThrottle])
+# @authentication_classes([ClientJWTAuthentication])
+# @permission_classes([IsAuthenticated])
+def get_sp_ratings(request, sp_id):
+    ratings = (
+        Rating.objects
+        .filter(rater_provider__sp_profile__id=sp_id)
+        .select_related('rater_client')
+        .order_by('-created_at')[:3]
     )
 
-    if session_id:
-        ratings = ratings.filter(session__session_id=session_id)
+    
 
-    serializer = RatingReadSerializer(ratings, many=True)
-    return Response(serializer.data)
+    serializer = ClientRatingReadSerializer(ratings, many=True)
+
+    return Response({
+        "success": True,
+        "data": serializer.data
+    })
+    
+
 
 @api_view(['PATCH'])
 @throttle_classes([HeavyReadThrottle])

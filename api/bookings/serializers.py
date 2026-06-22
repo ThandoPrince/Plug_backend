@@ -3,9 +3,10 @@ from datetime import datetime, timedelta
 from rest_framework import serializers
 from django.utils import timezone
 from django.db import transaction
-from api.serviceProvidersDB.models import ProviderService
+from api.bookings.services.validate_booking_time_help import validate_booking_time
+from api.serviceProvidersDB.models import ProviderService, SPProfile
 from .models import Negotiation, NegotiationRound, OrderService, BookingItem, Rating, ServicePicture, Session, SessionLocationPing, SessionToken, Shipment, ShipmentRoute
-from api.serviceProvidersDB.serializers import ProviderSeviceSerializer, ServiceSerializer
+from api.serviceProvidersDB.serializers import ClientSPProfileReadSerializer, ClientServiceSerializer, ProviderSeviceSerializer, ServiceSerializer
 from api.clientsDB.serializers import AddressOnlySerializer, ClientSerializer
 from api.clientsDB.models.models import ClientDetails, ClientAuth, Address
 from django.contrib.auth.hashers import make_password
@@ -117,6 +118,100 @@ class ServicePictureReadSerializer(serializers.ModelSerializer):
 
 # ------------------- OrderService -------------------
 
+class CancelOrderSerializer(serializers.Serializer):
+    order_id = serializers.IntegerField(required=True)
+
+    def validate_order_id(self, value):
+        if not OrderService.objects.filter(order_id=value).exists():
+            raise serializers.ValidationError("Order does not exist.")
+        return value
+    
+
+class OrderServicePatchSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = OrderService
+        fields = [
+            "title",
+            "notes",
+            "requested_date",
+            "requested_date_time",
+        ]
+
+    def validate(self, attrs):
+        request = self.context["request"]
+        instance = self.instance
+
+        # RLS check
+        if instance.client != request.user.clientdetails:
+            raise serializers.ValidationError("Not allowed.")
+
+        # block editing after acceptance
+        if instance.status in ["accepted", "in_session", "completed"]:
+            raise serializers.ValidationError(
+                "Order cannot be modified in its current state."
+            )
+
+        # merge existing + new values for validation
+        new_date = attrs.get("requested_date", instance.requested_date)
+        new_time = attrs.get("requested_date_time", instance.requested_date_time)
+
+        validate_booking_time(new_date, new_time)
+
+        return attrs
+
+class OrderServicePatchSerializer(serializers.ModelSerializer):
+
+    class Meta:
+        model = OrderService
+        fields = [
+            "title",
+            "notes",
+            "requested_date",
+            "requested_date_time",
+        ]
+
+    def validate(self, attrs):
+        request = self.context["request"]
+        instance = self.instance
+
+        
+        if instance.client != request.user.clientdetails:
+            raise serializers.ValidationError(
+                "You are not allowed to modify this booking."
+            )
+
+        # Status validation
+        if instance.status not in ["pending", "in-negotiation", "accepted", "resheduled"]:
+            raise serializers.ValidationError(
+                f"Bookings with status '{instance.status}' cannot be modified."
+            )
+
+        requested_date = attrs.get(
+            "requested_date",
+            instance.requested_date
+        )
+
+        requested_time = attrs.get(
+            "requested_date_time",
+            instance.requested_date_time
+        )
+
+        validate_booking_time(
+            requested_date,
+            requested_time
+        )
+
+        return attrs
+
+
+class ClientOrderServiceReadSerializer(serializers.ModelSerializer):
+
+    service_required = ClientServiceSerializer(read_only=True)
+
+    class Meta:
+        model = OrderService
+        fields = '__all__'
+        read_only_fields = ['order_id', 'date_and_time_created', 'total_price', 'final_price']
 
 class OrderServiceReadSerializer(serializers.ModelSerializer):
 
@@ -125,7 +220,7 @@ class OrderServiceReadSerializer(serializers.ModelSerializer):
     final_price = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
     delivery_address = AddressOnlySerializer(read_only=True)
     provider_for_service = ProviderSeviceSerializer(read_only=True)
-    invited_providers = ProviderSeviceSerializer(many=True, read_only=True)
+    invited_providers = ClientSPProfileReadSerializer(many=True, read_only=True)
     client = ClientSerializer(read_only=True)
     service_required = ServiceSerializer(read_only=True)
 
@@ -137,7 +232,6 @@ class OrderServiceReadSerializer(serializers.ModelSerializer):
 # ------------------- BookingItem -------------------
 
 class BookingItemReadSerializer(serializers.ModelSerializer):
-    negotiation = NegotiationReadSerializer(required=False, allow_null=True)
     order = OrderServiceReadSerializer(read_only=True)
 
     class Meta:
@@ -153,19 +247,25 @@ class ClientEmailField(serializers.SlugRelatedField):
     """
     def to_internal_value(self, data):
         try:
-            client_auth = ClientAuth.objects.get(email_address=data)
+            client_auth = ClientAuth.objects.get(id=data)
             return ClientDetails.objects.get(client_profile=client_auth)
         except ClientAuth.DoesNotExist:
-            raise serializers.ValidationError(f"No client found with email '{data}'.")
+            raise serializers.ValidationError(f"No client found with id '{data}'.")
         except ClientDetails.DoesNotExist:
             raise serializers.ValidationError(f"No client details linked to '{data}' found.")
 
 
 
 class OrderServiceWriteSerializer(serializers.ModelSerializer):
-    client = ClientEmailField(
-        queryset=ClientDetails.objects.all(),
-        slug_field='client_profile.email_address'
+
+    invited_providers = serializers.PrimaryKeyRelatedField(
+    queryset=SPProfile.objects.all(),
+    many=True,
+    required=False
+)
+
+    client = serializers.PrimaryKeyRelatedField(
+        queryset=ClientDetails.objects.all()
     )
 
     delivery_address = serializers.SlugRelatedField(
@@ -179,18 +279,13 @@ class OrderServiceWriteSerializer(serializers.ModelSerializer):
         allow_null=True
     )
 
-    invited_providers = serializers.ListField(
-        child=serializers.EmailField(),
-        write_only=True,
-        required=False
-    )
-
     service_pictures = ServicePictureReadSerializer(
         many=True,
         read_only=True
     )
 
     title = serializers.CharField(required=True)
+
     notes = serializers.CharField(required=True)
 
     proposal_price = serializers.DecimalField(
@@ -208,6 +303,7 @@ class OrderServiceWriteSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError(
                 "Proposal price must be greater than 0."
             )
+
         return value
 
     def validate(self, attrs):
@@ -239,59 +335,32 @@ class OrderServiceWriteSerializer(serializers.ModelSerializer):
 
         if requested_datetime < minimum_allowed_time:
             raise serializers.ValidationError({
-                "requested_date_time": (
+                "requested_date_time":
                     "Booking must be scheduled at least 1 hour from now."
-                )
             })
 
         return attrs
 
     def create(self, validated_data):
-        invited_emails = validated_data.pop("invited_providers", [])
-        request = self.context.get("request")
-        service_required = validated_data.get("service_required")
+        invited_providers = validated_data.pop(
+        "invited_providers",
+        []
+    )
 
-        normalized_emails = list({
-            email.strip().lower()
-            for email in invited_emails
-            if email and email.strip()
-        })
+        request = self.context.get("request")
 
         with transaction.atomic():
-            provider_services = ProviderService.objects.select_related(
-                "provider",
-                "provider__sp_profile",
-                "service",
-            ).filter(
-                provider__sp_profile__email_address__in=normalized_emails,
-                service=service_required
-            )
-
-            found_emails = {
-                ps.provider.sp_profile.email_address.strip().lower()
-                for ps in provider_services
-                if ps.provider and ps.provider.sp_profile and ps.provider.sp_profile.email_address
-            }
-
-            missing_emails = set(normalized_emails) - found_emails
-            if missing_emails:
-                raise serializers.ValidationError({
-                    "invited_providers": (
-                        "One or more invited providers do not offer this service."
-                    )
-                })
-
             order = OrderService.objects.create(**validated_data)
 
-            if provider_services.exists():
-                order.invited_providers.set(provider_services)
+            if invited_providers:
+                order.invited_providers.set(invited_providers)
 
             if request and hasattr(request, "FILES"):
                 for file in request.FILES.getlist("service_pictures"):
                     ServicePicture.objects.create(
-                        order=order,
-                        image=file
-                    )
+                    order=order,
+                    image=file
+                )
 
         return order
 
@@ -461,6 +530,17 @@ class SessionReadSerializer(serializers.ModelSerializer):
 
     def get_duration_seconds(self, obj):
         return int(obj.duration().total_seconds())
+    
+class ClientSessionReadSerializer(serializers.ModelSerializer):
+    shipment = ShipmentReadSerializer(read_only=True)
+    duration_seconds = serializers.SerializerMethodField()
+    
+
+    class Meta:
+        model = Session
+        fields = '__all__'
+    def get_duration_seconds(self, obj):
+        return int(obj.duration().total_seconds())
 
     
 
@@ -595,6 +675,16 @@ class RatingWriteSerializer(serializers.ModelSerializer):
             validated_data["rater_client"] = order.client
 
         return super().create(validated_data)
+    
+
+class ClientRatingReadSerializer(serializers.ModelSerializer):
+    author_type = serializers.SerializerMethodField()
+    session = ClientSessionReadSerializer(read_only=True)
+    class Meta:
+        model = Rating
+        fields = '__all__'
+    def get_author_type(self, obj):
+        return "client"
     
 class RatingReadSerializer(serializers.ModelSerializer):
     author_type = serializers.SerializerMethodField()

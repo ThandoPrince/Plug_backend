@@ -9,7 +9,7 @@ from api.serviceProvidersDB.services.service_category_constants import RiskLevel
 
 
 class Address(models.Model):
-    id = models.AutoField(primary_key=True, editable=False)
+    id = models.AutoField(primary_key=True, editable=False, db_index=True)
     building_type  = models.CharField(max_length=100, choices=BUILDING_TYPE_CHOICES , default='house')
     unit_number = models.CharField(max_length=20, blank=True, default="")
     street_number = models.CharField(max_length=10, blank=True, null=True)
@@ -21,7 +21,7 @@ class Address(models.Model):
     postal_code = models.CharField(max_length=20, blank=True, null=True)
     latitude = models.DecimalField(max_digits=9, decimal_places=6, blank=True, null=True)
     longitude = models.DecimalField(max_digits=9, decimal_places=6, blank=True, null=True)
-    place_id = models.CharField(max_length=255, blank=True, null=True, unique=True, editable=False)
+    place_id = models.CharField(max_length=255, blank=True, null=True, unique=True, editable=False, db_index=True)
 
     def __str__(self):
         return (
@@ -38,18 +38,20 @@ class ServiceCategory(models.Model):
         max_length=10,
         primary_key=True,
         unique=True,
-        choices= ServiceCategoryID.choices
+        choices= ServiceCategoryID.choices,
+        db_index=True
     )
 
-    name = models.CharField(max_length=100, unique=True, choices=ServiceCategoryName.choices)
+    name = models.CharField(max_length=100, unique=True, choices=ServiceCategoryName.choices, db_index=True)
 
     risk_level = models.CharField(
     max_length=20,
-    choices=RiskLevel.choices
+    choices=RiskLevel.choices,
+    db_index=True
 )
 
-    requires_verification = models.BooleanField(default=False)
-    requires_admin_approval = models.BooleanField(default=False)
+    requires_verification = models.BooleanField(default=False, db_index=True)
+    requires_admin_approval = models.BooleanField(default=False, db_index=True)
 
     def __str__(self):
         return f"{self.name} ({self.risk_level})"
@@ -83,20 +85,23 @@ class Service(models.Model):
     review_status = models.CharField(
         max_length=20,
         choices=REVIEW_STATUS,
-        default="APPROVED"
+        default="APPROVED",
+        db_index=True
     )
     risk_level = models.CharField(
         max_length=20,
         choices=RiskLevel.choices,
-        default=RiskLevel.LOW
+        default=RiskLevel.LOW,
+        db_index=True
     )
-    service_id = models.AutoField(primary_key=True, editable=False)
-    service_name = models.CharField(max_length=100)
+    service_id = models.AutoField(primary_key=True, editable=False, db_index=True)
+    service_name = models.CharField(max_length=100, db_index=True)
     service_group = models.ForeignKey(
         ServiceGroup,
         on_delete=models.SET_NULL,
         null=True,
-        related_name="services"
+        related_name="services",
+        db_index=True
     )
     description = models.TextField(null=True, blank=True)
 
@@ -112,32 +117,34 @@ class Service(models.Model):
     
 
 class ServiceKeyword(models.Model):
-    keyword = models.CharField(max_length=100, unique=True)
+    keyword = models.CharField(max_length=100, unique=True, db_index=True)
     service = models.ForeignKey(
         Service,
         on_delete=models.CASCADE,
         related_name="keywords",
         null=True,
-        blank=True
+        blank=True,
+        db_index=True
     )
     # Add this field to match your validator logic
     risk_level = models.CharField(
         max_length=20,
         choices=RiskLevel.choices,
-        default=RiskLevel.LOW
+        default=RiskLevel.LOW,
+        db_index=True
     )
-    is_prohibited = models.BooleanField(default=False)
-    is_active = models.BooleanField(default=True)
+    is_prohibited = models.BooleanField(default=False, db_index=True)
+    is_active = models.BooleanField(default=True, db_index=True)
 
     def __str__(self):
         return f"{self.keyword} ({self.risk_level})"
     
 
 class SPProfile(models.Model):
-    id = models.AutoField(primary_key=True)
-    email_address = models.EmailField(unique=True)
+    id = models.AutoField(primary_key=True, db_index=True)
+    email_address = models.EmailField(unique=True, db_index=True)
     password = models.CharField(max_length=128)
-    mobile_number = models.CharField(max_length=20, unique=True, null=True)
+    mobile_number = models.CharField(max_length=20, unique=True, null=True, db_index=True)
     Profile_CHOICES = [
         ("in-details", "In-Details"),
         ("in-address", "In-Address"),
@@ -145,12 +152,13 @@ class SPProfile(models.Model):
         ("in-cost", "In-Cost"),
         ("completed", "Completed"),
     ]
-    is_profile_completed = models.CharField(default="in-details", choices=Profile_CHOICES, max_length= 20)
-    is_active = models.BooleanField(default=True)
+    is_profile_completed = models.CharField(default="in-details", choices=Profile_CHOICES, max_length= 20, db_index=True)
+    is_active = models.BooleanField(default=True, db_index=True)
     class Meta:
         db_table = 'sp_profiles'
         indexes = [
             models.Index(fields=['email_address', 'is_active', 'is_profile_completed'],name='sp_profile_lookup_idx'),
+            models.Index(fields=['id'])
         ]
 
     @property
@@ -170,15 +178,15 @@ class SPProfile(models.Model):
     
 class ServiceProvider(models.Model):
     
-    rating = models.DecimalField(max_digits=3, decimal_places=2, null=True, blank=True, default=0.0)
-    full_name = models.CharField(max_length=85)
-    gender = models.CharField(max_length=50, null=True, blank=True)
-    id_number = models.CharField(max_length=20)
+    rating = models.DecimalField(max_digits=3, decimal_places=2, null=True, blank=True, default=0.0, db_index=True)
+    full_name = models.CharField(max_length=85, db_index=True)
+    gender = models.CharField(max_length=50, null=True, blank=True, db_index=True)
+    id_number = models.CharField(max_length=20, db_index=True)
     sp_description = models.CharField(max_length=255, null=True, blank=True, help_text="Brief description of yourself and qualities")
     dob = models.DateField()
     is_active = models.BooleanField(default=True)
-    location = models.ForeignKey(Address, on_delete=models.SET_NULL, null=True)
-    sp_profile = models.OneToOneField(SPProfile, on_delete=models.CASCADE, primary_key=True)
+    location = models.ForeignKey(Address, on_delete=models.SET_NULL, null=True, db_index=True)
+    sp_profile = models.OneToOneField(SPProfile, on_delete=models.CASCADE, primary_key=True, db_index=True)
 
     def service_provider_upload_path(instance, filename):
         
@@ -204,21 +212,23 @@ class DeviceToken(models.Model):
     provider = models.CharField(
         max_length=20,
         choices=PROVIDER_TYPES,
-        default="firebase"
+        default="firebase",
+        db_index=True
     )
 
     service_provider = models.ForeignKey(
         'SPProfile',
         on_delete=models.CASCADE,
-        related_name="device_tokens"
+        related_name="device_tokens",
+        db_index=True
     )
 
-    fcm_token = models.CharField(max_length=512)
-    device_type = models.CharField(max_length=20, choices=DEVICE_TYPES)
-    device_name = models.CharField(max_length=100, blank=True, null=True)
-    os_version = models.CharField(max_length=50, blank=True, null=True)
-    app_version = models.CharField(max_length=20, blank=True, null=True)
-    last_seen = models.DateTimeField(auto_now=True)
+    fcm_token = models.CharField(max_length=512, db_index=True)
+    device_type = models.CharField(max_length=20, choices=DEVICE_TYPES, db_index=True)
+    device_name = models.CharField(max_length=100, blank=True, null=True, db_index=True)
+    os_version = models.CharField(max_length=50, blank=True, null=True, db_index=True)
+    app_version = models.CharField(max_length=20, blank=True, null=True, db_index=True)
+    last_seen = models.DateTimeField(auto_now=True, db_index=True)
 
     class Meta:
         constraints = [
@@ -232,9 +242,9 @@ class DeviceToken(models.Model):
         return f"{self.service_provider.email_address} - {self.device_name or self.device_type}"
     
 class CostOfService(models.Model):
-    base_price = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
-    negotiable = models.BooleanField(default=True)
-    notes = models.TextField(blank=True, null=True, )
+    base_price = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True, db_index=True)
+    negotiable = models.BooleanField(default=True, db_index=True)
+    notes = models.TextField(blank=True, null=True, db_index=True)
 
     
     def __str__(self):
@@ -247,12 +257,12 @@ class CostOfServiceImage(models.Model):
     cost_of_service = models.ForeignKey(
         'CostOfService',
         on_delete=models.CASCADE,
-        related_name='images'
+        related_name='images', db_index=True
     )
 
-    image = models.ImageField(upload_to='service_images/')
+    image = models.ImageField(upload_to='service_images/', db_index=True)
 
-    uploaded_at = models.DateTimeField(auto_now_add=True)
+    uploaded_at = models.DateTimeField(auto_now_add=True, db_index=True)
 
     def save(self, *args, **kwargs):
         if self.cost_of_service_id:
@@ -278,13 +288,14 @@ class ProviderService(models.Model):
     provider = models.ForeignKey(
         'ServiceProvider',
         on_delete=models.CASCADE,
-        related_name='provider_services'
+        related_name='provider_services',
+        db_index=True
     )
 
     service = models.ForeignKey(
         'Service',
         on_delete=models.CASCADE,
-        related_name='service_providers'   # 🔥 IMPORTANT
+        related_name='service_providers', db_index=True   
     )
 
     cost_of_service = models.OneToOneField(
@@ -292,11 +303,11 @@ class ProviderService(models.Model):
         on_delete=models.CASCADE,
         null=True,
         blank=True,
-        related_name='provider_service'
+        related_name='provider_service', db_index=True
     )
     
 
-    is_primary = models.BooleanField(default=False)
+    is_primary = models.BooleanField(default=False, db_index=True)
 
     class Meta:
         unique_together = ('provider', 'service')
@@ -312,6 +323,9 @@ class ProviderService(models.Model):
         indexes = [
             models.Index(fields=['provider']),
             models.Index(fields=['service']),
+            models.Index(fields=['cost_of_service']),
+            models.Index(fields=['is_primary']),
+
         ]
 
     def clean(self):
@@ -363,21 +377,21 @@ class SupportingDocument(models.Model):
 
     ID_TYPE_CHOICES = [
         ("greenbook", "Green Book"),
-        ("card", "ID Card"),
+        ("card", "ID Card"), 
     ]
 
     provider = models.ForeignKey(
         'ServiceProvider',
         on_delete=models.CASCADE,
-        related_name='documents'
+        related_name='documents', db_index=True
     )
 
-    id_type = models.CharField(max_length=20, choices=ID_TYPE_CHOICES, default= 'card')
+    id_type = models.CharField(max_length=20, choices=ID_TYPE_CHOICES, default= 'card', db_index=True)
 
-    front_file = models.FileField(upload_to='sp_ids/', blank=True, null=True)
-    back_file = models.FileField(upload_to='sp_ids/', blank=True, null=True)
+    front_file = models.FileField(upload_to='sp_ids/', blank=True, null=True, db_index=True)
+    back_file = models.FileField(upload_to='sp_ids/', blank=True, null=True, db_index=True)
 
-    uploaded_at = models.DateTimeField(auto_now_add=True)
+    uploaded_at = models.DateTimeField(auto_now_add=True, db_index=True)
 
     def __str__(self):
         return f"{self.id_type} for {self.provider.full_name}"
@@ -389,23 +403,31 @@ class SPLiveLocation(models.Model):
     provider = models.OneToOneField(
         ServiceProvider, 
         on_delete=models.CASCADE, 
-        related_name="live_location"
+        related_name="live_location", db_index=True
     )
-    latitude = models.DecimalField(max_digits=9, decimal_places=6)
-    longitude = models.DecimalField(max_digits=9, decimal_places=6)
-    updated_at = models.DateTimeField(auto_now=True)
+    latitude = models.DecimalField(max_digits=9, decimal_places=6, db_index=True)
+    longitude = models.DecimalField(max_digits=9, decimal_places=6, db_index=True)
+    updated_at = models.DateTimeField(auto_now=True, db_index=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=["provider"]),
+    ]
 
     def __str__(self):
         return f"{self.provider.full_name} - ({self.latitude}, {self.longitude}) @ {self.updated_at}"
     
 class SPLocationHistory(models.Model):
-    provider = models.ForeignKey(ServiceProvider, on_delete=models.CASCADE, related_name="location_history")
-    latitude = models.DecimalField(max_digits=9, decimal_places=6)
-    longitude = models.DecimalField(max_digits=9, decimal_places=6)
-    recorded_at = models.DateTimeField(auto_now_add=True)
+    provider = models.ForeignKey(ServiceProvider, on_delete=models.CASCADE, related_name="location_history", db_index=True)
+    latitude = models.DecimalField(max_digits=9, decimal_places=6, db_index=True)
+    longitude = models.DecimalField(max_digits=9, decimal_places=6,db_index=True)
+    recorded_at = models.DateTimeField(auto_now_add=True, db_index=True)
 
     class Meta:
         ordering = ['-recorded_at']
+        indexes = [
+            models.Index(fields=["provider"]),
+    ]
 
     def __str__(self):
         return f"{self.provider.full_name} - ({self.latitude}, {self.longitude}) @ {self.recorded_at}"

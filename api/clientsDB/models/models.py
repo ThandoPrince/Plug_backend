@@ -1,10 +1,12 @@
+import os
+
 from django.db import models
 from django.core.exceptions import ValidationError
 from django.contrib.auth import get_user_model
 import uuid
 from django.utils import timezone
 from datetime import timedelta
-
+from django.db import models, transaction
 from django.db import models
 from api.bookings.utils.choices import BUILDING_TYPE_CHOICES
 
@@ -25,6 +27,7 @@ class Address(models.Model):
     country = models.CharField(max_length=100)
     postal_code = models.CharField(max_length=20)
     is_verified = models.BooleanField(default=False)
+    date_created = models.DateTimeField(auto_now=True, null=True)
     building_type  = models.CharField(max_length=100, choices=BUILDING_TYPE_CHOICES , default='house')
 
     clients = models.ManyToManyField('ClientDetails', through='ClientAddress', related_name='addresses')
@@ -80,6 +83,11 @@ class ClientAuth(models.Model):
         unique=True,
         max_length=100
     )
+    failed_login_attempts = models.PositiveIntegerField(default=0)
+    account_locked_until = models.DateTimeField(
+        null=True,
+        blank=True
+    )
 
     mobile_number = models.CharField(
         max_length=60,
@@ -87,6 +95,13 @@ class ClientAuth(models.Model):
         null=True,
         unique=True
     )
+    date_created = models.DateTimeField (auto_now= True, null=True)
+    last_login_ip = models.GenericIPAddressField(
+        null=True,
+        blank=True
+    )
+    last_login_at = models.DateTimeField(auto_now=True, null=True)
+
 
     password = models.CharField(max_length=128)
 
@@ -94,7 +109,11 @@ class ClientAuth(models.Model):
         ("in-details", "In-Details"),
         ("in-address", "In-Address"),
         ("completed", "Completed"),
+        ("in-kyc", "In-KYC")
     ]
+    total_failed_login_attempts = models.PositiveIntegerField(
+        default=0
+    )
 
     is_profile_completed = models.CharField(
         default="in-details",
@@ -119,26 +138,70 @@ class DeviceToken(models.Model):
         ("web", "Web"),
         ("huawei", "Huawei"),
     )
+
     PROVIDER_TYPES = (
         ("firebase", "Firebase Cloud Messaging"),
         ("huawei", "Huawei Push Kit"),
     )
-    provider = models.CharField(max_length=20, choices=PROVIDER_TYPES, default="firebase")
+
+    provider = models.CharField(
+        max_length=20,
+        choices=PROVIDER_TYPES,
+        default="firebase"
+    )
 
     client = models.ForeignKey(
-        'ClientAuth',  # link to your auth model
+        'ClientAuth',
         on_delete=models.CASCADE,
         related_name="device_tokens"
     )
+
     fcm_token = models.CharField(max_length=512)
-    device_type = models.CharField(max_length=20, choices=DEVICE_TYPES)
-    device_name = models.CharField(max_length=100, blank=True, null=True)
-    os_version = models.CharField(max_length=50, blank=True, null=True)
-    app_version = models.CharField(max_length=20, blank=True, null=True)
+
+    device_type = models.CharField(
+        max_length=20,
+        choices=DEVICE_TYPES
+    )
+
+    device_name = models.CharField(
+        max_length=100,
+        blank=True,
+        null=True
+    )
+
+    os_version = models.CharField(
+        max_length=50,
+        blank=True,
+        null=True
+    )
+
+    app_version = models.CharField(
+        max_length=20,
+        blank=True,
+        null=True
+    )
+
+    ip_address = models.GenericIPAddressField(
+        null=True,
+        blank=True
+    )
+
     last_seen = models.DateTimeField(auto_now=True)
 
     def __str__(self):
         return f"{self.client.email_address} - {self.device_name or self.device_type}"
+    
+class ClientLoginHistory(models.Model):
+    client = models.ForeignKey(
+        ClientAuth,
+        on_delete=models.CASCADE
+    )
+    successful = models.BooleanField(default=False)
+    identifier = models.CharField(max_length=100, null=True)
+    user_agent = models.TextField(blank=True, null=True)
+    ip_address = models.GenericIPAddressField()
+    device_name = models.CharField(max_length=100, blank=True, null=True)
+    created_at = models.DateTimeField(auto_now_add=True)
 
 
 class ClientDetails(models.Model):
@@ -150,6 +213,7 @@ class ClientDetails(models.Model):
     client_pp = models.ImageField(upload_to='client_profile_pics', default='default.jpg', null=True, blank=True)
     client_ID = models.CharField(max_length=20, blank=True, null=True, unique=True, auto_created=True)
     is_active = models.BooleanField(default=True)
+    date_created = models.DateTimeField (auto_now= True, null=True)
 
 
 
@@ -165,6 +229,7 @@ class ClientSession(models.Model):
         on_delete=models.CASCADE,
         related_name="sessions"
     )
+    date_created = models.DateTimeField (auto_created=True, null=True)
 
     token = models.CharField(max_length=255, unique=True)
 
@@ -194,8 +259,9 @@ class ClientSession(models.Model):
 
 
 class ClientAddress(models.Model):
-    id = models.AutoField(auto_created=True, primary_key=True)
+    id = models.AutoField(primary_key=True)
     is_active = models.BooleanField(default=True)
+    date_created = models.DateTimeField(auto_now_add=True, null=True)
 
     RESIDENTIAL = "Residential Address"
     VACATION = "Vacation Address"
@@ -208,7 +274,6 @@ class ClientAddress(models.Model):
     client = models.ForeignKey("ClientDetails", on_delete=models.CASCADE)
     address = models.ForeignKey("Address", on_delete=models.CASCADE)
 
-    # User-controlled flags
     is_owner = models.BooleanField(
         "Are you the owner of the household?",
         default=False
@@ -219,7 +284,6 @@ class ClientAddress(models.Model):
         default=False
     )
 
-    # 🔒 Only granted after document approval
     is_super_user = models.BooleanField(
         default=False,
         editable=False
@@ -234,102 +298,172 @@ class ClientAddress(models.Model):
     is_default = models.BooleanField(default=False)
 
     class Meta:
-        unique_together = ('client', 'address')
+        constraints = [
+            models.UniqueConstraint(
+                fields=['client', 'address'],
+                name='unique_client_address'
+            )
+        ]
 
     # --------------------------------------------------
     # VALIDATION
     # --------------------------------------------------
     def clean(self):
         """
-        Business validation only.
-        Do NOT validate default uniqueness here.
+        Business-level validation only.
         """
 
-        # Maximum 2 owners per address
+        super().clean()
+
+        # Limit owners per address
         if self.is_owner:
             owner_count = ClientAddress.objects.filter(
                 address=self.address,
                 is_owner=True
             ).exclude(pk=self.pk).count()
 
-            if owner_count >= 2:
+            if owner_count >= 5:
                 raise ValidationError(
-                    "Only two clients can be marked as owners of this address."
+                    "Only five clients can be marked as owners for this address."
                 )
 
-
+    # --------------------------------------------------
+    # SAVE LOGIC
+    # --------------------------------------------------
     def save(self, *args, **kwargs):
         """
-        Automatically ensure only one default per client.
+        Ensures:
+        - Only one default per client
+        - Validation always runs
+        - Race-safe updates
         """
 
-
-        if self.is_default:
-            ClientAddress.objects.filter(
-                client=self.client,
-                is_default=True
-            ).exclude(pk=self.pk).update(is_default=False)
-
-        # Now run validation AFTER fixing defaults
         self.full_clean()
 
-        super().save(*args, **kwargs)
+        with transaction.atomic():
+
+            if self.is_default:
+                ClientAddress.objects.filter(
+                    client=self.client,
+                    is_default=True
+                ).exclude(pk=self.pk).update(is_default=False)
+
+            super().save(*args, **kwargs)
 
     def __str__(self):
-        return f"{self.client.first_name} - {self.address}"
+        return f"{self.client} - {self.address}"
+
+
     
+def secure_verification_path(instance, filename):
+    """
+    Stores files under a randomized, non-guessable structure.
+    """
+
+    ext = os.path.splitext(filename)[1].lower()
+
+    valid_extensions = ['.pdf', '.jpg', '.jpeg', '.png']
+    if ext not in valid_extensions:
+        raise ValidationError("Unsupported file format. Use PDF, JPG, or PNG.")
+
+    random_filename = f"{uuid.uuid4()}{ext}"
+
+    client_id = instance.client_address.client.client_ID
+
+    return os.path.join(
+        "address_verifications",
+        f"client_{client_id}",
+        random_filename
+    )
+
+
 class AddressSuperUserVerification(models.Model):
 
+    STATUS_PENDING = "pending"
+    STATUS_APPROVED = "approved"
+    STATUS_REJECTED = "rejected"
+
     STATUS_CHOICES = [
-        ("pending", "Pending"),
-        ("approved", "Approved"),
-        ("rejected", "Rejected"),
+        (STATUS_PENDING, "Pending"),
+        (STATUS_APPROVED, "Approved"),
+        (STATUS_REJECTED, "Rejected"),
     ]
 
     client_address = models.OneToOneField(
-        ClientAddress,
+        "ClientAddress",
         on_delete=models.CASCADE,
         related_name="verification_request"
     )
 
+    date_created = models.DateTimeField(auto_now_add=True, null=True)
+
     proof_of_residence = models.FileField(
-        upload_to="media/address_verifications/proof_of_residence/"
+        upload_to=secure_verification_path
     )
 
     id_document = models.ImageField(
-        upload_to="media/address_verifications/id_documents"
+        upload_to=secure_verification_path
     )
 
     status = models.CharField(
         max_length=20,
         choices=STATUS_CHOICES,
-        default="pending"
+        default=STATUS_PENDING
     )
 
     submitted_at = models.DateTimeField(auto_now_add=True)
     reviewed_at = models.DateTimeField(null=True, blank=True)
-
     admin_notes = models.TextField(blank=True, null=True)
 
-    def approve(self):
-        self.status = "approved"
-        self.reviewed_at = timezone.now()
-        self.save()
+    # --------------------------------------------------
+    # VALIDATION
+    # --------------------------------------------------
+    def clean(self):
+        super().clean()
 
-        # 🔥 Promote user to super user
-        self.client_address.is_super_user = True
-        self.client_address.save(update_fields=["is_super_user"])
+        MAX_SIZE = 5 * 1024 * 1024  # 5MB
+
+        for field_name in ["proof_of_residence", "id_document"]:
+            file = getattr(self, field_name)
+
+            if file and hasattr(file, "size") and file.size > MAX_SIZE:
+                raise ValidationError({
+                    field_name: "File size cannot exceed 5MB."
+                })
+
+    # --------------------------------------------------
+    # APPROVAL FLOW
+    # --------------------------------------------------
+    def approve(self):
+        """
+        Atomically approves verification and upgrades client role.
+        """
+
+        with transaction.atomic():
+            self.status = self.STATUS_APPROVED
+            self.reviewed_at = timezone.now()
+            self.save()
+
+            ClientAddress.objects.filter(
+                pk=self.client_address.pk
+            ).update(is_super_user=True)
 
     def reject(self, note=None):
-        self.status = "rejected"
+        """
+        Reject verification with optional admin note.
+        """
+
+        self.status = self.STATUS_REJECTED
         self.reviewed_at = timezone.now()
+
         if note:
             self.admin_notes = note
+
         self.save()
 
     def __str__(self):
         return f"Verification for {self.client_address}"
-
+    
 
     
 class PendingAddressApproval(models.Model):
@@ -338,6 +472,7 @@ class PendingAddressApproval(models.Model):
     owner = models.ForeignKey(ClientDetails, related_name='approver', on_delete=models.CASCADE)
     status = models.CharField(choices=[('pending', 'Pending'), ('approved', 'Approved'), ('rejected', 'Rejected')], default='pending', max_length=50)
     created_at = models.DateTimeField(auto_now_add=True)
+    date_created = models.DateTimeField (auto_created=True, null=True)
     id = models.AutoField(auto_created=True, primary_key=True)
 
 User = get_user_model()

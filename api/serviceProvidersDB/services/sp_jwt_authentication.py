@@ -18,15 +18,15 @@ class SPJWTAuthentication(JWTAuthentication):
                 print("RAW TOKEN: Extraction evaluated to None")
                 return None
 
-            print("RAW TOKEN:", raw_token)
+            # print("RAW TOKEN:", raw_token)
 
             # 3. Assert signature integrity and checking expiration limits
             validated_token = self.get_validated_token(raw_token)
-            print("VALIDATED TOKEN:", validated_token)
+            # print("VALIDATED TOKEN:", validated_token)
 
             # 4. Resolve token custom payload claims down to the database record
             user = self.get_user(validated_token)
-            print("SP USER:", user)
+            # print("SP USER:", user)
 
             return (user, validated_token)
 
@@ -38,7 +38,7 @@ class SPJWTAuthentication(JWTAuthentication):
     def get_user(self, validated_token):
         # Map target identity claim from payload dictionary keys
         sp_id = validated_token.get("sp_id")
-        print("SP ID:", sp_id)
+        # print("SP ID:", sp_id)
 
         if not sp_id:
             raise AuthenticationFailed("Invalid token: Missing service provider claim identifier.")

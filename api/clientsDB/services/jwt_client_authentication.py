@@ -8,7 +8,7 @@ class ClientJWTAuthentication(JWTAuthentication):
         # 1. Safely extract raw header through SimpleJWT base utility
         header = self.get_header(request)
         if header is None:
-            print("AUTH HEADER: None")
+            # print("AUTH HEADER: None")
             return None  # Pass to DRF to handle anonymous or policy enforcement
 
         try:
@@ -18,15 +18,15 @@ class ClientJWTAuthentication(JWTAuthentication):
                 print("RAW TOKEN: Extraction evaluated to None")
                 return None
 
-            print("RAW TOKEN:", raw_token)
+            # print("RAW TOKEN:", raw_token)
 
             # 3. Verify cryptographic signature and token expiration status
             validated_token = self.get_validated_token(raw_token)
-            print("VALIDATED TOKEN:", validated_token)
+            # print("VALIDATED TOKEN:", validated_token)
 
             # 4. Resolve the token's payload data to a database model record
             user = self.get_user(validated_token)
-            print("USER:", user)
+            # print("USER:", user)
 
             return (user, validated_token)
 
@@ -38,7 +38,7 @@ class ClientJWTAuthentication(JWTAuthentication):
     def get_user(self, validated_token):
         # Extract target claim key mapped to your client instances
         client_id = validated_token.get("client_id")
-        print("CLIENT ID:", client_id)
+        # print("CLIENT ID:", client_id)
 
         if not client_id:
             raise AuthenticationFailed("Invalid token: Missing client identifier claim.")

@@ -1,5 +1,5 @@
 from django.contrib import admin
-from .models.models import AddressSuperUserVerification, ClientDetails, ClientAuth, Address, ClientAddress, DeviceToken, PendingAddressApproval, ClientNotification
+from .models.models import AddressSuperUserVerification, ClientDetails, ClientAuth, Address, ClientAddress, ClientLoginHistory, DeviceToken, PendingAddressApproval, ClientNotification
 
 # -----------------------------
 # ClientAuth Admin
@@ -23,8 +23,13 @@ class DeviceTokenAdmin(admin.ModelAdmin):
     
 @admin.register(ClientAuth)
 class ClientAuthAdmin(admin.ModelAdmin):
-    list_display = ('email_address', 'mobile_number')
+    list_display = ('email_address', 'mobile_number','total_failed_login_attempts', 'date_created','last_login_at' )
     search_fields = ('email_address', 'mobile_number')
+
+@admin.register(ClientLoginHistory)
+class ClientLoginHistoryAdmin(admin.ModelAdmin):
+    list_display = ('client', 'successful','device_name', 'ip_address','created_at' )
+    search_fields = ('ip_address', 'client')
 
 # -----------------------------
 # ClientDetails Admin

@@ -10,6 +10,7 @@ from api.clientsDB.notifications.services.client_push_notification_service impor
 from api.serviceProvidersDB.notifications.services.provider_push_notification_service import send_push_to_provider
 from .utils.choices import ORDER_STATUS, SESSION_STATUS, SHIPMENT_STATUS, PAYMENT_STATUS
 from django.db.models import Avg
+import json
 
 
 class OrderService(models.Model):
@@ -59,7 +60,7 @@ class OrderService(models.Model):
     status = models.CharField(max_length=100, choices=ORDER_STATUS, default='pending')
     is_broadcasted = models.BooleanField(default=False)
     invited_providers = models.ManyToManyField(
-        'serviceProvidersDB.ProviderService',
+        'serviceProvidersDB.SPProfile',
         related_name='invited_orders',
         blank=True
     )
@@ -76,12 +77,27 @@ class OrderService(models.Model):
                 .first()
             )
 
+        # 1. Save the order status change first
         super().save(*args, **kwargs)
 
+        # 2. Intercept status transition to trigger side effects
         if not is_new and old_status != self.status:
+            if self.status == 'canceled':
+                self._cascade_negotiation_cancellation()
+
             self._log_order_history(old_status=old_status, new_status=self.status)
             self._send_status_notification()
             self._send_status_websocket_updates()
+
+    def _cascade_negotiation_cancellation(self):
+        """
+        Look up all active negotiations for this order and change their status to 'canceled'.
+        """
+        # 'negotiation' matches the related_name on your Negotiation model's ForeignKey
+        self.negotiation.exclude(
+            status__in=['canceled', 'accepted', 'rejected']
+        ).update(status='canceled')
+
 
     def _log_order_history(self, old_status, new_status):
         try:
@@ -237,13 +253,10 @@ class OrderService(models.Model):
     def notify_invited_providers_of_new_booking(self):
         print(f"[Notify] notify_invited_providers_of_new_booking CALLED for order {self.order_id}")
 
-        invited_provider_services = self.invited_providers.select_related(
-            "provider",
-            "service",
-            "provider__sp_profile",
-        )
+        # Each item in this queryset is an SPProfile instance
+        invited_profiles = self.invited_providers.select_related("serviceprovider")
 
-        invited_count = invited_provider_services.count()
+        invited_count = invited_profiles.count()
         print(f"[Notify] invited providers count: {invited_count}")
 
         if invited_count == 0:
@@ -255,22 +268,17 @@ class OrderService(models.Model):
         booking_title = self._get_booking_title()
         payload = self._build_provider_invite_payload()
 
-        for provider_service in invited_provider_services:
-            provider = getattr(provider_service, "provider", None)
-            print(f"[Notify] ProviderService ID: {provider_service.pk}")
+        for sp_profile in invited_profiles:
+            print(f"[Notify] SPProfile ID: {sp_profile.pk}")
+
+            # Access the reverse OneToOne relation safely
+            provider = getattr(sp_profile, "serviceprovider", None)
 
             if not provider:
-                print("[Notify] provider missing")
+                print(f"[Notify] ServiceProvider profile missing for SPProfile {sp_profile.pk}")
                 continue
 
-            sp_profile = getattr(provider, "sp_profile", None)
-            print(f"[Notify] SP Profile: {sp_profile}")
-
-            if not sp_profile:
-                print("[Notify] sp_profile missing")
-                continue
-
-            provider_email = getattr(sp_profile, "email_address", None)
+            provider_email = sp_profile.email_address
 
             if provider_email:
                 try:
@@ -279,12 +287,12 @@ class OrderService(models.Model):
                 except Exception as e:
                     print(
                         f"[WS ERROR] Failed sending WebSocket invite for "
-                        f"Order {self.order_id}, ProviderService {provider_service.pk}: {e}"
+                        f"Order {self.order_id}, SPProfile {sp_profile.pk}: {e}"
                     )
 
             try:
                 send_push_to_provider(
-                    service_provider=sp_profile,
+                    service_provider=sp_profile,  # Accepts SPProfile instance directly
                     title="New Booking Request 📩",
                     body=f"{client_name} created a new booking for {service_name}.",
                     data={
@@ -301,9 +309,8 @@ class OrderService(models.Model):
             except Exception as e:
                 print(
                     f"[Push ERROR] Failed sending notification for "
-                    f"Order {self.order_id}, ProviderService {provider_service.pk}: {e}"
+                    f"Order {self.order_id}, SPProfile {sp_profile.pk}: {e}"
                 )
-
 
 class ServicePicture(models.Model):
     order = models.ForeignKey(
@@ -328,22 +335,23 @@ class ServicePicture(models.Model):
 
 
 class Negotiation(models.Model):
-    negotiation_id = models.AutoField(primary_key=True)
+    negotiation_id = models.AutoField(primary_key=True, db_index=True  )
     service_order = models.ForeignKey(
-        OrderService, on_delete=models.CASCADE, related_name='negotiation', null=True, blank=True
+        OrderService, on_delete=models.CASCADE, related_name='negotiation', null=True, blank=True, db_index=True
     )
     provider_for_negotiation = models.ForeignKey(
-        'serviceProvidersDB.ProviderService', on_delete=models.CASCADE, null=True, blank=True)
+        'serviceProvidersDB.ProviderService', on_delete=models.CASCADE, null=True, blank=True, related_name='negotiation', db_index=True)
     
-    base_price = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+    base_price = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True,  db_index=True)
     proposed_price = models.DecimalField(max_digits=10, decimal_places=2, null=True)
-    provider_response_price = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+    provider_response_price = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True, db_index=True)
 
     STATUS_CHOICES = [
         ('pending', 'Pending'),
         ('in-negotiation', 'In-Negotiation'),
         ('accepted', 'Accepted'),
         ('rejected', 'Rejected'),
+        ('canceled', 'Canceled'),
         ('expired', 'Expired'),
     ]
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='pending')
@@ -362,6 +370,16 @@ class Negotiation(models.Model):
     max_rounds = 1000
 
     created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=['negotiation_id']),
+            models.Index(fields=['status']),
+            models.Index(fields=['service_order']),
+            models.Index(fields=['provider_for_negotiation']),
+            models.Index(fields=['last_responder','updated_at']),
+
+        ]
 
     def save(self, *args, **kwargs):
        

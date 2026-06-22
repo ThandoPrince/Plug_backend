@@ -416,22 +416,22 @@ class SPProfileReadSerializer(serializers.ModelSerializer):
         # fields = ['id', 'email_address', 'mobile_number', 'is_profile_completed']
         read_only_fields = ['id', 'email_address', 'mobile_number', 'is_profile_completed','id']
 
+class ClientSPProfileReadSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = SPProfile
+        # List all fields except password
+        exclude = ['password', 'email_address', 'mobile_number']
+        # OR, alternatively, explicitly include fields you want:
+        # fields = ['id', 'email_address', 'mobile_number', 'is_profile_completed']
+        read_only_fields = [ 'is_profile_completed', 'id']
+
 class ServiceProviderSerializer(serializers.ModelSerializer):
+
+    sp_profile = SPProfileReadSerializer()
 
     class Meta:
         model = ServiceProvider
-        fields = [
-            "rating",
-            "full_name",
-            "gender",
-            "id_number",
-            "sp_description",
-            "dob",
-            "is_active",
-            "is_discoverable",
-            "location",
-            "services",
-        ]
+        fields = '__all__'
         read_only_fields = ["rating"]
 
 
@@ -468,6 +468,14 @@ class ServiceSerializer(serializers.ModelSerializer):
         model = Service
         fields = '__all__'  
 
+class ClientServiceSerializer(serializers.ModelSerializer):
+    
+    
+
+    class Meta:
+        model = Service
+        fields = '__all__'  
+
     
 
     def create(self, validated_data):
@@ -479,13 +487,19 @@ class ServiceSerializer(serializers.ModelSerializer):
         return Service.objects.create(service_group=group, **validated_data)
 
 class ServiceProviderReadSerializer(serializers.ModelSerializer):
-    sp_profile = SPProfileReadSerializer()
-    location = SPAddressSerializer()
-
+    sp_profile = ClientSPProfileReadSerializer()
+  
 
     class Meta:
         model = ServiceProvider
-        fields = '__all__'
+        exclude = ['id_number']
+
+class ClientServiceProviderReadSerializer(serializers.ModelSerializer):
+    sp_profile = ClientSPProfileReadSerializer()
+
+    class Meta:
+        model = ServiceProvider
+        exclude = ['id_number']
 class CostOfServiceReadSerializer(serializers.ModelSerializer):
     class Meta:
         model = CostOfService
@@ -633,8 +647,15 @@ class CostOfServiceSerializer(serializers.ModelSerializer):
         return super().update(instance, validated_data)
     
 
-class SPLiveLocationSerializer(serializers.ModelSerializer):
 
+
+class SPLiveLocationSerializer(serializers.ModelSerializer):
+    # Read-only field to catch the calculated distance from our query annotation
+    distance_km = serializers.FloatField(read_only=True, required=False)
+    
+    # Optional: Pulling explicit provider profile fields to save extra Flutter API hits
+    provider_name = serializers.CharField(source='provider.full_name', read_only=True)
+    is_verified = serializers.BooleanField(source='provider.is_verified', read_only=True)
 
     class Meta:
         model = SPLiveLocation

@@ -14,9 +14,9 @@ class OrderStatusService:
 
         allowed_transitions = {
             "pending": ["accepted", "declined", "canceled"],
-            "accepted": ["in_delivery"],
-            "in_delivery": ["awaiting_confirmation"],
-            "awaiting_confirmation": ["in_session"],
+            "accepted": ["in_delivery","canceled"],
+            "in_delivery": ["awaiting_confirmation","canceled"],
+            "awaiting_confirmation": ["in_session","canceled"],
             "in_session": ["awaiting_rating", "completed"],
             "awaiting_rating": ["completed"],
         }
@@ -46,5 +46,9 @@ class OrderStatusService:
             for shipment in shipments:
                 if shipment.shipment_status != "completed":
                     transition_shipment(shipment, "completed")
+
+        if new_status == "canceled":
+            # 1. Clear the M2M relationships table entries for this order
+            order.invited_providers.clear()
 
         return order
