@@ -44,6 +44,50 @@ class NegotiationReadSerializer(serializers.ModelSerializer):
 
 
 
+
+from rest_framework import serializers
+from django.utils import timezone
+from api.bookings.models import Shipment
+
+
+class RescheduleShipmentSerializer(serializers.ModelSerializer):
+
+    shipment_schedule_date = serializers.DateField()
+    shipment_schedule_time = serializers.TimeField()
+
+    class Meta:
+        model = Shipment
+        fields = [
+            "shipment_schedule_date",
+            "shipment_schedule_time"
+        ]
+
+    def validate(self, data):
+        new_date = data.get("shipment_schedule_date")
+        new_time = data.get("shipment_schedule_time")
+
+        if new_date < timezone.now().date():
+            raise serializers.ValidationError(
+                "Cannot reschedule to a past date."
+            )
+
+        return data
+
+
+class RejectNegotiationSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Negotiation
+        fields = ["negotiation_id", "status"]
+        read_only_fields = ["negotiation_id"]
+
+    def update(self, instance, validated_data):
+        instance.status = "rejected"
+        instance.last_responder = "client"
+        instance.save()
+        return instance
+
+
+
 class NegotiationWriteSerializer(serializers.ModelSerializer):
     class Meta:
         model = Negotiation

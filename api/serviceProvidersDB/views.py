@@ -15,7 +15,7 @@ from rest_framework import status
 from rest_framework.decorators import api_view, parser_classes
 from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 from rest_framework.response import Response
-from rest_framework.permissions import IsAuthenticated
+from rest_framework.permissions import AllowAny, IsAuthenticated
 from api.clientsDB.models.models import ClientAddress, ClientDetails, DeviceToken
 from api.clientsDB.services.jwt_client_authentication import ClientJWTAuthentication
 from api.serviceProvidersDB.services.service_validator import validate_service_submission
@@ -55,6 +55,7 @@ logger = logging.getLogger(__name__)  ##do not remove
 
 @api_view(['POST'])
 @throttle_classes([AuthThrottle])
+@permission_classes([AllowAny])
 def sp_login(request):
     try:
         serializer = SPLoginSerializer(data=request.data)
@@ -936,27 +937,27 @@ def service_group_list(request):
 def service_list(request):
 
     try:
-        services = Service.objects.filter(
-            review_status="APPROVED"
-        ).select_related(
-            "service_group"
-        ).annotate(
-            active_provider_count=Count(
-                "service_providers__provider",
-                filter=Q(service_providers__provider__is_active=True),
-                distinct=True
+        services = (
+            Service.objects.filter(
+                review_status="APPROVED"
             )
+            .select_related("service_group")
+            .annotate(
+                active_provider_count=Count(
+                    "service_providers__provider",
+                    filter=Q(service_providers__provider__is_active=True),
+                    distinct=True
+                )
+            )
+            .order_by("service_name")  # 🔥 deterministic ordering
         )
 
         serializer = ServiceSerializer(services, many=True)
 
-        return Response(
-            serializer.data,
-            status=status.HTTP_200_OK
-        )
+        return Response(serializer.data, status=status.HTTP_200_OK)
 
     except Exception:
-        logger.error("Unexpected error in service_list", exc_info=True)
+        logger.exception("Unexpected error in service_list")
 
         return Response(
             {
@@ -965,7 +966,6 @@ def service_list(request):
             },
             status=status.HTTP_500_INTERNAL_SERVER_ERROR
         )
-    
 
 
 # @api_view(['GET', 'PUT', 'PATCH', 'DELETE'])
@@ -1020,21 +1020,193 @@ def service_list(request):
 @permission_classes([IsAuthenticated])
 def service_provider_list_service(request):
 
+    print("\n=== [DEBUG START] service_provider_list_service ===")
+
     try:
         service_id = request.query_params.get('service_id')
+        search = request.query_params.get('search')
+        group_id = request.query_params.get('group_id')
 
-        providers_qs = ServiceProvider.objects.filter(
-            is_active=True
+        try:
+            limit = int(request.query_params.get('limit', 20))
+            limit = min(limit, 50)
+        except ValueError:
+            limit = 20
+
+        print(
+            f"[FILTERS] service_id={service_id}, "
+            f"group_id={group_id}, "
+            f"search={search}, "
+            f"limit={limit}"
+        )
+
+        # --------------------------------------------------
+        # CLIENT LOCATION
+        # --------------------------------------------------
+
+        try:
+            client_default_address = (
+                ClientAddress.objects
+                .select_related('address')
+                .get(
+                    client__client_profile=request.user,
+                    is_default=True,
+                    is_active=True
+                )
+            )
+
+            client_lat = float(
+                client_default_address.address.latitude
+            )
+
+            client_lon = float(
+                client_default_address.address.longitude
+            )
+
+            print(
+                f"[CLIENT LOCATION] "
+                f"lat={client_lat}, lon={client_lon}"
+            )
+
+        except ClientAddress.DoesNotExist:
+
+            print("[CLIENT LOCATION] No default address found")
+
+            return Response(
+                [],
+                status=status.HTTP_200_OK
+            )
+
+        # --------------------------------------------------
+        # DISTANCE CALCULATION
+        # --------------------------------------------------
+
+        INITIAL_RADIUS_KM = 50.0
+        MAX_RADIUS_KM = 200.0
+        EARTH_RADIUS_KM = 6371.0
+
+        distance_expression = ExpressionWrapper(
+            ACos(
+                Sin(Radians(client_lat))
+                * Sin(
+                    Radians(
+                        Cast(F('latitude'), FloatField())
+                    )
+                )
+                +
+                Cos(Radians(client_lat))
+                * Cos(
+                    Radians(
+                        Cast(F('latitude'), FloatField())
+                    )
+                )
+                *
+                Cos(
+                    Radians(
+                        Cast(F('longitude'), FloatField())
+                    ) - Radians(client_lon)
+                )
+            ) * EARTH_RADIUS_KM,
+            output_field=FloatField()
+        )
+
+        # --------------------------------------------------
+        # LIVE LOCATION QUERY
+        # --------------------------------------------------
+
+        live_locations = (
+            SPLiveLocation.objects
+            .select_related(
+                'provider',
+                'provider__sp_profile'
+            )
+            .filter(
+                provider__is_active=True
+            )
+            .annotate(
+                distance_km=distance_expression
+            )
         )
 
         if service_id:
-            providers_qs = providers_qs.filter(
-                provider_services__service_id=service_id
-            ).distinct()
+            live_locations = live_locations.filter(
+                provider__provider_services__service_id=service_id
+            )
+
+        if group_id:
+            live_locations = live_locations.filter(
+                provider__provider_services__service__service_group_id=group_id
+            )
+
+        if search:
+            live_locations = live_locations.filter(
+                Q(
+                    provider__sp_profile__first_name__icontains=search
+                )
+                |
+                Q(
+                    provider__sp_profile__last_name__icontains=search
+                )
+            )
+
+        print(
+            f"[PRE FILTER COUNT] "
+            f"{live_locations.count()}"
+        )
+
+        providers = list(
+            live_locations
+            .filter(distance_km__lte=INITIAL_RADIUS_KM)
+            .order_by('distance_km')[:limit]
+        )
+
+        print(
+            f"[50KM RESULTS] {len(providers)}"
+        )
+
+        if not providers:
+
+            providers = list(
+                live_locations
+                .filter(distance_km__lte=MAX_RADIUS_KM)
+                .order_by('distance_km')[:limit]
+            )
+
+            print(
+                f"[200KM RESULTS] {len(providers)}"
+            )
+
+        if not providers:
+
+            print("[RESULT] No providers found")
+
+            return Response(
+                [],
+                status=status.HTTP_200_OK
+            )
+
+        provider_ids = [
+            item.provider_id
+            for item in providers
+        ]
+
+        print(
+            f"[PROVIDER IDS] {provider_ids}"
+        )
+
+        ordered_providers = [
+            item.provider
+            for item in providers
+        ]
 
         serializer = ClientServiceProviderReadSerializer(
-            providers_qs,
+            ordered_providers,
             many=True
+        )
+
+        print(
+            f"[SUCCESS] Returning "
+            f"{len(ordered_providers)} providers"
         )
 
         return Response(
@@ -1043,7 +1215,10 @@ def service_provider_list_service(request):
         )
 
     except Exception:
-        logger.error("Unexpected error in service_provider_list_service", exc_info=True)
+
+        logger.exception(
+            "Unexpected error in service_provider_list_service"
+        )
 
         return Response(
             {
@@ -1335,11 +1510,21 @@ def service_provider_address(request):
 def providers_by_service(request, service_id):
 
     try:
-        providers = ServiceProvider.objects.filter(
-            services__service_id=service_id
-        ).distinct()
+        providers = (
+            ServiceProvider.objects
+            .filter(
+                services__service_id=service_id,
+                is_active=True  # 🔥 consistent visibility rule
+            )
+            .select_related("sp_profile")
+            .distinct()
+            .order_by("sp_profile__id")
+        )
 
-        serializer = ServiceProviderReadSerializer(providers, many=True)
+        serializer = ServiceProviderReadSerializer(
+            providers,
+            many=True
+        )
 
         return Response(
             serializer.data,
@@ -1347,7 +1532,7 @@ def providers_by_service(request, service_id):
         )
 
     except Exception:
-        logger.error("Unexpected error in providers_by_service", exc_info=True)
+        logger.exception("Unexpected error in providers_by_service")
 
         return Response(
             {"error": "Unexpected server error."},
@@ -1364,17 +1549,17 @@ def providers_by_service(request, service_id):
 def get_cost_of_service_images_by_cost_id(request, cost_id):
 
     try:
-        exists = CostOfService.objects.filter(id=cost_id).exists()
-
-        if not exists:
+        if not CostOfService.objects.filter(id=cost_id).exists():
             return Response(
                 {"error": "Cost of service not found."},
                 status=status.HTTP_404_NOT_FOUND
             )
 
-        images = CostOfServiceImage.objects.filter(
-            cost_of_service_id=cost_id
-        ).order_by('-uploaded_at')
+        images = (
+            CostOfServiceImage.objects
+            .filter(cost_of_service_id=cost_id)
+            .order_by('-uploaded_at')
+        )
 
         serializer = CostOfServiceImageReadSerializer(
             images,
@@ -1388,7 +1573,9 @@ def get_cost_of_service_images_by_cost_id(request, cost_id):
         )
 
     except Exception:
-        logger.error("Unexpected error in get_cost_of_service_images_by_cost_id", exc_info=True)
+        logger.exception(
+            "Unexpected error in get_cost_of_service_images_by_cost_id"
+        )
 
         return Response(
             {"error": "Unexpected server error."},
@@ -1401,8 +1588,8 @@ def get_cost_of_service_images_by_cost_id(request, cost_id):
 @authentication_classes([ClientJWTAuthentication])
 @permission_classes([IsAuthenticated])
 def costs_by_sp(request, provider_id, service_id=None):
-    try:
 
+    try:
         sp = ServiceProvider.objects.select_related(
             'sp_profile'
         ).get(
@@ -1418,19 +1605,16 @@ def costs_by_sp(request, provider_id, service_id=None):
             cost_of_service__isnull=False
         )
 
+        # ---------------- SINGLE COST ----------------
         if service_id is not None:
-            try:
-                provider_service = provider_services.get(
-                    service_id=service_id
-                )
+            provider_service = provider_services.filter(
+                service_id=service_id
+            ).select_related('cost_of_service').first()
 
-            except ProviderService.DoesNotExist:
+            if not provider_service or not provider_service.cost_of_service:
                 return Response(
                     {
-                        "detail": (
-                            "Cost of service not found for "
-                            "this provider and service."
-                        )
+                        "detail": "Cost of service not found for this provider and service."
                     },
                     status=status.HTTP_404_NOT_FOUND
                 )
@@ -1439,25 +1623,25 @@ def costs_by_sp(request, provider_id, service_id=None):
                 provider_service.cost_of_service
             )
 
-            return Response(
-                serializer.data,
-                status=status.HTTP_200_OK
-            )
+            return Response(serializer.data, status=status.HTTP_200_OK)
 
-        costs = list({
-            ps.cost_of_service.id: ps.cost_of_service
-            for ps in provider_services
-        }.values())
+        # ---------------- ALL COSTS ----------------
+        costs = list(
+            provider_services
+            .exclude(cost_of_service=None)
+            .order_by('service__service_name')
+            .values_list('cost_of_service', flat=False)
+        )
+
+        # safer fallback (ensures serializer stability)
+        costs = [ps.cost_of_service for ps in provider_services if ps.cost_of_service]
 
         serializer = CostOfServiceSerializer(
             costs,
             many=True
         )
 
-        return Response(
-            serializer.data,
-            status=status.HTTP_200_OK
-        )
+        return Response(serializer.data, status=status.HTTP_200_OK)
 
     except ServiceProvider.DoesNotExist:
         return Response(
@@ -1466,8 +1650,10 @@ def costs_by_sp(request, provider_id, service_id=None):
         )
 
     except Exception:
+        logger.exception("Error fetching provider costs")
+
         return Response(
-            {"detail": "An unexpected error occurred."},
+            {"detail": "An unexpected server error occurred."},
             status=status.HTTP_500_INTERNAL_SERVER_ERROR
         )
 
@@ -1524,12 +1710,12 @@ def fetch_sp_live_locations_by_service(request, service_id):
     try:
         # 1. Dynamic Limit Resolution
         try:
-            limit = int(request.query_params.get('limit', 5))
+            limit = int(request.query_params.get('limit', 6))
             if limit > 10:
                 limit = 10
         except ValueError:
             limit = 5
-        print(f"[DEBUG] Limit resolved to: {limit}")
+      
 
         # 2. Fetch Client Coordinates
         try:
@@ -1540,11 +1726,11 @@ def fetch_sp_live_locations_by_service(request, service_id):
             )
             client_lat = float(client_default_address.address.latitude)
             client_lon = float(client_default_address.address.longitude)
-            print(f"[DEBUG] Client address found. Coordinates: ({client_lat}, {client_lon})")
+           
         except ClientAddress.DoesNotExist:
-            print("[DEBUG ALERT] Client has no default active address row!")
+            
             return Response(
-                {"success": False, "message": "Please set a default address."},
+            
                 status=status.HTTP_400_BAD_REQUEST
             )
 
@@ -1562,43 +1748,38 @@ def fetch_sp_live_locations_by_service(request, service_id):
         )
 
         # 3. Base Query Trace
-        print(f"[DEBUG] Filtering SPLiveLocation on service_id={service_id} and provider__is_active=True...")
+        
         base_query = SPLiveLocation.objects.select_related('provider').filter(
             provider__provider_services__service__service_id=service_id,
             provider__is_active=True
         ).annotate(distance_km=distance_expression)
 
-        # Let's peek at the total pool BEFORE radius filtering
+    
         pre_filter_count = base_query.count()
-        print(f"[DEBUG] Found {pre_filter_count} active providers for this service overall.")
+   
         
-        if pre_filter_count > 0:
-            for item in base_query:
-                print(f"   -> Found Provider Profile ID: {item.provider_id} at ({item.latitude}, {item.longitude})")
+        
 
         # 4. Range Filtering Traces
         results_list = list(base_query.filter(distance_km__lte=INITIAL_RADIUS_KM).order_by('distance_km')[:limit])
-        print(f"[DEBUG] Providers within Initial Radius ({INITIAL_RADIUS_KM}km): {len(results_list)}")
+  
 
         if not results_list:
-            print(f"[DEBUG] Initial radius empty. Falling back to Max Radius ({MAX_RADIUS_KM}km)...")
+      
             results_list = list(base_query.filter(distance_km__lte=MAX_RADIUS_KM).order_by('distance_km')[:limit])
-            print(f"[DEBUG] Providers within Max Radius fallback: {len(results_list)}")
+
 
         if not results_list:
-            print("[DEBUG END] Final result list is completely empty. Returning empty array.")
+
             return Response({"success": True, "data": []}, status=status.HTTP_200_OK)
 
-        # Print distance calculations before packing response payload
-        for item in results_list:
-            print(f"   -> Match Selected: SP {item.provider_id} | Calculated Distance: {getattr(item, 'distance_km', 'N/A')} km")
-
+       
         serializer = SPLiveLocationSerializer(results_list, many=True)
-        print(f"[DEBUG END] Serialization successful. Payload size: {len(serializer.data)}")
+
         return Response({"success": True, "data": serializer.data}, status=status.HTTP_200_OK)
 
     except Exception as e:
-        print(f"[DEBUG CRITICAL] Exception dropped view: {str(e)}")
+
         logger.exception("Unexpected error in fetch_sp_live_locations_by_service")
         return Response(
             {"success": False, "message": "Unable to fetch live locations at this time."},

@@ -14,23 +14,23 @@ from api.bookings.utils.choices import BUILDING_TYPE_CHOICES
 
 
 class Address(models.Model):
-    unit_number = models.CharField(max_length=20, blank=True, default="")
-    access_notes = models.TextField(blank=True, null=True)
-    latitude = models.DecimalField(max_digits=9, decimal_places=7, blank=True, null=True)
-    longitude = models.DecimalField(max_digits=9, decimal_places=7, blank=True, null=True)
-    place_id = models.CharField(max_length=255, blank=True, null=True)
-    street_number = models.CharField(max_length=10, blank=True, null=True)
-    route = models.CharField("Street Name", max_length=255, blank=True, null=True)
-    locality = models.CharField("City/Town", max_length=100)
-    administrative_area_level_1 = models.CharField("Province/State", max_length=100)
-    formatted_address = models.CharField("Full Address", max_length=512, blank=False, null=True,editable=False)
-    country = models.CharField(max_length=100)
-    postal_code = models.CharField(max_length=20)
-    is_verified = models.BooleanField(default=False)
-    date_created = models.DateTimeField(auto_now=True, null=True)
-    building_type  = models.CharField(max_length=100, choices=BUILDING_TYPE_CHOICES , default='house')
+    unit_number = models.CharField(max_length=20, blank=True, default="",db_index=True)
+    access_notes = models.TextField(blank=True, null=True,db_index=True)
+    latitude = models.DecimalField(max_digits=9, decimal_places=7, blank=True, null=True,db_index=True)
+    longitude = models.DecimalField(max_digits=9, decimal_places=7, blank=True, null=True,db_index=True)
+    place_id = models.CharField(max_length=255, blank=True, null=True,db_index=True)
+    street_number = models.CharField(max_length=10, blank=True, null=True,db_index=True)
+    route = models.CharField("Street Name", max_length=255, blank=True, null=True,db_index=True)
+    locality = models.CharField("City/Town", max_length=100,db_index=True)
+    administrative_area_level_1 = models.CharField("Province/State", max_length=100,db_index=True)
+    formatted_address = models.CharField("Full Address", max_length=512, blank=False, null=True,editable=False,db_index=True)
+    country = models.CharField(max_length=100,db_index=True)
+    postal_code = models.CharField(max_length=20,db_index=True)
+    is_verified = models.BooleanField(default=False,db_index=True)
+    date_created = models.DateTimeField(auto_now=True, null=True,db_index=True)
+    building_type  = models.CharField(max_length=100, choices=BUILDING_TYPE_CHOICES , default='house',db_index=True)
 
-    clients = models.ManyToManyField('ClientDetails', through='ClientAddress', related_name='addresses')
+    clients = models.ManyToManyField('ClientDetails', through='ClientAddress', related_name='addresses',db_index=True)
     class Meta:
         constraints = [
             models.UniqueConstraint(
@@ -38,6 +38,12 @@ class Address(models.Model):
                 name="unique_household_identity"
             )
         ]
+        indexes = [
+            models.Index(fields=["place_id","latitude", "longitude"]),
+            models.Index(fields=["place_id"]),
+            models.Index(fields=["is_verified"]),
+           
+    ]
 
     def clean(self):
 
@@ -77,30 +83,30 @@ class Address(models.Model):
 
 
 class ClientAuth(models.Model):
-    id = models.AutoField(primary_key=True)
+    id = models.AutoField(primary_key=True,db_index=True)
 
     email_address = models.EmailField(
         unique=True,
-        max_length=100
+        max_length=100,db_index=True
     )
-    failed_login_attempts = models.PositiveIntegerField(default=0)
+    failed_login_attempts = models.PositiveIntegerField(default=0,db_index=True)
     account_locked_until = models.DateTimeField(
         null=True,
-        blank=True
+        blank=True,db_index=True
     )
 
     mobile_number = models.CharField(
         max_length=60,
         blank=True,
         null=True,
-        unique=True
+        unique=True,db_index=True
     )
-    date_created = models.DateTimeField (auto_now= True, null=True)
+    date_created = models.DateTimeField (auto_now= True, null=True,db_index=True)
     last_login_ip = models.GenericIPAddressField(
         null=True,
-        blank=True
+        blank=True,db_index=True
     )
-    last_login_at = models.DateTimeField(auto_now=True, null=True)
+    last_login_at = models.DateTimeField(auto_now=True, null=True,db_index=True)
 
 
     password = models.CharField(max_length=128)
@@ -112,14 +118,19 @@ class ClientAuth(models.Model):
         ("in-kyc", "In-KYC")
     ]
     total_failed_login_attempts = models.PositiveIntegerField(
-        default=0
+        default=0,db_index=True
     )
 
     is_profile_completed = models.CharField(
         default="in-details",
         choices=Profile_CHOICES,
-        max_length=20
+        max_length=20,db_index=True
     )
+    class Meta:
+        indexes = [
+            models.Index(fields=["id"]),
+           
+    ]
 
     @property
     def is_authenticated(self):
@@ -194,7 +205,7 @@ class DeviceToken(models.Model):
 class ClientLoginHistory(models.Model):
     client = models.ForeignKey(
         ClientAuth,
-        on_delete=models.CASCADE
+        on_delete=models.CASCADE, null=True
     )
     successful = models.BooleanField(default=False)
     identifier = models.CharField(max_length=100, null=True)
@@ -203,23 +214,91 @@ class ClientLoginHistory(models.Model):
     device_name = models.CharField(max_length=100, blank=True, null=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
+class ClientRegistrationHistory(models.Model):
+
+    email = models.CharField(max_length=255, null=True, blank=True)
+    mobile_number = models.CharField(max_length=20, null=True, blank=True)
+
+    successful = models.BooleanField(default=False)
+
+    ip_address = models.GenericIPAddressField()
+    user_agent = models.TextField(blank=True, null=True)
+    device_name = models.CharField(max_length=100, blank=True, null=True)
+
+    error_message = models.TextField(blank=True, null=True)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "client_registration_history"
+
+        indexes = [
+            models.Index(fields=["email"]),
+            models.Index(fields=["mobile_number"]),
+            models.Index(fields=["ip_address"]),
+            models.Index(fields=["created_at"]),
+            models.Index(fields=["successful"]),
+        ]
+
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        status = "SUCCESS" if self.successful else "FAILED"
+        return f"{status} | {self.email or self.mobile_number} | {self.ip_address}"
+
 
 class ClientDetails(models.Model):
     first_name = models.CharField(max_length=100, null=True, blank=True)
     last_name = models.CharField(max_length=100, null=True, blank=True)
     date_of_birth = models.DateField(null=True, blank=True)
-    client_profile = models.OneToOneField(ClientAuth, on_delete=models.CASCADE, primary_key=True)
-    rating = models.DecimalField(max_digits=3, decimal_places=2, null=True, blank=True, default=0.0)
-    client_pp = models.ImageField(upload_to='client_profile_pics', default='default.jpg', null=True, blank=True)
-    client_ID = models.CharField(max_length=20, blank=True, null=True, unique=True, auto_created=True)
+
+    client_profile = models.OneToOneField(
+        ClientAuth,
+        on_delete=models.CASCADE,
+        primary_key=True,
+    )
+
+    rating = models.DecimalField(
+        max_digits=3,
+        decimal_places=2,
+        null=True,
+        blank=True,
+        default=0.0,
+    )
+
+    client_pp = models.ImageField(
+        upload_to='client_profile_pics',
+        default='default.jpg',
+        null=True,
+        blank=True,
+    )
+
+    client_ID = models.CharField(
+        max_length=20,
+        blank=True,
+        null=True,
+        unique=True,
+        auto_created=True,
+    )
+
     is_active = models.BooleanField(default=True)
-    date_created = models.DateTimeField (auto_now= True, null=True)
 
 
+    last_updated = models.DateTimeField(auto_now=True, null=True)
 
+    class Meta:
+        indexes = [
+            models.Index(fields=["client_ID","client_profile","first_name","client_pp","is_active","rating"]),
+
+           
+    ]
 
     def __str__(self):
-        return f"{self.first_name} - {self.last_name}-{self.client_profile.email_address}"
+        return (
+            f"{self.first_name} - "
+            f"{self.last_name} - "
+            f"{self.client_profile.email_address}"
+        )
     
 class ClientSession(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
@@ -259,9 +338,9 @@ class ClientSession(models.Model):
 
 
 class ClientAddress(models.Model):
-    id = models.AutoField(primary_key=True)
-    is_active = models.BooleanField(default=True)
-    date_created = models.DateTimeField(auto_now_add=True, null=True)
+    id = models.AutoField(primary_key=True ,db_index=True)
+    is_active = models.BooleanField(default=True,db_index=True)
+    date_created = models.DateTimeField(auto_now_add=True, null=True,db_index=True)
 
     RESIDENTIAL = "Residential Address"
     VACATION = "Vacation Address"
@@ -271,31 +350,31 @@ class ClientAddress(models.Model):
         (VACATION, "Vacation Address"),
     ]
 
-    client = models.ForeignKey("ClientDetails", on_delete=models.CASCADE)
-    address = models.ForeignKey("Address", on_delete=models.CASCADE)
+    client = models.ForeignKey("ClientDetails", on_delete=models.CASCADE,db_index=True)
+    address = models.ForeignKey("Address", on_delete=models.CASCADE,db_index=True)
 
     is_owner = models.BooleanField(
         "Are you the owner of the household?",
-        default=False
+        default=False,db_index=True
     )
 
     house_administrator = models.BooleanField(
         "Are you responsible for what happens on the premises?",
-        default=False
+        default=False,db_index=True
     )
 
     is_super_user = models.BooleanField(
         default=False,
-        editable=False
+        editable=False,db_index=True
     )
 
     address_type = models.CharField(
         max_length=100,
         choices=ADDRESS_TYPE_CHOICES,
-        default=RESIDENTIAL
+        default=RESIDENTIAL,db_index=True
     )
 
-    is_default = models.BooleanField(default=False)
+    is_default = models.BooleanField(default=False,db_index=True)
 
     class Meta:
         constraints = [
@@ -304,6 +383,12 @@ class ClientAddress(models.Model):
                 name='unique_client_address'
             )
         ]
+
+        indexes = [
+            models.Index(fields=["id","client", "address", "is_active","is_default"]),
+             models.Index(fields=["id","is_default"]),
+           
+    ]
 
     # --------------------------------------------------
     # VALIDATION
@@ -488,3 +573,40 @@ class ClientNotification(models.Model):
         return f"To {self.recipient} - {self.title}"
 
 
+class Notification(models.Model):
+
+    NOTIFICATION_TYPES = [
+        ("booking", "Booking"),
+        ("negotiation", "Negotiation"),
+        ("shipment", "Shipment"),
+        ("session", "Session"),
+        ("rating", "Rating"),
+        ("system", "System"),
+    ]
+
+    recipient = models.ForeignKey(
+        ClientAuth,
+        on_delete=models.CASCADE,
+        related_name="legacy_notifications"
+    )
+
+    notification_type = models.CharField(
+        max_length=50,
+        choices=NOTIFICATION_TYPES
+    )
+
+    title = models.CharField(max_length=255)
+
+    message = models.TextField()
+
+    is_read = models.BooleanField(default=False)
+
+    payload = models.JSONField(
+        blank=True,
+        null=True
+    )
+
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-created_at"]

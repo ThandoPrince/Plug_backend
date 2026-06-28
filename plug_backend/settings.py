@@ -15,11 +15,13 @@ def get_env(name: str, default: str | None = None, required: bool = False) -> st
     return value
 
 SIMPLE_JWT = {
-    "ACCESS_TOKEN_LIFETIME": timedelta(hours=1),
+    "ACCESS_TOKEN_LIFETIME": timedelta(minutes=15),
     "REFRESH_TOKEN_LIFETIME": timedelta(days=30),
     "ROTATE_REFRESH_TOKENS": True,
     "BLACKLIST_AFTER_ROTATION": True,
 }
+
+
 
 
 
@@ -170,7 +172,15 @@ REST_FRAMEWORK = {
         "upload": "10/min",
         "profile_write": "20/min",
         "booking_like_write": "15/min",
-    }
+    },
+    "DEFAULT_AUTHENTICATION_CLASSES": (
+        "rest_framework_simplejwt.authentication.JWTAuthentication",
+    ),
+    "DEFAULT_PERMISSION_CLASSES": (
+        "rest_framework.permissions.IsAuthenticated",
+    ),
+    "EXCEPTION_HANDLER": "plug_backend.exceptions.custom_exception_handler",
+
 }
 
 REDIS_URL = get_env("REDIS_URL", "")  # optional, no crash

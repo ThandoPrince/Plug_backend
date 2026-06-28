@@ -31,7 +31,7 @@ def notify_provider_booking_invite(email: str, payload: dict) -> None:
         group_name=f"provider_{safe_group(email)}",
         event_type="booking_invite",
         payload=payload,
-    )
+    )   
 
 
 def notify_provider_booking_update(email: str, payload: dict) -> None:

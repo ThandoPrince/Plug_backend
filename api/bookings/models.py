@@ -4,13 +4,64 @@ from django.utils import timezone
 import uuid
 from django.conf import settings
 from django.db import models
-from api.bookings.ws_events import notify_provider_booking_invite, notify_provider_booking_update, notify_client_booking
+from api.bookings.events.event_base import EventBus
+from api.bookings.events.order_events import OrderArrivedEvent, OrderInTransitEvent, OrderRescheduledEvent
+from api.bookings.events.websoket_event_emitters.shipment_event_emitters import push_shipment_status_update
+from api.bookings.events.ws_events import notify_provider_booking_invite, notify_provider_booking_update, notify_client_booking
 from api.bookings.services.order_status_service import OrderStatusService
+from api.clientsDB.models.models import ClientAuth
 from api.clientsDB.notifications.services.client_push_notification_service import send_push_to_client
+from api.serviceProvidersDB.models import SPProfile, ServiceProvider
 from api.serviceProvidersDB.notifications.services.provider_push_notification_service import send_push_to_provider
 from .utils.choices import ORDER_STATUS, SESSION_STATUS, SHIPMENT_STATUS, PAYMENT_STATUS
 from django.db.models import Avg
 import json
+
+
+
+class ClientNotification(models.Model):
+    client = models.ForeignKey(
+        ClientAuth,
+        on_delete=models.CASCADE,
+        related_name="notifications"
+    )
+
+    notification_type = models.CharField(max_length=100)
+
+    title = models.CharField(max_length=255)
+
+    body = models.TextField()
+
+    payload = models.JSONField(
+        default=dict,
+        blank=True
+    )
+
+    is_read = models.BooleanField(default=False)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+
+class SPNotification(models.Model):
+    provider = models.ForeignKey(
+        SPProfile,
+        on_delete=models.CASCADE,
+        related_name="notifications"
+    )
+
+    notification_type = models.CharField(max_length=100)
+
+    title = models.CharField(max_length=255)
+
+    body = models.TextField()
+
+    payload = models.JSONField(
+        default=dict,
+        blank=True
+    )
+
+    is_read = models.BooleanField(default=False)
+
+    created_at = models.DateTimeField(auto_now_add=True)
 
 
 class OrderService(models.Model):
@@ -86,8 +137,8 @@ class OrderService(models.Model):
                 self._cascade_negotiation_cancellation()
 
             self._log_order_history(old_status=old_status, new_status=self.status)
-            self._send_status_notification()
-            self._send_status_websocket_updates()
+          
+           
 
     def _cascade_negotiation_cancellation(self):
         """
@@ -109,208 +160,11 @@ class OrderService(models.Model):
         except Exception as e:
             print(f"Failed to create order history for Order {self.order_id}: {e}")
 
-    def _get_client_name(self):
-        client_name = "A client"
 
-        if self.client:
-            first_name = getattr(self.client, "first_name", "") or ""
-            last_name = getattr(self.client, "last_name", "") or ""
-            full_name = f"{first_name} {last_name}".strip()
 
-            if full_name:
-                client_name = full_name
 
-        return client_name
 
-    def _get_service_name(self):
-        return (
-            self.service_required.service_name
-            if self.service_required
-            else "a service"
-        )
-
-    def _get_booking_title(self):
-        return self.title or f"New booking for {self._get_service_name()}"
-
-    def _build_provider_invite_payload(self):
-        return {
-            "type": "new_booking_invite",
-            "order_id": str(self.order_id),
-            "status": self.status,
-            "title": self._get_booking_title(),
-            "service_name": self._get_service_name(),
-            "client_name": self._get_client_name(),
-            "requested_date": self.requested_date.isoformat() if self.requested_date else None,
-            "requested_date_time": self.requested_date_time.isoformat() if self.requested_date_time else None,
-            "created_at": self.date_and_time_created.isoformat() if self.date_and_time_created else None,
-            "proposal_price": str(self.proposal_price) if self.proposal_price is not None else None,
-            "notes": self.notes,
-        }
-
-    def _build_client_status_payload(self):
-        return {
-            "type": "order_status_update",
-            "order_id": str(self.order_id),
-            "status": self.status,
-            "title": self._get_booking_title(),
-            "service_name": self._get_service_name(),
-            "provider_service_id": self.provider_for_service_id,
-            "updated_at": timezone.now().isoformat(),
-        }
-
-    def _build_provider_status_payload(self):
-        return {
-            "type": "booking_update",
-            "order_id": str(self.order_id),
-            "status": self.status,
-            "title": self._get_booking_title(),
-            "service_name": self._get_service_name(),
-            "client_name": self._get_client_name(),
-            "updated_at": timezone.now().isoformat(),
-        }
-
-    def _send_status_notification(self):
-        if not self.client:
-            return
-
-        client_auth_user = getattr(self.client, 'client_profile', None)
-        if not client_auth_user:
-            return
-
-        service_name = self._get_service_name()
-
-        notification_map = {
-            "accepted": {
-                "title": "Order Accepted 🛠️",
-                "body": f"Your order for {service_name} has been accepted!",
-                "type": "order_accepted",
-            },
-            "in_delivery": {
-                "title": "Provider On The Way 🚗",
-                "body": f"Your provider is on the way for {service_name}.",
-                "type": "provider_on_the_way",
-            },
-            "awaiting_confirmation": {
-                "title": "Provider Has Arrived 📍",
-                "body": f"Your provider has arrived for {service_name}. Please confirm.",
-                "type": "provider_arrived",
-            },
-        }
-
-        notification_config = notification_map.get(self.status)
-        if not notification_config:
-            return
-
-        try:
-            send_push_to_client(
-                client=client_auth_user,
-                title=notification_config["title"],
-                body=notification_config["body"],
-                data={
-                    "order_id": str(self.order_id),
-                    "type": notification_config["type"],
-                    "status": self.status,
-                }
-            )
-        except Exception as e:
-            print(f"Push notification failed for Order {self.order_id}: {e}")
-
-    def _send_status_websocket_updates(self):
-        client_profile = getattr(self.client, "client_profile", None)
-        client_email = getattr(client_profile, "email_address", None)
-
-        if client_email:
-            try:
-                notify_client_booking(
-                    client_email,
-                    self._build_client_status_payload()
-                )
-                print(f"[WS] Client booking update sent to {client_email}")
-            except Exception as e:
-                print(f"[WS ERROR] Failed client booking update for Order {self.order_id}: {e}")
-
-        provider_service = self.provider_for_service
-        if not provider_service:
-            return
-
-        provider = getattr(provider_service, "provider", None)
-        if not provider:
-            return
-
-        sp_profile = getattr(provider, "sp_profile", None)
-        provider_email = getattr(sp_profile, "email_address", None)
-
-        if provider_email:
-            try:
-                notify_provider_booking_update(
-                    provider_email,
-                    self._build_provider_status_payload()
-                )
-                print(f"[WS] Provider booking update sent to {provider_email}")
-            except Exception as e:
-                print(f"[WS ERROR] Failed provider booking update for Order {self.order_id}: {e}")
-
-    def notify_invited_providers_of_new_booking(self):
-        print(f"[Notify] notify_invited_providers_of_new_booking CALLED for order {self.order_id}")
-
-        # Each item in this queryset is an SPProfile instance
-        invited_profiles = self.invited_providers.select_related("serviceprovider")
-
-        invited_count = invited_profiles.count()
-        print(f"[Notify] invited providers count: {invited_count}")
-
-        if invited_count == 0:
-            print(f"[Notify] No invited providers found for Order {self.order_id}.")
-            return
-
-        client_name = self._get_client_name()
-        service_name = self._get_service_name()
-        booking_title = self._get_booking_title()
-        payload = self._build_provider_invite_payload()
-
-        for sp_profile in invited_profiles:
-            print(f"[Notify] SPProfile ID: {sp_profile.pk}")
-
-            # Access the reverse OneToOne relation safely
-            provider = getattr(sp_profile, "serviceprovider", None)
-
-            if not provider:
-                print(f"[Notify] ServiceProvider profile missing for SPProfile {sp_profile.pk}")
-                continue
-
-            provider_email = sp_profile.email_address
-
-            if provider_email:
-                try:
-                    notify_provider_booking_invite(provider_email, payload)
-                    print(f"[WS] Booking invite sent to {provider_email}")
-                except Exception as e:
-                    print(
-                        f"[WS ERROR] Failed sending WebSocket invite for "
-                        f"Order {self.order_id}, SPProfile {sp_profile.pk}: {e}"
-                    )
-
-            try:
-                send_push_to_provider(
-                    service_provider=sp_profile,  # Accepts SPProfile instance directly
-                    title="New Booking Request 📩",
-                    body=f"{client_name} created a new booking for {service_name}.",
-                    data={
-                        "type": "new_booking_invite",
-                        "order_id": str(self.order_id),
-                        "status": self.status,
-                        "title": booking_title,
-                        "service_name": service_name,
-                        "client_name": client_name,
-                    }
-                )
-                print(f"[Push] Notification sent to SPProfile {sp_profile.pk}")
-
-            except Exception as e:
-                print(
-                    f"[Push ERROR] Failed sending notification for "
-                    f"Order {self.order_id}, SPProfile {sp_profile.pk}: {e}"
-                )
+ 
 
 class ServicePicture(models.Model):
     order = models.ForeignKey(
@@ -499,6 +353,7 @@ class Shipment(models.Model):
     shipment_confirmation = models.BooleanField(default=False)
     service_ordered = models.ForeignKey(BookingItem, on_delete=models.CASCADE, related_name="shipments")
     created_at = models.DateTimeField(auto_now_add=True)
+    updated_date = models.DateField( auto_now=True, null=True)
 
 
 
@@ -516,14 +371,40 @@ class Shipment(models.Model):
 
         
         if not is_new and old_status != self.shipment_status:
+            ShipmentHistory.objects.create(
+    shipment=self,
+    previous_status=old_status,
+    new_status=self.shipment_status
+)
 
             order = self.service_ordered.order
 
+
+
             if self.shipment_status == "in_transit":
+                
                 OrderStatusService.set_status(order, "in_delivery")
+                EventBus.emit(
+    OrderInTransitEvent({
+        "shipment_id": self.shipment_id,
+        "order_id": order.order_id,
+    })
+)
 
             elif self.shipment_status == "arrived":
+                
                 OrderStatusService.set_status(order, "awaiting_confirmation")
+                EventBus.emit(
+        OrderArrivedEvent({
+            "shipment_id": self.shipment_id,
+            "order_id": order.order_id,
+        })
+    )
+                print("STATUS CHANGED → EMITTING WS EVENT")
+                push_shipment_status_update(
+        self.shipment_id,
+        "arrived"
+    )
 
             elif self.shipment_status == "delivered":
                 OrderStatusService.set_status(order, "awaiting_confirmation")   
@@ -532,6 +413,33 @@ class Shipment(models.Model):
     def __str__(self):
     
         return f"Shipment {self.shipment_id} | Status: {self.shipment_status} | Date: {self.shipment_schedule_date} | Time: {self.shipment_schedule_time}"
+    
+class ShipmentHistory(models.Model):
+    shipment = models.ForeignKey(
+        Shipment,
+        on_delete=models.CASCADE,
+        related_name="history"
+    )
+
+    previous_status = models.CharField(max_length=50)
+    new_status = models.CharField(max_length=50)
+
+    changed_at = models.DateTimeField(auto_now_add=True)
+
+    changed_by_provider = models.ForeignKey(
+        ServiceProvider,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL
+    )
+
+    notes = models.TextField(
+        blank=True,
+        default=""
+    )
+
+    class Meta:
+        ordering = ["-changed_at"]
     
 class ShipmentRouteHistory(models.Model):
     history_id = models.AutoField(primary_key=True)

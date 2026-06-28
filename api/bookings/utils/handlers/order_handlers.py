@@ -1,0 +1,212 @@
+
+
+
+from api.bookings.events.event_base import EventBus
+from api.bookings.models import OrderService
+from api.clientsDB.notifications.services.notification_builder import OrderNotificationBuilder
+from api.clientsDB.notifications.services.notification_service import NotificationService
+
+
+def handle_order_created(payload):
+
+    order = payload["order"]
+
+    invited_profiles = order.invited_providers.all()
+
+    notification_payload = (
+        OrderNotificationBuilder.booking_invite(order)
+    )
+
+    for provider in invited_profiles:
+
+        NotificationService.notify_provider(
+            provider=provider,
+            notification_type="booking_invite",
+            title="New Booking Request 📩",
+            body=f"{notification_payload['client_name']} created a booking.",
+            payload=notification_payload,
+            websocket_invite=True,
+        )
+
+
+def handle_order_cancelled(payload):
+
+    order = payload.get("order")
+    shipment = payload.get("shipment")
+
+    if not order or not shipment:
+        return
+
+    provider_service = shipment.service_ordered.order.provider_for_service
+
+    if not provider_service:
+        return
+
+    service_provider = provider_service.provider
+
+    if not service_provider:
+        return
+
+    sp_profile = service_provider.sp_profile
+
+    if not sp_profile:
+        return
+
+    NotificationService.notify_provider(
+        provider=sp_profile,
+        notification_type="order_cancelled",
+        title="Booking Cancelled ❌",
+        body="The client has cancelled the booking.",
+        payload=OrderNotificationBuilder.order_cancelled(order),
+    )
+
+
+
+def handle_order_accepted(payload):
+
+    order_id = payload["order_id"]
+
+    order = OrderService.objects.select_related("client").get(order_id=order_id)
+
+    client = getattr(order.client, "client_profile", None)
+
+    if not client:
+        return
+
+    NotificationService.notify_client(
+        client=client,
+        notification_type="order_accepted",
+        title="Order Accepted 🛠️",
+        body="Your booking has been accepted.",
+        payload=OrderNotificationBuilder.order_accepted(order),
+    )
+
+
+def handle_provider_in_transit(payload):
+    order_id = payload["order_id"]
+
+    order = OrderService.objects.get(order_id=order_id)
+
+    client = getattr(order.client, "client_profile", None)
+
+    if not client:
+        return
+
+    NotificationService.notify_client(
+        client=client,
+        notification_type="provider_in_transit",
+        title="Provider On The Way 🚗",
+        body="Your provider is on the way.",
+        payload=OrderNotificationBuilder.provider_in_transit(order),
+    )
+
+def handle_final_price_updated(payload):
+    order = payload.get("order")
+    final_price = payload.get("final_price")
+
+    if not order:
+        return
+
+    provider_for_service = order.provider_for_service.provider.sp_profile
+
+    if not provider_for_service:
+        return
+    
+    NotificationService.notify_provider(
+            provider=provider_for_service,
+            notification_type="order_final_price_updated",
+            title="Booking Price Updated 💰",
+            body=f"The client updated the booking price to {final_price}.",
+            payload={
+                "order_id": order.order_id,
+                "final_price": final_price,
+            },
+            websocket_invite=False,
+        )
+
+
+def handle_provider_arrived(payload):
+
+    order_id = payload["order_id"]
+
+    order = OrderService.objects.select_related("client").get(order_id=order_id)
+
+    client = getattr(order.client, "client_profile", None)
+
+    if not client:
+        return
+
+    NotificationService.notify_client(
+        client=client,
+        notification_type="provider_arrived",
+        title="Provider Arrived 📍",
+        body="Your provider has arrived.",
+        payload=OrderNotificationBuilder.provider_arrived(order),
+    )
+
+def handle_order_rescheduled(payload):
+
+    order = payload.get("order")
+    shipment = payload.get("shipment")
+
+    if not order or not shipment:
+        return
+
+    # Resolve the provider's SPProfile
+    provider_service = shipment.service_ordered.order.provider_for_service
+
+    if not provider_service:
+        return
+
+    service_provider = provider_service.provider
+
+    if not service_provider:
+        return
+
+    sp_profile = service_provider.sp_profile
+
+    if not sp_profile:
+        return
+
+    NotificationService.notify_provider(
+        provider=sp_profile,
+        notification_type="order_rescheduled",
+        title="Booking Rescheduled 📅",
+        body="The client has rescheduled the booking.",
+        payload=OrderNotificationBuilder.order_rescheduled(order),
+    )
+
+EventBus.register(
+    "order.created",
+    handle_order_created
+)
+
+EventBus.register(
+    "order.rescheduled",
+    handle_order_rescheduled
+)
+
+EventBus.register(
+    "order.cancelled",
+    handle_order_cancelled
+)
+
+EventBus.register(
+    "order.final_price_updated",
+    handle_final_price_updated
+)
+
+EventBus.register(
+    "order.accepted",
+    handle_order_accepted
+)
+
+EventBus.register(
+    "order.in_transit",
+    handle_provider_in_transit
+)
+
+EventBus.register(
+    "order.arrived",
+    handle_provider_arrived
+)

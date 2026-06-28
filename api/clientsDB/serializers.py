@@ -613,6 +613,46 @@ class ClientProfileUpdateSerializer(serializers.ModelSerializer):
             setattr(instance, attr, value)
         instance.save()
         return instance
+    
+class ClientProfileAppUpdateSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ClientDetails
+        fields = [
+            "first_name",
+            "last_name",
+            "date_of_birth",
+            "client_pp",
+            "last_updated",
+        ]
+
+        read_only_fields = [
+            "last_updated",
+        ]
+
+    def update(self, instance, validated_data):
+        instance.first_name = validated_data.get(
+            "first_name",
+            instance.first_name,
+        )
+
+        instance.last_name = validated_data.get(
+            "last_name",
+            instance.last_name,
+        )
+
+        instance.date_of_birth = validated_data.get(
+            "date_of_birth",
+            instance.date_of_birth,
+        )
+
+        if "client_pp" in validated_data:
+            instance.client_pp = validated_data["client_pp"]
+
+        instance.save()
+
+        return instance
+    
+
 
 class ClientUpdateSerializer(serializers.ModelSerializer):
     client_profile = ClientProfileUpdateSerializer()

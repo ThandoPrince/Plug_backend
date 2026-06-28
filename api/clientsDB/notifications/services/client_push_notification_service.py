@@ -1,235 +1,240 @@
 import json
 import time
 import requests
+from concurrent.futures import ThreadPoolExecutor
+
 from django.conf import settings
 from firebase_admin import messaging
+
 from api.clientsDB.models.models import DeviceToken
 
-# Huawei credentials
+
+# =========================================================
+# CONFIG
+# =========================================================
+
 HMS_APP_ID = settings.HMS_APP_ID
 HMS_APP_SECRET = settings.HMS_APP_SECRET
 
-# Token cache
 _hms_cached_token = None
 _hms_token_expiry = 0
 
+ALLOWED_PROVIDERS = {"firebase", "huawei"}
+
+
+# =========================================================
+# ENTRY POINT
+# =========================================================
 
 def send_push_to_client(client, title, body, data=None):
-    """
-    Sends push notifications to all registered devices of a client.
-    Supports Firebase and Huawei Push Kit.
-    """
-    tokens = DeviceToken.objects.filter(client=client)
+    devices = list(
+        DeviceToken.objects.filter(client=client).only(
+            "id", "provider", "device_type", "fcm_token"
+        )
+    )
 
-    if not tokens.exists():
-        print(f"[Push] No registered devices for client {client}")
+    if not devices:
+        print(f"[Push] No devices for client {client}")
         return
 
-    print(f"[Push] Sending notification to {tokens.count()} device(s)")
+    firebase_tokens = []
+    huawei_tokens = []
+    device_map = {}
 
-    for device in tokens:
-        provider = (device.provider or "").strip().lower()
-        device_type = (device.device_type or "").strip().lower()
-        push_token = device.fcm_token
-
-        print("\n----------------------------------")
-        print(f"[Push] Provider: {provider}")
-        print(f"[Push] Device Type: {device_type}")
-        print(f"[Push] Token: {push_token}")
-
-        if not push_token:
-            print("[Push] Token missing")
+    for device in devices:
+        token = device.fcm_token
+        if not token:
             continue
 
+        provider = _normalize_provider(device.provider)
+
+        device_map[token] = device
+
         if provider == "firebase":
-            _send_firebase_push(
-                device=device,
-                push_token=push_token,
-                title=title,
-                body=body,
-                data=data,
-            )
+            firebase_tokens.append(token)
 
         elif provider == "huawei":
-            _send_huawei_push(
-                push_token=push_token,
-                title=title,
-                body=body,
-                data=data,
-            )
+            huawei_tokens.append(token)
 
         else:
-            print(f"[Push] Unknown provider: {provider}")
+            print(f"[Push] Unknown provider '{device.provider}' → skipped")
+
+    print(f"[Push] Firebase: {len(firebase_tokens)} | Huawei: {len(huawei_tokens)}")
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        if firebase_tokens:
+            executor.submit(
+                _send_firebase_batch,
+                firebase_tokens,
+                title,
+                body,
+                data,
+                device_map,
+            )
+
+        if huawei_tokens:
+            executor.submit(
+                _send_huawei_batch,
+                huawei_tokens,
+                title,
+                body,
+                data,
+            )
 
 
-def _send_firebase_push(device, push_token, title, body, data=None):
-    """
-    Send notification using Firebase Cloud Messaging.
-    """
-    try:
-        firebase_data = _normalize_firebase_data(data)
+# =========================================================
+# PROVIDER NORMALIZATION
+# =========================================================
 
-        message = messaging.Message(
-            token=push_token,
-            notification=messaging.Notification(
-                title=title,
-                body=body,
-            ),
-            data=firebase_data,
-            android=messaging.AndroidConfig(
-                priority="high",
-                notification=messaging.AndroidNotification(
-                    sound="default",
-                    channel_id="default_channel",
+def _normalize_provider(provider: str) -> str:
+    return (provider or "").strip().lower()
+
+
+# =========================================================
+# FIREBASE
+# =========================================================
+
+def _send_firebase_batch(tokens, title, body, data, device_map):
+    firebase_data = _normalize_firebase_data(data)
+
+    def send_single(token):
+        device = device_map.get(token)
+
+        try:
+            message = messaging.Message(
+                token=token,
+                notification=messaging.Notification(
+                    title=title,
+                    body=body,
                 ),
-            ),
-        )
+                data=firebase_data,
+                android=messaging.AndroidConfig(
+                    priority="high",
+                    notification=messaging.AndroidNotification(
+                        sound="default",
+                        channel_id="default_channel",
+                    ),
+                ),
+            )
 
-        response = messaging.send(message)
+            response = messaging.send(message)
+            print(f"[Firebase SUCCESS] {response}")
 
-        print("[Firebase Push SUCCESS]")
-        print(f"[Firebase Response] {response}")
+        except Exception as e:
+            error = str(e).lower()
+            print(f"[Firebase ERROR] {token}: {error}")
 
-    except Exception as e:
-        print("[Firebase Push ERROR]")
-        print(str(e))
+            # auto-clean invalid tokens
+            if any(x in error for x in [
+                "not registered",
+                "unregistered",
+                "invalid registration",
+                "requested entity was not found",
+            ]):
+                if device:
+                    print(f"[Firebase] Deleting invalid token {device.id}")
+                    device.delete()
 
-        # Remove invalid/unregistered tokens
-        error_text = str(e).lower()
-        if (
-            "registration-token-not-registered" in error_text
-            or "unregistered" in error_text
-            or "invalid registration token" in error_text
-        ):
-            print(f"[Firebase] Removing invalid token for device id={device.id}")
-            device.delete()
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        executor.map(send_single, tokens)
 
 
-def _send_huawei_push(push_token, title, body, data=None):
-    """
-    Send notification using Huawei Push Kit.
-    """
+# =========================================================
+# HUAWEI
+# =========================================================
+
+def _send_huawei_batch(tokens, title, body, data):
     try:
         access_token = _get_hms_access_token()
-
         if not access_token:
-            print("[Huawei Push ERROR] No access token")
+            print("[Huawei] Missing access token")
             return
 
         payload = {
             "validate_only": False,
             "message": {
-                "token": [push_token],
+                "token": tokens,
                 "data": json.dumps(data or {}),
                 "android": {
                     "bi_tag": "order_notification",
                     "notification": {
                         "title": title,
                         "body": body,
-                        "click_action": {
-                            "type": 3
-                        }
-                    }
-                }
-            }
+                        "click_action": {"type": 3},
+                    },
+                },
+            },
         }
 
         headers = {
             "Authorization": f"Bearer {access_token}",
-            "Content-Type": "application/json"
+            "Content-Type": "application/json",
         }
-
-        print("\n[Huawei Request]")
-        print(json.dumps(payload, indent=2))
 
         response = requests.post(
             f"https://push-api.cloud.huawei.com/v1/{HMS_APP_ID}/messages:send",
             headers=headers,
             json=payload,
-            timeout=10
+            timeout=10,
         )
 
-        print("\n[Huawei Response Status]")
-        print(response.status_code)
-
-        print("\n[Huawei Response Body]")
-        print(response.text)
-
         if response.status_code == 200:
-            print("[Huawei Push SUCCESS]")
+            print("[Huawei Batch] SUCCESS")
         else:
-            print("[Huawei Push FAILED]")
+            print("[Huawei Batch FAILED]", response.text)
 
     except Exception as e:
-        print("[Huawei Push ERROR]")
-        print(str(e))
+        print("[Huawei Batch ERROR]", str(e))
 
+
+# =========================================================
+# DATA NORMALIZATION
+# =========================================================
 
 def _normalize_firebase_data(data):
-    """
-    Firebase data payload values must be strings.
-    """
     if not data:
         return {}
 
-    normalized = {}
-    for key, value in data.items():
-        if value is None:
-            continue
+    return {
+        str(k): (
+            json.dumps(v) if isinstance(v, (dict, list)) else str(v)
+        )
+        for k, v in data.items()
+        if v is not None
+    }
 
-        if isinstance(value, (dict, list)):
-            normalized[str(key)] = json.dumps(value)
-        else:
-            normalized[str(key)] = str(value)
 
-    return normalized
-
+# =========================================================
+# HUAWEI TOKEN CACHE
+# =========================================================
 
 def _get_hms_access_token():
-    """
-    Fetch Huawei OAuth token and cache it.
-    """
     global _hms_cached_token, _hms_token_expiry
 
     if _hms_cached_token and time.time() < _hms_token_expiry:
-        print("[Huawei OAuth] Using cached token")
         return _hms_cached_token
 
     try:
-        print("\n[Huawei OAuth] Requesting new token...")
-
         response = requests.post(
             "https://oauth-login.cloud.huawei.com/oauth2/v3/token",
             data={
                 "grant_type": "client_credentials",
                 "client_id": HMS_APP_ID,
-                "client_secret": HMS_APP_SECRET
+                "client_secret": HMS_APP_SECRET,
             },
-            headers={
-                "Content-Type": "application/x-www-form-urlencoded"
-            },
-            timeout=10
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            timeout=10,
         )
 
-        print("[Huawei OAuth Response Status]")
-        print(response.status_code)
-
-        print("[Huawei OAuth Response Body]")
-        print(response.text)
-
         response.raise_for_status()
+        data = response.json()
 
-        token_data = response.json()
-
-        _hms_cached_token = token_data.get("access_token", "")
-        expires_in = int(token_data.get("expires_in", 0))
+        _hms_cached_token = data.get("access_token", "")
+        expires_in = int(data.get("expires_in", 0))
         _hms_token_expiry = time.time() + expires_in - 60
-
-        print("[Huawei OAuth] Token stored in cache")
 
         return _hms_cached_token
 
     except Exception as e:
-        print("[Huawei OAuth ERROR]")
-        print(str(e))
+        print("[Huawei OAuth ERROR]", str(e))
         return ""

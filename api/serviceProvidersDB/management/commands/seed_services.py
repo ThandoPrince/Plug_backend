@@ -136,7 +136,7 @@ class Command(BaseCommand):
         "group_id": "PRO001",
         "name": "Professional & Business Services",
         "category": ServiceCategoryID.GENERAL,
-        "services": ["Private Tutor", "Graphic Designer", "IT Technician", "Accountant", "Translator", "Marketing Specialist", "Legal Consultant", "CV Writer"],
+        "services": ["Private Tutor", "Graphic Designer", "IT Technician", "Translator", "Marketing Specialist", "Legal Consultant", "CV Writer"],
     },
     {
         "group_id": "ENT001",

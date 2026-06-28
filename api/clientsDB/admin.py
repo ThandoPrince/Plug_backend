@@ -1,5 +1,78 @@
 from django.contrib import admin
-from .models.models import AddressSuperUserVerification, ClientDetails, ClientAuth, Address, ClientAddress, ClientLoginHistory, DeviceToken, PendingAddressApproval, ClientNotification
+from .models.models import AddressSuperUserVerification, ClientDetails, ClientAuth, Address, ClientAddress, ClientLoginHistory, ClientRegistrationHistory, DeviceToken, PendingAddressApproval, ClientNotification
+
+
+
+@admin.register(ClientRegistrationHistory)
+class ClientRegistrationHistoryAdmin(admin.ModelAdmin):
+
+    list_display = (
+        "email",
+        "mobile_number",
+        "successful",
+        "ip_address",
+        "device_name",
+        "created_at",
+    )
+
+    list_filter = (
+        "successful",
+        "created_at",
+        "ip_address",
+    )
+
+    search_fields = (
+        "email",
+        "mobile_number",
+        "ip_address",
+        "device_name",
+    )
+
+    readonly_fields = (
+        "email",
+        "mobile_number",
+        "successful",
+        "ip_address",
+        "user_agent",
+        "device_name",
+        "error_message",
+        "created_at",
+    )
+
+    ordering = ("-created_at",)
+
+class ClientLoginHistoryAdmin(admin.ModelAdmin):
+    list_display = (
+        "client",
+        "successful",
+        "ip_address",
+        "device_name",
+        "short_user_agent",
+        "created_at",
+    )
+
+    list_filter = ("successful", "created_at")
+
+    search_fields = ("identifier", "ip_address", "device_name")
+
+    readonly_fields = (
+        "client",
+        "successful",
+        "identifier",
+        "user_agent",
+        "ip_address",
+        "device_name",
+        "created_at",
+    )
+
+    ordering = ("-created_at",)
+
+    def short_user_agent(self, obj):
+        if obj.user_agent:
+            return obj.user_agent[:60] + "..."
+        return "-"
+
+    short_user_agent.short_description = "User Agent"
 
 # -----------------------------
 # ClientAuth Admin

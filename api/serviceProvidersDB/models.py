@@ -411,7 +411,8 @@ class SPLiveLocation(models.Model):
 
     class Meta:
         indexes = [
-            models.Index(fields=["provider"]),
+            models.Index(fields=["provider","latitude", "longitude"]),
+           
     ]
 
     def __str__(self):

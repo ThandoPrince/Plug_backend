@@ -1,5 +1,10 @@
 import json
+import logging
+
 from channels.generic.websocket import AsyncWebsocketConsumer
+
+
+logger = logging.getLogger(__name__)
 
 
 def safe_group_value(value: str) -> str:
@@ -15,25 +20,31 @@ def safe_group_value(value: str) -> str:
 
 
 class BaseAppConsumer(AsyncWebsocketConsumer):
-    group_prefix = None  # override in child classes
+    group_prefix = None
 
     async def connect(self):
-        email = self.scope["url_route"]["kwargs"].get("email", "")
-        self.email = email.strip().lower()
+        user_id = self.scope["url_route"]["kwargs"].get("user_id")
 
-        if not self.email or not self.group_prefix:
-            await self.close()
+        if user_id is None or self.group_prefix is None:
+            await self.close(code=4000)
             return
 
-        self.group_name = f"{self.group_prefix}_{safe_group_value(self.email)}"
+        self.user_id = int(user_id)
+        self.group_name = f"{self.group_prefix}_{self.user_id}"
 
-        await self.channel_layer.group_add(self.group_name, self.channel_name)
+        await self.channel_layer.group_add(
+            self.group_name,
+            self.channel_name,
+        )
+
         await self.accept()
 
     async def disconnect(self, close_code):
-        group_name = getattr(self, "group_name", None)
-        if group_name:
-            await self.channel_layer.group_discard(group_name, self.channel_name)
+        if hasattr(self, "group_name"):
+            await self.channel_layer.group_discard(
+                self.group_name,
+                self.channel_name,
+            )
 
     async def receive(self, text_data=None, bytes_data=None):
         if not text_data:
@@ -41,17 +52,22 @@ class BaseAppConsumer(AsyncWebsocketConsumer):
 
         try:
             data = json.loads(text_data)
+
         except json.JSONDecodeError:
+            logger.warning("Invalid websocket payload.")
+
+            await self.send_json({
+                "type": "error",
+                "message": "Invalid message format."
+            })
             return
 
-        message_type = data.get("type")
-
-        if message_type == "ping":
+        if data.get("type") == "ping":
             await self.send_json({
                 "type": "pong"
             })
 
-    async def send_json(self, payload: dict):
+    async def send_json(self, payload):
         await self.send(text_data=json.dumps(payload))
 
 
@@ -76,6 +92,18 @@ class ProviderUpdatesConsumer(BaseAppConsumer):
             "data": event["data"],
         })
 
+    async def shipment_route_updated(self, event):
+        await self.send_json({
+            "type": "shipment_route_updated",
+            "data": event["data"],
+        })
+
+    async def shipment_status_updated(self, event):
+        await self.send_json({
+            "type": "shipment_status_updated",
+            "data": event["data"],
+        })
+
 
 class ClientOrderConsumer(BaseAppConsumer):
     group_prefix = "client"
@@ -89,5 +117,17 @@ class ClientOrderConsumer(BaseAppConsumer):
     async def location_update(self, event):
         await self.send_json({
             "type": "location_update",
+            "data": event["data"],
+        })
+
+    async def shipment_route_updated(self, event):
+        await self.send_json({
+            "type": "shipment_route_updated",
+            "data": event["data"],
+        })
+
+    async def shipment_status_updated(self, event):
+        await self.send_json({
+            "type": "shipment_status_updated",
             "data": event["data"],
         })

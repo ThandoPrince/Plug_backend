@@ -13,10 +13,11 @@ class OrderStatusService:
             return order
 
         allowed_transitions = {
-            "pending": ["accepted", "declined", "canceled"],
-            "accepted": ["in_delivery","canceled"],
-            "in_delivery": ["awaiting_confirmation","canceled"],
-            "awaiting_confirmation": ["in_session","canceled"],
+            "pending": ["accepted", "declined", "canceled","rescheduled"],
+            "accepted": ["in_delivery","canceled","rescheduled"],
+            "in_delivery": ["awaiting_confirmation","canceled","rescheduled"],
+            "rescheduled": ["in_delivery", "declined", "canceled",],
+            "awaiting_confirmation": ["in_session","canceled",'rescheduled'],
             "in_session": ["awaiting_rating", "completed"],
             "awaiting_rating": ["completed"],
         }
