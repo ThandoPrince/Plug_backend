@@ -24,6 +24,7 @@ class BookingsConfig(AppConfig):
             "order.created",
             handle_order_created
         )
+        
         EventBus.register(
         "negotiation.round_created",
         handle_negotiation_round_created

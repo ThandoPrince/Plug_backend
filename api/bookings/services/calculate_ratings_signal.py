@@ -1,28 +1,62 @@
 from django.db.models.signals import post_save, post_delete
 from django.dispatch import receiver
-from django.db.models import Avg
+from django.db.models import Q, Avg, Count
 from api.bookings.models import Rating
 
 
 def update_provider_rating(provider):
-    avg = Rating.objects.filter(
+    ratings = Rating.objects.filter(
         session__shipment__service_ordered__order__provider_for_service__provider=provider,
         rater_client__isnull=False,
         score__isnull=False
-    ).aggregate(avg=Avg('score'))['avg']
+    )
 
-    provider.rating = round(avg, 2) if avg else None
+    stats = ratings.aggregate(
+        avg=Avg('score'),
+        one_star=Count('id', filter=Q(score=1)),
+        two_star=Count('id', filter=Q(score=2)),
+    )
+
+    avg = stats["avg"]
+
+    if avg is None:
+        provider.rating = None
+    else:
+        penalty = (
+            (stats["two_star"] * 0.07) +
+            (stats["one_star"] * 0.14)
+        )
+
+        provider.rating = round(max(1.0, avg - penalty), 2)
+
     provider.save(update_fields=["rating"])
 
 
 def update_client_rating(client):
-    avg = Rating.objects.filter(
+    ratings = Rating.objects.filter(
         session__shipment__service_ordered__order__client=client,
         rater_provider__isnull=False,
         score__isnull=False
-    ).aggregate(avg=Avg('score'))['avg']
+    )
 
-    client.rating = round(avg, 2) if avg else None
+    stats = ratings.aggregate(
+        avg=Avg('score'),
+        one_star=Count('id', filter=Q(score=1)),
+        two_star=Count('id', filter=Q(score=2)),
+    )
+
+    avg = stats["avg"]
+
+    if avg is None:
+        client.rating = None
+    else:
+        penalty = (
+            (stats["two_star"] * 0.05) +
+            (stats["one_star"] * 0.10)
+        )
+
+        client.rating = round(max(1.0, avg - penalty), 2)
+
     client.save(update_fields=["rating"])
 
 

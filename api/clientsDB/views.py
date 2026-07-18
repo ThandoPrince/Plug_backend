@@ -12,21 +12,22 @@ from rest_framework.parsers import MultiPartParser, FormParser
 from rest_framework.permissions import AllowAny
 from rest_framework.permissions import IsAuthenticated
 from django.db import transaction
-from api.clientsDB.services.client_ip_address_helper import get_client_ip
+from api.clientsDB.services.client_ip_address_helper import get_client_ip, get_device_info
 from api.clientsDB.services.jwt_client_authentication import ClientJWTAuthentication
 from api.clientsDB.services.sa_phone_number_helper import normalize_sa_mobile
 from plug_backend.helpers.auth_helpers import get_client_auth, get_client_details
-from plug_backend.throttles import ProfileWriteThrottle, UserReadThrottle
+from plug_backend.throttles import AuthThrottle, ProfileWriteThrottle, RegisterThrottle, UserReadThrottle
 from plug_backend.utils.client_jwt_helper import generate_client_tokens
 from django.db.models import Q
 from django.utils import timezone
 from .models.models import ClientAuth, ClientDetails, Address, ClientAddress, ClientLoginHistory, ClientNotification, ClientRegistrationHistory, DeviceToken 
-from .serializers import AddressClaimSerializer, AddressOnlySerializer, AddressVerificationCreateSerializer, ClientAddressNoDuplicatesSerializer, AddressSerializer, ClientAddressSerializerr, ClientAddressWriteSerializer, ClientAuthReadSerializer, ClientLoginSerializer, ClientProfileAppUpdateSerializer, ClientProfileSerializer, ClientRegisterSerializer, ClientSerializer, ClientAddressSerializer, DefaultAddressSerializer, DeviceTokenWriteSerializer
+from .serializers import AddressClaimSerializer, AddressOnlySerializer, AddressVerificationCreateSerializer, ClientAddressNoDuplicatesSerializer, AddressSerializer, ClientAddressSerializerr, ClientAddressWriteSerializer, ClientAuthReadSerializer, ClientLoginSerializer, ClientProfileAppUpdateSerializer, ClientProfileSerializer, ClientRegisterSerializer, ClientSerializer, ClientAddressSerializer, DefaultAddressSerializer, DeviceTokenWriteSerializer, HouseholdMemberSerializer
 from django.contrib.auth.hashers import check_password, make_password
 
 
 @api_view(["POST"])
-@throttle_classes([ProfileWriteThrottle])
+@permission_classes([AllowAny])
+@throttle_classes([AuthThrottle])
 def reset_client_password(request):
 
     try:
@@ -179,12 +180,12 @@ def reset_client_password(request):
 
     
 @api_view(['POST'])
-@throttle_classes([ProfileWriteThrottle])
+@throttle_classes([AuthThrottle])
 @permission_classes([AllowAny])
 def register_client(request):
 
     ip_address = get_client_ip(request)
-    user_agent = request.META.get("HTTP_USER_AGENT", "")
+    user_agent = get_device_info(request)
 
     try:
         serializer = ClientRegisterSerializer(data=request.data)
@@ -369,8 +370,103 @@ def get_my_profile(request):
             status=status.HTTP_500_INTERNAL_SERVER_ERROR
         )
     
+
+
+
+
+
+
+def _user_has_access(user, address_obj):
+    """
+    RLS rule:
+    User must be linked to this address OR be super user on it.
+    """
+    return ClientAddress.objects.filter(
+        client__client_profile=user,
+        address=address_obj.address,
+        is_active=True,
+    ).filter(
+        # allow normal members OR super users
+        is_super_user=True
+    ).exists() or ClientAddress.objects.filter(
+        client__client_profile=user,
+        address=address_obj.address,
+        is_active=True,
+    ).exists()
+
+
+@api_view(["GET"])
+@authentication_classes([ClientJWTAuthentication])
+@throttle_classes([UserReadThrottle])
+@permission_classes([IsAuthenticated])
+def get_household_members(request, client_address_id):
+    try:
+        selected = ClientAddress.objects.select_related(
+            "address",
+            "client",
+        ).get(
+            id=client_address_id,
+            is_active=True,
+        )
+    except ClientAddress.DoesNotExist:
+        return Response(
+            {
+                "success": False,
+                "message": "Address membership not found.",
+            },
+            status=status.HTTP_404_NOT_FOUND,
+        )
+
+  
+    if not _user_has_access(request.user, selected):
+        return Response(
+            {
+                "success": False,
+                "message": "You do not have permission to view this address.",
+            },
+            status=status.HTTP_403_FORBIDDEN,
+        )
+
+    members = (
+        ClientAddress.objects.select_related(
+            "client",
+            "client__client_profile",
+        )
+        .filter(
+            address=selected.address,
+            is_active=True,
+        )
+        .order_by(
+            "-is_owner",
+            "-house_administrator",
+            "client__first_name",
+        )
+    )
+
+    serializer = HouseholdMemberSerializer(
+        members,
+        many=True,
+        context={"request": request},
+    )
+
+    return Response(
+        {
+            "success": True,
+            "count": members.count(),
+            "data": serializer.data,
+        },
+        status=status.HTTP_200_OK,
+    )
+
+
+
+
+
+
+
+    
 @api_view(['POST'])
-@throttle_classes([ProfileWriteThrottle])
+@throttle_classes([AuthThrottle])
 @parser_classes([MultiPartParser, FormParser])
 @authentication_classes([ClientJWTAuthentication])
 @permission_classes([IsAuthenticated])
@@ -584,7 +680,7 @@ def add_residential_address(request):
     
 
 @api_view(['GET'])
-@throttle_classes([UserReadThrottle])
+@throttle_classes([AuthThrottle])
 @authentication_classes([ClientJWTAuthentication])
 @permission_classes([IsAuthenticated])
 def get_my_auth(request):
@@ -676,7 +772,7 @@ def submit_address_verification(request, client_address_id):
 
 
 @api_view(['POST'])
-@throttle_classes([ProfileWriteThrottle])
+@throttle_classes([AuthThrottle])
 @authentication_classes([ClientJWTAuthentication])
 @permission_classes([IsAuthenticated])
 def register_device_token(request):
@@ -745,12 +841,12 @@ def register_device_token(request):
 
 
 @api_view(['POST'])
-@throttle_classes([ProfileWriteThrottle])
+@throttle_classes([AuthThrottle])
 @permission_classes([AllowAny])
 def client_login(request):
 
     ip_address = get_client_ip(request)
-    user_agent = request.META.get("HTTP_USER_AGENT", "")
+    user_agent = get_device_info(request)
 
     try:
         serializer = ClientLoginSerializer(
@@ -958,6 +1054,7 @@ def address_detail(request, id, format=None):
     
     
 @api_view(["PATCH"])
+@throttle_classes([RegisterThrottle])
 @authentication_classes([ClientJWTAuthentication])
 @permission_classes([IsAuthenticated])
 def update_client_profile(request):

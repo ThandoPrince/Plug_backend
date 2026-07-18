@@ -61,6 +61,11 @@ urlpatterns = [
     path("api/clientsDB/client/profile/complete/", views.complete_profile, name="complete-client-profile"), ##used
     path("api/clientsDB/client/add-residential-address/", views.add_residential_address, name="add-residential-address"), ##used
     path("api/clientsDB/login/", views.client_login, name="client-login"),  ##used
+    path(
+        "api/client-address/<int:client_address_id>/household-members/",
+        views.get_household_members,
+        name="get_household_members",
+    ),
     path("clientsDB/address/verify/<int:client_address_id>/", views.submit_address_verification, name="client-address-verification"), ##used
     path(
     "api/client/reset-password/",
@@ -75,6 +80,7 @@ path(
         name="update_client_profile",
     ),
     
+    
 
     # Service Providers DB
     path('api/sp_profile/register/', sp_views.sp_register, name='sp_profile_register'),##used
@@ -83,6 +89,18 @@ path(
     
     path('api/sp_details/upload/', sp_views.patch_sp_profile, name='sp_details_upload'), ##used
     path('api/sp/upload/address_document/', sp_views.sp_add_address_document, name='sp_details_upload'),
+    path(
+    "provider-services/<int:provider_service_id>/affidavit/",
+    sp_views.upload_provider_service_affidavit,
+    name="upload-provider-service-affidavit",
+),
+    path(
+        "api/provider-services/<int:service_id>/qualifications/",
+        sp_views.upload_provider_qualification,
+        name="upload-provider-qualification",
+    ),
+
+
     path('api/service/upload_or_create/<int:provider_id>/', sp_views.submit_service, name='sp_service_create  '), ##used
     path('api/sp_profiles/', sp_views.sp_profile_list, name='sp_profile_list'),
     path('api/sp-profile/', sp_views.sp_profile_detail, name='sp_profile_detail'),
@@ -97,7 +115,7 @@ path(
         sp_views.get_cost_of_service_images_by_cost_id,
         name='get_cost_of_service_images_by_cost_id'
     ), ##used 
-    # path('api/service_groups/', sp_views.service_group_list, name='service_group_list'),
+    path('api/service_groups/', sp_views.service_group_list, name='service_group_list'), ##used
     # path('api/service_groups/<str:group_id>/', sp_views.service_group_detail, name='service_group_detail'),
     # path('api/services/<int:pk>/', sp_views.service_detail, name='service_detail'),
     path('api/services/', sp_views.service_list, name='service_list'), ##NEEDS TO BE CACHED
@@ -114,7 +132,7 @@ path(
     
     path('api/service_providers/', sp_views.service_provider_list_service, name='service_provider_list'),
     path('api/service_providers/<int:provider_id>/', sp_views.service_provider_detail, name='service_provider_detail_by_email'), ##used
-    path('api/service_provider_my/<int:id>/', sp_views.service_provider_details, name='service_provider_details_by_email'),
+    path('api/service_provider_my/<int:provider_id>/', sp_views.service_provider_details, name='service_provider_details_by_email'),
     path('api/service_providers/by-service/<int:service_id>/', sp_views.providers_by_service, name='service_provider_detail_by_service'), ##used
     path('api/serviceProvidersDB/address/<int:id>/', sp_views.service_provider_address_detail, name='service_provider_address'),
     path('api/serviceProvidersDB/address/', sp_views.service_provider_address, name='service_provider_address_detail'),
@@ -133,14 +151,20 @@ path(
 
 
     # Bookings
-    path('api/bookings/service_orders/', booking_views.order_service_list, name='service_order_list'),
+    path(
+        "api/bookings/service_orders/<int:order_id>/remove-invitation/",
+        booking_views.remove_from_invited_providers,
+        name="remove_from_invited_providers",
+    ),
+    # path('api/bookings/service_orders/', booking_views.order_service_list, name='service_order_list'),
     path('api/bookings/service_orders/<int:pk>/', booking_views.order_service_detail, name='service_order_detail'),
     path('api/bookings/provider_service_orders/<int:pk>/', booking_views.provider_order_service_detail, name='service_order_detail'),
     path('api/bookings/order_a_service/', booking_views.order_service_create, name='order_a_service'), ##used
-    path('api/bookings/get_shipment/by_sp_email/<str:provider_email>/', booking_views.get_shipments_by_provider, name='get_shipments_by_provider_email'),
+    path('api/bookings/get_shipment/by_sp_email/', booking_views.get_shipments_by_provider, name='get_shipments_by_provider_email'),
     path('api/bookings/get_shipment/by_shipment_id/<int:shipment_id>/', booking_views.get_shipment_by_id, name='get_shipment_by_id'), ##used
     path('api/bookings/get_shipment/by_client_email/<int:client_id>/', booking_views.get_shipments_by_client, name='get_shipments_by_client_email'), ##used
     path('api/bookings/shipment/<int:shipment_id>/route/', booking_views.shipment_routes_view, name='shipment_routes'), ##used
+    path('api/bookings/client/shipment/<int:shipment_id>/route/', booking_views.client_shipment_routes_view, name='shipment_routes'),
     path('api/bookings/shipment/<int:shipment_id>/change_status/', booking_views.change_shipment_status, name='change_shipment_status'), ##used
     path('api/bookings/shipment/<int:shipment_id>/confirm/', booking_views.confirm_shipment, name='confirm_shipment'), ##used
     path(
@@ -148,6 +172,12 @@ path(
         booking_views.patch_order_final_price,
         name='patch_order_final_price'
     ), ##used
+
+    path(
+    "api/clients/<int:client_id>/ratings/",
+    booking_views.client_ratings,
+    name="client-ratings",
+),
 
     path(
         "api/bookings/shipment/<int:shipment_id>/reschedule/",
@@ -165,6 +195,7 @@ path(
     path('api/bookings/sessions/confirm_checkin/', booking_views.confirm_checkin, name='confirm_checkin'), #used
     path('api/bookings/sessions/get_checkin_token/<int:shipment_id>/', booking_views.get_checkin_token, name='get_checkin_token'), ##used
     path('api/bookings/sessions/get_session_by_shipment/<int:shipment_id>/', booking_views.get_session_by_shipment, name='get_session_by_shipment'), ##used
+    path('api/bookings/sessions/client/get_session_by_shipment/<int:shipment_id>/', booking_views.client_get_session_by_shipment, name='get_session_by_shipment'), ##used
     path('api/bookings/sessions/geofence_check/<int:session_id>/', booking_views.session_geofence_check, name='session_geofence_check'), #used
     path('api/bookings/sessions/<int:session_id>/pings/', booking_views.session_location_pings, name='session_location_pings'), 
     path('api/bookings/sessions/<int:session_id>/latest-ping/', booking_views.session_latest_ping, name='session_latest_ping'),
@@ -177,14 +208,14 @@ path(
     path('api/bookings/client_active_orders/<int:client_id>/', booking_views.pending_orders_by_client_id, name='client_active_orders'), ##used
     path('api/bookings/get_ratings/by_client_email/<int:client_id>/', booking_views.get_ratings_by_client_email, name='client_ratings'), ##used
     path('api/bookings/get_ratings/by_provider_email/<str:email>/', booking_views.get_ratings_by_provider_email, name='provider_ratings'), #used
-    path('api/bookings/<int:session_id>/rate-provider/<str:client_email>/', booking_views.submit_client_rating, name='client_submit_rating'),  #used
-    path('api/bookings/<int:session_id>/rate-client/<str:provider_email>/', booking_views.submit_provider_rating, name='provider_submit_rating'),  #used
+    path('api/bookings/<int:session_id>/rate-provider/<str:client_id>/', booking_views.submit_client_rating, name='client_submit_rating'),  #used
+    path('api/bookings/<int:session_id>/rate-client/<int:provider_id>/', booking_views.submit_provider_rating, name='provider_submit_rating'),  #used
     path('api/bookings/cancel_order/', booking_views.cancel_order, name='client_cancel_order'), ##used
 
     # Negotiation endpoints
     path('api/bookings/service_orders/negotiations/', booking_views.negotiation_list, name='negotiation_list'),
     path('api/bookings/service_orders/negotiation/by-order/<int:order_id>/', booking_views.negotiations_by_order, name='negotiations_by_order'),  #used
-    path('api/bookings/negotiations/order/<int:order_id>/provider/<str:email>/', booking_views.negotiations_by_order_and_provider, name='negotiations_by_order_and_provider'),
+    path('api/bookings/negotiations/order/<int:order_id>/provider/', booking_views.negotiations_by_order_and_provider, name='negotiations_by_order_and_provider'),
     path('api/bookings/service_orders/negotiation/<int:pk>/', booking_views.negotiation_detail, name='negotiation_detail'),
     path('api/bookings/service_orders/negotiation/<int:negotiation_id>/provider_start_round/', booking_views.provider_start_round, name='negotiation_detail_provider_start_round'),  #used
     path('api/bookings/service_orders/negotiation/rounds/<int:negotiation_id>/', booking_views.negotiation_rounds_by_negotiation, name='negotiation_round_list'),

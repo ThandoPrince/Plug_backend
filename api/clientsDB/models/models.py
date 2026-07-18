@@ -106,6 +106,8 @@ class ClientAuth(models.Model):
         null=True,
         blank=True,db_index=True
     )
+    mfa_enabled = models.BooleanField(default=False)
+    mfa_secret = models.CharField(max_length=32, null=True, blank=True)
     last_login_at = models.DateTimeField(auto_now=True, null=True,db_index=True)
 
 
@@ -115,7 +117,8 @@ class ClientAuth(models.Model):
         ("in-details", "In-Details"),
         ("in-address", "In-Address"),
         ("completed", "Completed"),
-        ("in-kyc", "In-KYC")
+        ("in-kyc", "In-KYC"),
+        ("is_blocked", "Is-Blocked"),
     ]
     total_failed_login_attempts = models.PositiveIntegerField(
         default=0,db_index=True
@@ -341,6 +344,7 @@ class ClientAddress(models.Model):
     id = models.AutoField(primary_key=True ,db_index=True)
     is_active = models.BooleanField(default=True,db_index=True)
     date_created = models.DateTimeField(auto_now_add=True, null=True,db_index=True)
+    in_request = models.BooleanField (default=False, null=True ,db_index=True )
 
     RESIDENTIAL = "Residential Address"
     VACATION = "Vacation Address"
@@ -365,7 +369,7 @@ class ClientAddress(models.Model):
 
     is_super_user = models.BooleanField(
         default=False,
-        editable=False,db_index=True
+        editable=True,db_index=True
     )
 
     address_type = models.CharField(
@@ -387,6 +391,7 @@ class ClientAddress(models.Model):
         indexes = [
             models.Index(fields=["id","client", "address", "is_active","is_default"]),
              models.Index(fields=["id","is_default"]),
+             models.Index(fields=["id","in_request"]),
            
     ]
 

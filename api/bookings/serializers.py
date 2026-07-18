@@ -1,5 +1,7 @@
 from datetime import datetime, timedelta
-
+from decimal import Decimal
+from django.db.models import Avg
+import attrs
 from rest_framework import serializers
 from django.utils import timezone
 from django.db import transaction
@@ -7,7 +9,7 @@ from api.bookings.services.validate_booking_time_help import validate_booking_ti
 from api.serviceProvidersDB.models import ProviderService, SPProfile
 from .models import Negotiation, NegotiationRound, OrderService, BookingItem, Rating, ServicePicture, Session, SessionLocationPing, SessionToken, Shipment, ShipmentRoute
 from api.serviceProvidersDB.serializers import ClientSPProfileReadSerializer, ClientServiceSerializer, ProviderSeviceSerializer, ServiceSerializer
-from api.clientsDB.serializers import AddressOnlySerializer, ClientSerializer
+from api.clientsDB.serializers import AddressOnlySerializer, ClientBookingReadSerializer, ClientSerializer
 from api.clientsDB.models.models import ClientDetails, ClientAuth, Address
 from django.contrib.auth.hashers import make_password
 
@@ -265,7 +267,7 @@ class OrderServiceReadSerializer(serializers.ModelSerializer):
     delivery_address = AddressOnlySerializer(read_only=True)
     provider_for_service = ProviderSeviceSerializer(read_only=True)
     invited_providers = ClientSPProfileReadSerializer(many=True, read_only=True)
-    client = ClientSerializer(read_only=True)
+    client = ClientBookingReadSerializer(read_only=True)
     service_required = ServiceSerializer(read_only=True)
 
     class Meta:
@@ -349,6 +351,7 @@ class OrderServiceWriteSerializer(serializers.ModelSerializer):
             )
 
         return value
+    
 
     def validate(self, attrs):
         requested_date = attrs.get("requested_date")
@@ -383,6 +386,41 @@ class OrderServiceWriteSerializer(serializers.ModelSerializer):
                     "Booking must be scheduled at least 1 hour from now."
             })
 
+        # -----------------------------
+        # Validate proposal price
+        # -----------------------------
+        proposal_price = attrs.get("proposal_price")
+        service = attrs.get("service_required")
+        invited_providers = attrs.get("invited_providers", [])
+
+        if proposal_price and service and invited_providers:
+
+            average_price = (
+                ProviderService.objects.filter(
+                    provider__sp_profile__in=invited_providers,
+                    service=service,
+                    cost_of_service__base_price__isnull=False,
+                ).aggregate(
+                    average=Avg("cost_of_service__base_price")
+                )["average"]
+            )
+
+            if average_price is not None:
+                average_price = Decimal(str(average_price))
+                minimum_allowed = average_price * Decimal("0.30")
+
+                if proposal_price < minimum_allowed:
+                    raise serializers.ValidationError({
+                        "proposal_price": (
+                            f"The proposed price is too low. "
+                            
+                            f"Minimum allowed R{minimum_allowed:.2f}."
+                        )
+                    })
+
+                # Persist the calculated average
+                attrs["base_price"] = average_price
+
         return attrs
 
     def create(self, validated_data):
@@ -407,6 +445,19 @@ class OrderServiceWriteSerializer(serializers.ModelSerializer):
                 )
 
         return order
+    
+
+class ClientRatingSerializer(serializers.ModelSerializer):
+    
+    class Meta:
+        model = Rating
+        fields = [
+            "id",
+            "score",
+            "review",
+            "created_at",
+           
+        ]
 
     
     
@@ -630,9 +681,17 @@ class ConfirmCheckinSerializer(serializers.Serializer):
             data["expired_token"] = token
             return data
 
-        # ✅ Valid token
+        
         data["token_instance"] = token
         return data
+    
+
+class RemoveInvitedProviderSerializer(serializers.Serializer):
+    """
+    Empty serializer.
+    Provider is determined from the authenticated user.
+    """
+    pass
 
 
 class ConfirmCheckinResponseSerializer(serializers.ModelSerializer):

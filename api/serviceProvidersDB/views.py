@@ -1,10 +1,15 @@
+from datetime import timezone
 from decimal import Decimal, InvalidOperation
 import json
+import os
 import time
+
+from unittest import result
 from django.db import DatabaseError, transaction, OperationalError
 from django.db import IntegrityError, transaction
 from django.forms import ValidationError
 from django.shortcuts import get_object_or_404
+from django.core.files.storage import default_storage
 from rest_framework import status
 from rest_framework.response import Response
 from rest_framework.decorators import api_view, authentication_classes, permission_classes, throttle_classes
@@ -17,13 +22,18 @@ from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 from rest_framework.response import Response
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from api.clientsDB.models.models import ClientAddress, ClientDetails, DeviceToken
+from api.clientsDB.services.client_ip_address_helper import get_client_ip, get_device_info
 from api.clientsDB.services.jwt_client_authentication import ClientJWTAuthentication
+
+from api.serviceProvidersDB.services.affidavit_hash_calcultor import calculate_sha256
+from api.serviceProvidersDB.services.affidavit_verification_service import AIKYCClient
+from api.serviceProvidersDB.services.kyc_verification_service import KYCService
 from api.serviceProvidersDB.services.service_validator import validate_service_submission
 from api.serviceProvidersDB.services.sp_jwt_authentication import SPJWTAuthentication
 from plug_backend.helpers.auth_helpers import get_service_provider
-from plug_backend.throttles import AuthThrottle, LiveLocationReadThrottle, LiveLocationWriteThrottle, ProfileWriteThrottle, RegisterThrottle, UploadThrottle, UserReadThrottle
+from plug_backend.throttles import AuthThrottle, HeavyReadThrottle, LiveLocationReadThrottle, LiveLocationWriteThrottle, ProfileWriteThrottle, RegisterThrottle, UploadThrottle, UserReadThrottle
 from plug_backend.utils.sp_jwt_helper import generate_sp_tokens
-from .models import CostOfService, CostOfServiceImage, ProviderService, SPLiveLocation, SPLocationHistory, SPProfile, ServiceGroup, Service, ServiceProvider, Address
+from .models import CostOfService, CostOfServiceImage, ProviderLoginHistory, ProviderRegistrationHistory, ProviderService, ProviderServiceAffidavit, SPLiveLocation, SPLocationHistory, SPProfile, ServiceGroup, Service, ServiceProvider, Address
 from .serializers import (
     ClientSPProfileReadSerializer,
     ClientServiceProviderReadSerializer,
@@ -31,6 +41,8 @@ from .serializers import (
     CostOfServiceImageWriteSerializer,
     CostOfServiceSerializer,
     DeviceTokenWriteSerializer,
+    ProviderQualificationSerializer,
+    ProviderServiceAffidavitSerializer,
     ProviderSeviceSerializer,
     SPAddressDocumentWriteSerializer,
     SPLiveLocationSerializer,
@@ -47,6 +59,7 @@ from .serializers import (
     SPAddressSerializer,
     ServiceWriteSerializer
 )
+from rest_framework.exceptions import ValidationError
 
 logger = logging.getLogger(__name__)  ##do not remove
 
@@ -57,44 +70,85 @@ logger = logging.getLogger(__name__)  ##do not remove
 @throttle_classes([AuthThrottle])
 @permission_classes([AllowAny])
 def sp_login(request):
+
+    ip_address = get_client_ip(request)
+    user_agent = get_device_info(request)
+
     try:
-        serializer = SPLoginSerializer(data=request.data)
-
-        if serializer.is_valid():
-            user = serializer.validated_data["user"]
-            tokens = generate_sp_tokens(user)
-
-            return Response({
-                "success": True,
-                "message": "Login successful",
-                "data": {
-                    "email": user.email_address,
-                    "is_profile_completed": user.is_profile_completed,
-                    "access_token": tokens["access"],
-                    "refresh_token": tokens["refresh"],
-                }
-            }, status=status.HTTP_200_OK)
-
-        error_data = serializer.errors
-        first_error = (
-            next(iter(error_data.values()))[0]
-            if error_data
-            else "Invalid data"
+        serializer = SPLoginSerializer(
+            data=request.data,
+            context={"request": request}
         )
 
-        return Response({
-            "success": False,
-            "message": first_error,
-            "errors": error_data
-        }, status=status.HTTP_400_BAD_REQUEST)
+        if serializer.is_valid():
+
+            sp = serializer.validated_data["user"]
+
+            # 🔐 LOG SUCCESSFUL LOGIN
+            ProviderLoginHistory.objects.create(
+                service_provider=sp,
+                successful=True,
+                identifier=request.data.get("email"),
+                user_agent=user_agent,
+                ip_address=ip_address,
+                device_name=request.data.get("device_name")
+            )
+
+            tokens = generate_sp_tokens(sp)
+
+            return Response(
+                {
+                    "success": True,
+                    "message": "Login successful",
+                    "data": {
+                        "id": sp.id,
+                        "is_profile_completed": sp.is_profile_completed,
+                        "access_token": tokens["access"],
+                        "refresh_token": tokens["refresh"],
+                    }
+                },
+                status=status.HTTP_200_OK
+            )
+
+        # 🔐 LOG FAILED LOGIN
+        ProviderLoginHistory.objects.create(
+            service_provider=None,
+            successful=False,
+            identifier=request.data.get("email"),
+            user_agent=user_agent,
+            ip_address=ip_address,
+            device_name=request.data.get("device_name")
+        )
+
+        return Response(
+            {
+                "success": False,
+                "errors": serializer.errors
+            },
+            status=status.HTTP_400_BAD_REQUEST
+        )
 
     except Exception:
-        logger.exception("SP Login failed")
 
-        return Response({
-            "success": False,
-            "message": "Unable to process your request at this time. Please try again later."
-        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        logger.exception("SP login failed unexpectedly")
+
+        # 🔐 LOG SYSTEM FAILURE
+        ProviderLoginHistory.objects.create(
+            service_provider=None,
+            successful=False,
+            identifier=request.data.get("email"),
+            user_agent=user_agent,
+            ip_address=ip_address,
+            device_name=request.data.get("device_name")
+        )
+
+        return Response(
+            {
+                "success": False,
+                "message": "Unable to process login at this time."
+            },
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR
+        )
     
 
 
@@ -105,21 +159,26 @@ def sp_login(request):
 def sp_add_address_document(request):
     print("FILES RECEIVED:", request.FILES)
     print("POST DATA:", request.data)
-
-    address_raw = request.data.get('address')
+    address_raw = request.data.get("address")
 
     if not address_raw:
         return Response(
-            {"success": False, "message": "Address data missing"},
-            status=400
+            {
+                "success": False,
+                "message": "Address data missing",
+            },
+            status=status.HTTP_400_BAD_REQUEST,
         )
 
     try:
         address_dict = json.loads(address_raw)
     except (json.JSONDecodeError, TypeError):
         return Response(
-            {"success": False, "message": "Invalid address format"},
-            status=400
+            {
+                "success": False,
+                "message": "Invalid address format",
+            },
+            status=status.HTTP_400_BAD_REQUEST,
         )
 
     clean_data = {
@@ -128,7 +187,16 @@ def sp_add_address_document(request):
         "id_type": request.data.get("id_type"),
         "front_file": request.FILES.get("front_file"),
         "back_file": request.FILES.get("back_file"),
+        "liveness_video": request.FILES.get("liveness_video"),
     }
+    liveness = request.FILES.get("liveness_video")
+
+    if liveness:
+        print("Liveness name:", liveness.name)
+        print("Liveness size:", liveness.size)
+        print("Content type:", liveness.content_type)
+    else:
+        print("No liveness video received")
 
     serializer = SPAddressDocumentWriteSerializer(data=clean_data)
 
@@ -144,16 +212,166 @@ def sp_add_address_document(request):
                 "message": "Please check the submitted information.",
                 "errors": serializer.errors,
             },
-            status=400,
+            status=status.HTTP_400_BAD_REQUEST,
         )
+
+    def save_temp(file_obj, filename):
+        if not file_obj:
+            return None
+
+        path = f"temp/{filename}"
+        saved_path = default_storage.save(path, file_obj)
+        return default_storage.path(saved_path)
 
     try:
         with transaction.atomic():
-            service_provider = serializer.save()
+
+            # ----------------------------------
+            # Save provider + document
+            # ----------------------------------
+            result = serializer.save()
+
+            service_provider = result["provider"]
+            document = result["document"]
+
+            # ----------------------------------
+            # Save temp files
+            # ----------------------------------
+            front_path = save_temp(
+                clean_data["front_file"],
+                f"{service_provider.pk}_front.jpg"
+            )
+
+            back_path = save_temp(
+                clean_data["back_file"],
+                f"{service_provider.pk}_back.jpg"
+            )
+
+            liveness_path = save_temp(
+                clean_data["liveness_video"],
+                f"{service_provider.pk}_liveness.mp4"
+            )
+
+            # ----------------------------------
+            # Call AI
+            # ----------------------------------
+            ai_result = KYCService.verify_with_ai(
+    customer_id=service_provider.sp_profile.pk,
+    full_name=service_provider.full_name,
+    front_path=front_path,
+    back_path=back_path,
+    selfie_path=liveness_path,
+)
+
+            logger.info("AI RESULT: %s", ai_result)
+
+            if not isinstance(ai_result, dict):
+                raise ValidationError(
+                    {
+                        "kyc": "Invalid response from AI verification service."
+                    }
+                )
+
+            # ----------------------------------
+            # HTTP/API failure
+            # ----------------------------------
+            if ai_result.get("success") is False:
+
+                document.ai_response = ai_result
+                document.verification_status = "rejected"
+                document.risk_level = "high"
+                document.verification_score = ai_result.get(
+                    "face_match_score"
+                )
+
+                document.save(update_fields=[
+                    "ai_response",
+                    "verification_status",
+                    "verification_score",
+                    "risk_level",
+                ])
+
+                face_meta = ai_result.get("face_meta", {})
+
+                raise ValidationError({
+                    "kyc": {
+                        "type": face_meta.get("error_type"),
+                        "message": face_meta.get(
+                            "message",
+                            "Identity verification failed."
+                        ),
+                        "details": face_meta.get("details"),
+                        "score": ai_result.get("face_match_score"),
+                    }
+                })
+
+            # ----------------------------------
+            # Verification failed
+            # ----------------------------------
+            verification_status = ai_result.get(
+                "verification_status",
+                ""
+            ).lower()
+
+            if verification_status not in ["verified", "approved", "success"]:
+
+                document.ai_response = ai_result
+                document.verification_status = "rejected"
+                document.verification_score = ai_result.get(
+                    "face_match_score"
+                )
+                document.risk_level = ai_result.get(
+                    "risk_level",
+                    "high"
+                )
+
+                document.save(update_fields=[
+                    "ai_response",
+                    "verification_status",
+                    "verification_score",
+                    "risk_level",
+                ])
+
+                face_meta = ai_result.get("face_meta", {})
+
+                raise ValidationError({
+                    "kyc": {
+                        "type": face_meta.get("error_type"),
+                        "message": face_meta.get(
+                            "message",
+                            "Identity verification failed."
+                        ),
+                        "details": face_meta.get("details"),
+                        "score": ai_result.get("face_match_score"),
+                    }
+                })
+
+            # ----------------------------------
+            # SUCCESS
+            # ----------------------------------
+            document.ai_response = ai_result
+            document.verification_status = "verified"
+            document.verification_score = ai_result.get(
+                "face_match_score",
+                0
+            )
+            document.risk_level = ai_result.get(
+                "risk_level",
+                "low"
+            )
+
+            document.save(update_fields=[
+                "ai_response",
+                "verification_status",
+                "verification_score",
+                "risk_level",
+            ])
 
             sp_profile = service_provider.sp_profile
             sp_profile.is_profile_completed = "in-services"
-            sp_profile.save(update_fields=["is_profile_completed"])
+            sp_profile.save(update_fields=[
+                "is_profile_completed"
+            ])
 
         return Response(
             {
@@ -161,11 +379,26 @@ def sp_add_address_document(request):
                 "message": "Registration completed successfully.",
                 "provider_id": service_provider.sp_profile_id,
                 "profile_status": sp_profile.is_profile_completed,
+                "ai_result": ai_result,
             },
             status=status.HTTP_201_CREATED,
         )
 
+    except ValidationError as e:
+
+        logger.warning("KYC validation failed: %s", e.detail)
+
+        return Response(
+            {
+                "success": False,
+                "message": "KYC verification failed.",
+                "errors": e.detail,
+            },
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
     except Exception:
+
         logger.exception(
             "Failed to complete SP address document registration"
         )
@@ -173,27 +406,53 @@ def sp_add_address_document(request):
         return Response(
             {
                 "success": False,
-                "message": "Unable to complete registration at this time. Please try again later."
+                "message": "Unable to complete registration at this time.",
             },
             status=status.HTTP_500_INTERNAL_SERVER_ERROR,
         )
 
+    finally:
+        # Cleanup temp files
+        for path in [front_path, back_path, liveness_path]:
+            try:
+                if path and os.path.exists(path):
+                    os.remove(path)
+            except Exception:
+                logger.warning("Failed to delete temp file %s", path)
 
 
-@api_view(['POST'])
+@api_view(["POST"])
+@permission_classes([AllowAny])
 @throttle_classes([RegisterThrottle])
 def sp_register(request):
+
+    email = request.data.get("email_address")
+    mobile = request.data.get("mobile_number")
+
+    ip_address = get_client_ip(request)
+    user_agent = get_device_info(request)
 
     serializer = SPProfileWriteSerializer(data=request.data)
 
     if not serializer.is_valid():
+
+        ProviderRegistrationHistory.objects.create(
+            email=email,
+            mobile_number=mobile,
+            successful=False,
+            ip_address=ip_address,
+            user_agent=user_agent,
+            device_name=user_agent,
+            error_message=str(serializer.errors),
+        )
+
         return Response(
             {
                 "success": False,
                 "message": "Validation failed",
-                "errors": serializer.errors
+                "errors": serializer.errors,
             },
-            status=status.HTTP_400_BAD_REQUEST
+            status=status.HTTP_400_BAD_REQUEST,
         )
 
     try:
@@ -205,49 +464,83 @@ def sp_register(request):
 
             tokens = generate_sp_tokens(sp_profile)
 
+            ProviderRegistrationHistory.objects.create(
+                email=sp_profile.email_address,
+                mobile_number=sp_profile.mobile_number,
+                successful=True,
+                ip_address=ip_address,
+                user_agent=user_agent,
+                device_name=user_agent,
+            )
+
         return Response(
             {
                 "success": True,
                 "message": "Service Provider registered successfully.",
                 "data": {
                     "id": sp_profile.id,
-                    "email": sp_profile.email_address,
-                    "mobile": sp_profile.mobile_number,
                     "profile_status": sp_profile.is_profile_completed,
                     "access_token": tokens["access"],
                     "refresh_token": tokens["refresh"],
-                }
+                },
             },
-            status=status.HTTP_201_CREATED
+            status=status.HTTP_201_CREATED,
         )
 
     except IntegrityError:
 
+        ProviderRegistrationHistory.objects.create(
+            email=email,
+            mobile_number=mobile,
+            successful=False,
+            ip_address=ip_address,
+            user_agent=user_agent,
+            device_name=user_agent,
+            error_message="Duplicate email or mobile number.",
+        )
+
         logger.warning(
-            "Duplicate registration attempt. Email: %s, Mobile: %s",
-            request.data.get("email_address"),
-            request.data.get("mobile_number")
+            "Duplicate registration attempt. Email=%s Mobile=%s IP=%s",
+            email,
+            mobile,
+            ip_address,
         )
 
         return Response(
             {
                 "success": False,
-                "message": "An account with this email or mobile already exists."
+                "message": "An account with this email or mobile already exists.",
             },
-            status=status.HTTP_409_CONFLICT
+            status=status.HTTP_409_CONFLICT,
         )
 
-    except Exception:
+    except Exception as e:
 
-        logger.exception("SP Registration failed")
+        ProviderRegistrationHistory.objects.create(
+            email=email,
+            mobile_number=mobile,
+            successful=False,
+            ip_address=ip_address,
+            user_agent=user_agent,
+            device_name=user_agent,
+            error_message=str(e),
+        )
+
+        logger.exception(
+            "SP Registration failed. Email=%s Mobile=%s IP=%s",
+            email,
+            mobile,
+            ip_address,
+        )
 
         return Response(
             {
                 "success": False,
-                "message": "A server error occurred. Please try again later."
+                "message": "A server error occurred. Please try again later.",
             },
-            status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
         )
+    
     
 @api_view(['POST'])
 @throttle_classes([RegisterThrottle])
@@ -359,6 +652,7 @@ def patch_sp_profile(request):
 
 @api_view(["GET"])
 @authentication_classes([SPJWTAuthentication])
+@throttle_classes([HeavyReadThrottle])
 @permission_classes([IsAuthenticated])
 def approved_services_list(request):
     """
@@ -456,6 +750,7 @@ def submit_service(request, provider_id):
 
                 return Response({
                     "status": "linked_existing",
+                    "id": provider_service.id,
                     "is_primary": provider_service.is_primary,
                     "service": ServiceReadSerializer(service).data,
                     "profile_status": provider.sp_profile.is_profile_completed
@@ -495,6 +790,7 @@ def submit_service(request, provider_id):
             provider.sp_profile.save(update_fields=["is_profile_completed"])
 
             return Response({
+                "id": provider_service.id,
                 "status": validation["status"],
                 "is_primary": provider_service.is_primary,
                 "service": ServiceReadSerializer(service).data,
@@ -541,6 +837,274 @@ def submit_service(request, provider_id):
             status=status.HTTP_500_INTERNAL_SERVER_ERROR
         )
     
+
+@api_view(["POST"])
+@authentication_classes([SPJWTAuthentication])
+@throttle_classes([ProfileWriteThrottle])
+@permission_classes([IsAuthenticated])
+def upload_provider_service_affidavit(request, provider_service_id):
+
+    try:
+        provider = ServiceProvider.objects.select_related(
+            "sp_profile"
+        ).get(
+            sp_profile=request.user
+        )
+
+    except ServiceProvider.DoesNotExist:
+        return Response(
+            {
+                "success": False,
+                "message": "Provider not found."
+            },
+            status=status.HTTP_404_NOT_FOUND,
+        )
+
+    try:
+        provider_service = ProviderService.objects.get(
+            pk=provider_service_id,
+            provider=provider
+        )
+
+    except ProviderService.DoesNotExist:
+        return Response(
+            {
+                "success": False,
+                "message": "Service not found."
+            },
+            status=status.HTTP_404_NOT_FOUND,
+        )
+
+    serializer = ProviderServiceAffidavitSerializer(
+        data=request.data
+    )
+
+    if not serializer.is_valid():
+
+        return Response(
+            {
+                "success": False,
+                "errors": serializer.errors
+            },
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    print("STEP 1 - Serializer OK")
+    
+
+
+    
+
+    with transaction.atomic():
+
+        uploaded_file = serializer.validated_data["affidavit"]
+
+        # --------------------------------------------
+        # AI Verification
+        # --------------------------------------------
+        ai_result = AIKYCClient.verify_affidavit(
+            provider=provider,
+            provider_service=provider_service,
+            uploaded_file=uploaded_file,
+        )
+        print("\n========== AI RESULT ==========")
+        from pprint import pprint
+        pprint(ai_result)
+        print("================================\n")
+
+        # AI processing failed (OCR/System/etc.)
+        if not ai_result["success"]:
+            return Response(
+                {
+                    "success": False,
+                    "message": ai_result["message"],
+                    "error_type": ai_result["error_type"],
+                    "ai_result": ai_result,
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # AI rejected the affidavit
+        
+        if ai_result["verification_status"] not in ("verified", "approved"):
+            print("Verification rejected")
+            pprint(ai_result)
+
+            return Response(
+                {
+                    "success": False,
+                    "message": ai_result["message"],
+                    "ai_result": ai_result,
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # Reset file pointer after sending to AI
+        uploaded_file.seek(0)
+
+        # --------------------------------------------
+        # Calculate SHA256
+        # --------------------------------------------
+        document_hash = calculate_sha256(uploaded_file)
+
+        uploaded_file.seek(0)
+
+        # --------------------------------------------
+        # Prevent duplicate uploads
+
+        # --------------------------------------------
+
+        existing_affidavits = ProviderServiceAffidavit.objects.filter(
+    provider_service=provider_service,
+)
+        if existing_affidavits.exists():
+            print(f"Removing {existing_affidavits.count()} existing affidavit(s).")
+            existing_affidavits.delete()     
+        
+        
+        # --------------------------------------------
+        # Archive previous affidavit
+        # --------------------------------------------
+        ProviderServiceAffidavit.objects.filter(
+            provider_service=provider_service,
+            is_current=True,
+        ).update(
+            is_current=False
+        )
+
+        # --------------------------------------------
+        # Determine next version
+        # --------------------------------------------
+        latest = (
+            ProviderServiceAffidavit.objects.filter(
+                provider_service=provider_service
+            )
+            .order_by("-version")
+            .first()
+        )
+
+        version = 1 if latest is None else latest.version + 1
+
+        # --------------------------------------------
+        # Save verified affidavit
+        # --------------------------------------------
+        affidavit = ProviderServiceAffidavit.objects.create(
+    provider_service=provider_service,
+    affidavit=uploaded_file,
+    version=version,
+    is_current=True,
+    verification_status=ProviderServiceAffidavit.VerificationStatus.APPROVED,
+    document_hash=document_hash,
+    original_filename=uploaded_file.name,
+    file_size=uploaded_file.size,
+    mime_type=getattr(uploaded_file, "content_type", ""),
+    ai_confidence=ai_result["confidence_score"],
+    ai_result=ai_result,
+    verification_engine="Plug AI v1",
+)
+
+        # --------------------------------------------
+        # Update ProviderService
+        # --------------------------------------------
+        provider_service.has_uploaded_affidavit = True
+        provider_service.is_affidavit_verified = True
+
+        provider_service.save(
+            update_fields=[
+                "has_uploaded_affidavit",
+                "is_affidavit_verified",
+            ]
+        )
+
+    return Response(
+        {
+            "success": True,
+            "message": ai_result["message"],
+            "data": {
+                "affidavit_id": affidavit.affidavit_id,
+                "version": affidavit.version,
+                "verification_status": affidavit.verification_status,
+                "confidence_score": ai_result["confidence_score"],
+                "verified_at": affidavit.verified_at,
+                "ai_result": ai_result,
+            },
+        },
+        status=status.HTTP_201_CREATED,
+    )
+    
+
+@api_view(["POST"])
+@authentication_classes([SPJWTAuthentication])
+@permission_classes([IsAuthenticated])
+@throttle_classes([ProfileWriteThrottle])
+def upload_provider_qualification(request, service_id):
+
+    try:
+        provider = ServiceProvider.objects.select_related(
+            "sp_profile"
+        ).get(
+            sp_profile=request.user
+        )
+
+    except ServiceProvider.DoesNotExist:
+        return Response(
+            {
+                "success": False,
+                "message": "Provider not found.",
+            },
+            status=status.HTTP_404_NOT_FOUND,
+        )
+
+    try:
+        provider_service = ProviderService.objects.select_related(
+            "service"
+        ).get(
+            provider=provider,
+            service_id=service_id,
+        )
+
+    except ProviderService.DoesNotExist:
+        return Response(
+            {
+                "success": False,
+                "message": "You are not linked to this service.",
+            },
+            status=status.HTTP_404_NOT_FOUND,
+        )
+
+    serializer = ProviderQualificationSerializer(
+        data=request.data
+    )
+
+    if not serializer.is_valid():
+        return Response(
+            {
+                "success": False,
+                "errors": serializer.errors,
+            },
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    qualification = serializer.save(
+        provider_service=provider_service
+    )
+
+    return Response(
+        {
+            "success": True,
+            "message": "Document uploaded successfully.",
+            "data": {
+                "id": qualification.id,
+                "title": qualification.title,
+                "document_type": qualification.document_type,
+                "verification_status": qualification.verification_status,
+                "verified": qualification.verified,
+                "uploaded_at": qualification.uploaded_at,
+            },
+        },
+        status=status.HTTP_201_CREATED,
+    )
+
+
 @api_view(['PATCH'])
 @throttle_classes([ProfileWriteThrottle])
 @authentication_classes([SPJWTAuthentication])
@@ -871,6 +1435,7 @@ def upload_service_images(request, cost_id):
 
 @api_view(['GET'])
 @authentication_classes([SPJWTAuthentication])
+@throttle_classes([HeavyReadThrottle])
 @permission_classes([IsAuthenticated])
 def service_group_list(request):
 
@@ -888,9 +1453,6 @@ def service_group_list(request):
                 status=status.HTTP_200_OK
             )
 
-        
-
-
     except Exception:
         logger.error("Unexpected error in service_group_list", exc_info=True)
 
@@ -902,30 +1464,21 @@ def service_group_list(request):
             status=status.HTTP_500_INTERNAL_SERVER_ERROR
         )
 
-# @api_view(['GET', 'PUT'])
-# @throttle_classes([UserReadThrottle])
-# def service_group_detail(request, group_id):
-#     try:
-#         group = ServiceGroup.objects.get(group_id=group_id)
-#     except ServiceGroup.DoesNotExist:
-#         return Response({'error': 'Service Group not found.'}, status=status.HTTP_404_NOT_FOUND)
+@api_view(['GET'])
+@authentication_classes([SPJWTAuthentication])
+@permission_classes([IsAuthenticated])
+@throttle_classes([UserReadThrottle])
+def service_group_detail(request, group_id):
+    try:
+        group = ServiceGroup.objects.get(group_id=group_id)
+    except ServiceGroup.DoesNotExist:
+        return Response({'error': 'Service Group not found.'}, status=status.HTTP_404_NOT_FOUND)
 
-#     if request.method == 'GET':
-#         serializer = ServiceGroupSerializer(group)
-#         return Response(serializer.data)
+    if request.method == 'GET':
+        serializer = ServiceGroupSerializer(group)
+        return Response(serializer.data)
 
-#     elif request.method in ['PUT', 'PATCH']:
-#         partial = request.method == 'PATCH'
-#         serializer = ServiceGroupSerializer(group, data=request.data, partial=partial)
-#         if serializer.is_valid():
-#             serializer.save()
-#             return Response(serializer.data)
-        
-#         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
-#     elif request.method == 'DELETE':
-#         group.delete()
-#         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 # -------- Service --------

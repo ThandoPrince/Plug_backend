@@ -2,12 +2,35 @@ from rest_framework import serializers
 from django.contrib.auth.hashers import check_password, make_password
 from django.db import transaction
 import re
+from django.utils.html import strip_tags
+from django.db.models import Q
 from django.db import models
 from rest_framework import serializers
 from django.core.validators import validate_email
 from django.core.exceptions import ValidationError as DjangoValidationError
-from .models import CostOfServiceImage, DeviceToken, SPProfile
+from django.utils import timezone
+from datetime import date, timedelta
+from api.clientsDB.services.client_ip_address_helper import get_client_ip
+from api.clientsDB.services.sa_phone_number_helper import normalize_sa_mobile
+from api.serviceProvidersDB.services.sa_id_validator import SouthAfricanIDValidator
+from .models import CostOfServiceImage, DeviceToken, ProviderQualification, ProviderServiceAffidavit, SPProfile
 from .models import CostOfService, ProviderService, SPLiveLocation, SPProfile, ServiceCategory, ServiceProvider, ServiceGroup, Service, Address, SupportingDocument
+
+
+def validate_file_type(file_obj, allowed_extensions):
+    """Validate uploaded file extension against allowed types."""
+    if not file_obj:
+        return
+
+    filename = getattr(file_obj, 'name', None)
+    if not filename:
+        return
+
+    filename = filename.lower()
+    if not any(filename.endswith(ext) for ext in allowed_extensions):
+        raise serializers.ValidationError(
+            f"Invalid file type. Supported types: {', '.join(allowed_extensions)}"
+        )
 
 
 class SPProfileWriteSerializer(serializers.ModelSerializer):
@@ -32,7 +55,7 @@ class SPProfileWriteSerializer(serializers.ModelSerializer):
 
         if SPProfile.objects.filter(email_address=email).exists():
             raise serializers.ValidationError(
-                "An account with this email already exists."
+                "An account with these credentials already exists."
             )
 
         return email
@@ -130,54 +153,266 @@ class DeviceTokenWriteSerializer(serializers.ModelSerializer):
 
 
 class ServiceProviderPatchSerializer(serializers.ModelSerializer):
-    # Ensure all fields are explicitly required
-    full_name = serializers.CharField(required=True, allow_blank=False)
+
+    full_name = serializers.CharField(required=True, allow_blank=False, max_length=120)
     id_number = serializers.CharField(required=True, min_length=13, max_length=13)
     dob = serializers.DateField(required=True)
     gender = serializers.CharField(required=True)
-    sp_description = serializers.CharField(required=True)
-    location = serializers.CharField(required=False)
+    sp_description = serializers.CharField(required=True, max_length=1000)
+    location = serializers.CharField(required=False, allow_blank=True)
     profile_image = serializers.ImageField(required=True)
 
     class Meta:
         model = ServiceProvider
         fields = [
-            "full_name", "gender", "id_number", 
-            "dob", "sp_description", "location", "profile_image",
+            "full_name",
+            "gender",
+            "id_number",
+            "dob",
+            "sp_description",
+            "location",
+            "profile_image",
         ]
+
+    # -------------------------
+    # SECURITY VALIDATION
+    # -------------------------
+
+    def _sanitize_text(self, value: str) -> str:
+        """
+        Removes HTML tags and trims dangerous input patterns.
+        """
+        if not value:
+            return value
+
+        value = value.strip()
+
+        # Remove HTML tags
+        value = strip_tags(value)
+
+        # Block script-like patterns
+        blocked_patterns = [
+            r"<script.*?>",
+            r"javascript:",
+            r"onerror=",
+            r"onload=",
+        ]
+
+        for pattern in blocked_patterns:
+            if re.search(pattern, value, re.IGNORECASE):
+                raise serializers.ValidationError("Invalid characters detected in input.")
+
+        return value
+
+    def validate_full_name(self, value):
+        value = self._sanitize_text(value)
+
+        # Only allow letters, spaces, apostrophes, hyphens
+        if not re.match(r"^[a-zA-Z\s'\-]+$", value):
+            raise serializers.ValidationError(
+                "Full name contains invalid characters."
+            )
+
+        if len(value) < 2:
+            raise serializers.ValidationError("Full name is too short.")
+
+        return value
+
+    def validate_sp_description(self, value):
+        value = self._sanitize_text(value)
+
+        # Prevent extremely long or spammy payloads
+        if len(value.split()) > 300:
+            raise serializers.ValidationError("Description is too long.")
+
+        return value
+
+    def validate_profile_image(self, image):
+        """
+        Protect against malicious uploads.
+        """
+        if not image:
+            raise serializers.ValidationError("Image is required.")
+
+        # File size limit (5MB example)
+        if image.size > 5 * 1024 * 1024:
+            raise serializers.ValidationError("Image too large (max 5MB).")
+
+        # MIME type validation
+        valid_types = ["image/jpeg", "image/png", "image/webp"]
+        if hasattr(image, "content_type") and image.content_type not in valid_types:
+            raise serializers.ValidationError("Unsupported image type.")
+
+        # Basic filename sanity check
+        if ".." in image.name or "/" in image.name:
+            raise serializers.ValidationError("Invalid file name.")
+
+        return image
+
+    # -------------------------
+    # CROSS FIELD VALIDATION
+    # -------------------------
 
     def validate_id_number(self, value):
         clean_id = str(value).strip()
+
         if not clean_id.isdigit() or len(clean_id) != 13:
             raise serializers.ValidationError("SA ID must be exactly 13 digits.")
-        
+
         if ServiceProvider.objects.exclude(pk=self.instance.pk).filter(id_number=clean_id).exists():
             raise serializers.ValidationError("This ID number is already in use.")
+
         return clean_id
 
-    def validate(self, data):
-        """
-        Cross-field validation: Compare ID number with Date of Birth.
-        """
-        id_num = data.get('id_number')
-        dob = data.get('dob')
+    def validate(self, attrs):
 
-        if id_num and dob:
-            # Extract YYMMDD from ID (first 6 digits)
-            id_dob_part = id_num[:6]
-            # Format DOB from input to YYMMDD
-            expected_dob_part = dob.strftime('%y%m%d')
+        attrs = super().validate(attrs)
 
-            if id_dob_part != expected_dob_part:
+        id_number = attrs.get("id_number")
+        dob = attrs.get("dob")
+        gender = attrs.get("gender")
+
+        if not id_number:
+            return attrs
+
+        result = SouthAfricanIDValidator.validate(id_number)
+
+        if not result["valid"]:
+            raise serializers.ValidationError({
+                "id_number": result["message"]
+            })
+
+        # DOB check
+        if dob and dob != result["dob"]:
+            raise serializers.ValidationError({
+                "dob": "Date of birth does not match the South African ID number."
+            })
+
+        # Gender check
+        if gender:
+            gender_map = {
+                "m": "Male",
+                "male": "Male",
+                "f": "Female",
+                "female": "Female",
+            }
+
+            submitted_gender = gender_map.get(
+                gender.strip().lower(),
+                gender.strip().title()
+            )
+
+            if submitted_gender != result["gender"]:
                 raise serializers.ValidationError({
-                    "id_number": f"ID number ({id_dob_part}...) does not match Date of Birth ({expected_dob_part})."
+                    "gender": "Gender does not match the South African ID number."
                 })
 
-        return data
+        # Minimum age
+        if dob:
+            today = date.today()
+
+            age = (
+                today.year
+                - dob.year
+                - ((today.month, today.day) < (dob.month, dob.day))
+            )
+
+            if age < 18:
+                raise serializers.ValidationError({
+                    "dob": "You must be at least 18 years old to register."
+                })
+
+        return attrs
 
     @transaction.atomic
     def update(self, instance, validated_data):
         return super().update(instance, validated_data)
+
+class ProviderServiceAffidavitSerializer(serializers.ModelSerializer):
+
+    class Meta:
+        model = ProviderServiceAffidavit
+        fields = [
+            "affidavit",
+        ]
+
+    def validate_affidavit(self, file):
+
+        if not file:
+            raise serializers.ValidationError(
+                "Please upload an affidavit."
+            )
+
+        # Max 10 MB
+        if file.size > 10 * 1024 * 1024:
+            raise serializers.ValidationError(
+                "Affidavit must not exceed 10MB."
+            )
+
+        allowed = [
+            "application/pdf",
+            "image/jpeg",
+            "image/png",
+        ]
+
+        if (
+            hasattr(file, "content_type")
+            and file.content_type not in allowed
+        ):
+            raise serializers.ValidationError(
+                "Only PDF, JPG and PNG files are allowed."
+            )
+
+        return file
+    
+
+
+
+class ProviderQualificationSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ProviderQualification
+        fields = (
+            "document_type",
+            "title",
+            "issuing_body",
+            "issue_date",
+            "expiry_date",
+            "document",
+        )
+
+    def validate_title(self, value):
+        value = value.strip()
+        if not value:
+            raise serializers.ValidationError("Title is required.")
+        return value
+
+    def validate_document(self, value):
+        max_size = 10 * 1024 * 1024  # 10MB
+
+        if value.size > max_size:
+            raise serializers.ValidationError(
+                "Document must be smaller than 10MB."
+            )
+
+        allowed_extensions = {
+            ".pdf",
+            ".jpg",
+            ".jpeg",
+            ".png",
+            ".doc",
+            ".docx",
+        }
+
+        import os
+
+        extension = os.path.splitext(value.name)[1].lower()
+
+        if extension not in allowed_extensions:
+            raise serializers.ValidationError(
+                "Only PDF, Word documents and images are allowed."
+            )
+
+        return value
     
 
 class AddressWriteSerializer(serializers.ModelSerializer):
@@ -282,66 +517,105 @@ class ProviderServiceCostPatchSerializer(serializers.Serializer):
 class SPAddressDocumentWriteSerializer(serializers.Serializer):
     email = serializers.EmailField(write_only=True)
     address = AddressWriteSerializer()
+
     id_type = serializers.ChoiceField(
         choices=[("greenbook", "Green Book"), ("card", "ID Card")],
         required=False
     )
+
     front_file = serializers.FileField(required=True)
-    back_file = serializers.FileField(required=False, allow_null = True)
+    back_file = serializers.FileField(required=False, allow_null=True)
+
+    # 🔥 NEW: LIVENESS VIDEO
+    liveness_video = serializers.FileField(required=False, allow_null=True)
 
     def validate(self, attrs):
         id_type = attrs.get("id_type")
         front_file = attrs.get("front_file")
         back_file = attrs.get("back_file")
+        liveness_video = attrs.get("liveness_video")
 
         if not id_type:
             raise serializers.ValidationError("ID type is required.")
 
         id_type = id_type.lower()
 
+        validate_file_type(front_file, [".jpg", ".jpeg", ".png"])
+        validate_file_type(back_file, [".jpg", ".jpeg", ".png"])
+        validate_file_type(liveness_video, [".mp4", ".mov", ".avi"])
+
         if id_type == "greenbook":
             if not front_file:
                 raise serializers.ValidationError("Greenbook requires a front file.")
 
-        # If back_file is sent but empty, ignore it
-            if back_file:
-                if hasattr(back_file, "size") and back_file.size > 0:
-                    raise serializers.ValidationError(
+            if back_file and back_file.size > 0:
+                raise serializers.ValidationError(
                     "Greenbook does not require a back file."
                 )
 
         elif id_type == "card":
             if not front_file or not back_file:
                 raise serializers.ValidationError(
-                "Card requires both front and back files."
+                    "Card requires both front and back files."
+                )
+
+        
+        if id_type == "card" and not liveness_video:
+            raise serializers.ValidationError(
+                "Liveness video is required for ID Card verification."
+            )
+        if id_type == "greenbook" and not liveness_video:
+            raise serializers.ValidationError(
+                "Liveness video is required for Green Book verification."
             )
 
-        return attrs
+        if liveness_video:
+            if liveness_video.size > 10 * 1024 * 1024:
+                raise serializers.ValidationError(
+                    "Liveness video must be less than 10MB."
+                )
 
+            if liveness_video.size < 50 * 1024:
+                raise serializers.ValidationError(
+                    "Liveness video too small or invalid."
+                )
+
+        return attrs 
     def create(self, validated_data):
         address_data = validated_data.pop("address")
         email = validated_data.pop("email")
         id_type = validated_data.pop("id_type", None)
+
         front_file = validated_data.pop("front_file", None)
-        back_file = validated_data.pop("back_file")
+        back_file = validated_data.pop("back_file", None)
+        liveness_video = validated_data.pop("liveness_video", None)
 
-        provider = ServiceProvider.objects.get(sp_profile__email_address=email)
+        provider = ServiceProvider.objects.select_related(
+            "sp_profile"
+        ).get(
+            sp_profile__email_address=email
+        )
 
-        # Create Address
+        # Update provider address
         address_obj = Address.objects.create(**address_data)
         provider.location = address_obj
         provider.save(update_fields=["location"])
 
-        # Create Supporting Document if ID provided
-        if id_type:
-            SupportingDocument.objects.create(
-                provider=provider,
-                id_type=id_type.lower(),
-                front_file=front_file,
-                back_file=back_file
-            )
+        # Create KYC document
+        document = SupportingDocument.objects.create(
+            provider=provider,
+            id_type=id_type.lower(),
+            front_file=front_file,
+            back_file=back_file,
+            liveness_video=liveness_video,
+            verification_status="processing",
+        )
 
-        return provider
+        return {
+            "provider": provider,
+            "document": document,
+        }
+
 
 class CostOfServiceImageReadSerializer(serializers.ModelSerializer):
     image_url = serializers.SerializerMethodField()
@@ -366,40 +640,156 @@ class CostOfServiceImageReadSerializer(serializers.ModelSerializer):
     
 
 class SPLoginSerializer(serializers.Serializer):
-    identifier = serializers.CharField()
-    password = serializers.CharField(write_only=True)
 
-    def validate(self, attrs):
-        identifier = attrs.get("identifier")
-        password = attrs.get("password")
+    identifier = serializers.CharField(required=True, max_length=100)
+    password = serializers.CharField(write_only=True, required=True, min_length=6)
 
-        # Find user by email OR mobile number
-        try:
-            user = SPProfile.objects.get(
-                models.Q(email_address__iexact=identifier) |
-                models.Q(mobile_number=identifier)
+    def validate(self, data):
+
+        request = self.context.get("request")
+
+        # -------------------------------------------------
+        # 1. RAW INPUT
+        # -------------------------------------------------
+        raw_identifier = data.get("identifier", "").strip()
+        password = data.get("password")
+
+        if not raw_identifier:
+            raise serializers.ValidationError({
+                "non_field_errors": ["Invalid credentials."]
+            })
+
+        # -------------------------------------------------
+        # 2. IDENTITY TYPE DETECTION
+        # -------------------------------------------------
+        is_email = re.match(
+            r"^[^@\s]+@[^@\s]+\.[^@\s]+$",
+            raw_identifier
+        ) is not None
+
+        normalized_phone = None
+
+        if not is_email:
+            normalized_phone = normalize_sa_mobile(raw_identifier)
+
+        # -------------------------------------------------
+        # 3. BUILD SAFE QUERY
+        # -------------------------------------------------
+        query = Q()
+
+        if is_email:
+            query = Q(email_address__iexact=raw_identifier)
+
+        elif normalized_phone:
+            query = Q(mobile_number=normalized_phone)
+
+        else:
+            raise serializers.ValidationError({
+                "non_field_errors": ["Invalid credentials."]
+            })
+
+        user = SPProfile.objects.filter(query).first()
+
+        # -------------------------------------------------
+        # 4. GENERIC FAILURE
+        # -------------------------------------------------
+        if not user:
+            raise serializers.ValidationError({
+                "non_field_errors": ["Invalid credentials."]
+            })
+
+        now = timezone.now()
+
+        # -------------------------------------------------
+        # 5. ACCOUNT LOCK CHECK
+        # -------------------------------------------------
+        if (
+            user.account_locked_until and
+            user.account_locked_until > now
+        ):
+
+            remaining_minutes = max(
+                1,
+                int(
+                    (user.account_locked_until - now).total_seconds() / 60
+                )
             )
-        except SPProfile.DoesNotExist:
+
             raise serializers.ValidationError({
-                "identifier": "No account found with this email address or mobile number."
+                "non_field_errors": [
+                    f"Account temporarily locked. Try again in {remaining_minutes} minute(s)."
+                ]
             })
 
-        # Check password
-        if not check_password(password, user.password):
-            raise serializers.ValidationError({
-                "password": "The password you entered is incorrect."
-            })
-
-        # Check account status
+        # -------------------------------------------------
+        # 6. ACCOUNT STATUS
+        # -------------------------------------------------
         if not user.is_active:
             raise serializers.ValidationError({
-                "non_field_errors": "This account has been deactivated. Please contact support."
+                "non_field_errors": [
+                    "This account has been deactivated. Please contact support."
+                ]
             })
 
-        attrs["user"] = user
-        return attrs
-    
+        # -------------------------------------------------
+        # 7. PASSWORD CHECK
+        # -------------------------------------------------
+        if not check_password(password, user.password):
 
+            user.failed_login_attempts = (
+                user.failed_login_attempts or 0
+            ) + 1
+
+            user.total_failed_login_attempts = (
+                user.total_failed_login_attempts or 0
+            ) + 1
+
+            attempts = user.failed_login_attempts
+
+            if attempts >= 15:
+                lock_duration = timedelta(hours=24)
+
+            elif attempts >= 10:
+                lock_duration = timedelta(hours=1)
+
+            elif attempts >= 5:
+                lock_duration = timedelta(minutes=15)
+
+            else:
+                lock_duration = None
+
+            if lock_duration:
+                user.account_locked_until = now + lock_duration
+
+            user.save(update_fields=[
+                "failed_login_attempts",
+                "total_failed_login_attempts",
+                "account_locked_until",
+            ])
+
+            raise serializers.ValidationError({
+                "non_field_errors": ["Invalid credentials."]
+            })
+
+        # -------------------------------------------------
+        # 8. SUCCESS RESET
+        # -------------------------------------------------
+        user.failed_login_attempts = 0
+        user.account_locked_until = None
+        user.last_login_at = now
+
+        if request:
+            user.last_login_ip = get_client_ip(request)
+
+        user.save(update_fields=[
+            "failed_login_attempts",
+            "account_locked_until",
+            "last_login_at",
+            "last_login_ip",
+        ])
+
+        data["user"] = user
+        return data
 
 class ServiceWriteSerializer(serializers.ModelSerializer):
     class Meta:
@@ -420,7 +810,7 @@ class ClientSPProfileReadSerializer(serializers.ModelSerializer):
     class Meta:
         model = SPProfile
         # List all fields except password
-        exclude = ['password', 'email_address', 'mobile_number']
+        exclude = ['password', 'email_address', 'mobile_number','failed_login_attempts','mfa_secret','mfa_enabled','total_failed_login_attempts','account_locked_until','last_login_at','last_login_ip']
         # OR, alternatively, explicitly include fields you want:
         # fields = ['id', 'email_address', 'mobile_number', 'is_profile_completed']
         read_only_fields = [ 'is_profile_completed', 'id']

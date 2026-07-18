@@ -2,22 +2,44 @@
 
 
 from api.bookings.events.event_base import EventBus
+from api.bookings.events.order_events import ProviderDeclinedInvitationEvent
+from api.bookings.events.ws_events import notify_provider_booking_invite, notify_provider_booking_removed, notify_provider_negotiation_update
 from api.bookings.models import OrderService
+from api.bookings.serializers import NegotiationRoundReadSerializer, OrderServiceReadSerializer
 from api.clientsDB.notifications.services.notification_builder import OrderNotificationBuilder
 from api.clientsDB.notifications.services.notification_service import NotificationService
 
 
-def handle_order_created(payload):
+ACTIVE_PROVIDER_BOOKING_STATUSES = {
+    "pending",
+    "in_progress",
+    "in-negotiation",
+    "rescheduled",
+    "overdue",
+}
 
+def is_visible_to_provider(order):
+    return order.status in ACTIVE_PROVIDER_BOOKING_STATUSES
+
+
+def handle_order_created(payload):
     order = payload["order"]
 
-    invited_profiles = order.invited_providers.all()
+    if not is_visible_to_provider(order):
+        return
+
+    serializer = OrderServiceReadSerializer(order)
+    booking_payload = serializer.data
 
     notification_payload = (
         OrderNotificationBuilder.booking_invite(order)
     )
 
-    for provider in invited_profiles:
+    for provider in order.invited_providers.all():
+        notify_provider_booking_invite(
+            provider_id=provider.id,
+            payload=booking_payload,
+        )
 
         NotificationService.notify_provider(
             provider=provider,
@@ -27,6 +49,54 @@ def handle_order_created(payload):
             payload=notification_payload,
             websocket_invite=True,
         )
+
+def handle_order_updated(order):
+
+    if not is_visible_to_provider(order):
+        return
+
+    serializer = OrderServiceReadSerializer(order)
+    booking_payload = serializer.data
+
+    for provider in order.invited_providers.all():
+        notify_provider_booking_invite(
+            provider_id=provider.id,
+            payload=booking_payload,
+        )
+
+def handle_negotiation_created(payload):
+    negotiation = payload["negotiation"]
+    round = payload["round"]
+
+    provider = negotiation.provider_for_negotiation.provider.sp_profile
+
+    # Live update
+    notify_provider_negotiation_update(
+        provider_id=provider.id,
+        payload={
+            "action": "new_round",
+            "type": "negotiation_update",
+            "order_id": negotiation.service_order.order_id,
+            "negotiation_id": negotiation.negotiation_id,
+            "round": NegotiationRoundReadSerializer(round).data,
+        },
+    )
+
+    # Push notification
+    NotificationService.notify_provider(
+        
+        provider=provider,
+        notification_type="negotiation_created",
+        title="New Negotiation Message 💬",
+        body="The client sent you a new offer.",
+        payload={
+            "type": "negotiation_update",
+            "action": "new_round",
+            "order_id": negotiation.service_order.order_id,
+            "negotiation_id": negotiation.negotiation_id,
+        },
+        websocket_invite=False,
+    )
 
 
 def handle_order_cancelled(payload):
@@ -51,6 +121,8 @@ def handle_order_cancelled(payload):
 
     if not sp_profile:
         return
+    handle_order_updated(payload["order"])
+
 
     NotificationService.notify_provider(
         provider=sp_profile,
@@ -59,27 +131,36 @@ def handle_order_cancelled(payload):
         body="The client has cancelled the booking.",
         payload=OrderNotificationBuilder.order_cancelled(order),
     )
+    for provider in order.invited_providers.all():
+        notify_provider_booking_removed(
+            provider_id=provider.id,
+            order_id=order.order_id,
+        )
 
 
 
 def handle_order_accepted(payload):
 
-    order_id = payload["order_id"]
-
-    order = OrderService.objects.select_related("client").get(order_id=order_id)
+    order = payload["order"]
 
     client = getattr(order.client, "client_profile", None)
 
-    if not client:
-        return
+    handle_order_updated(payload["order"])
 
-    NotificationService.notify_client(
-        client=client,
-        notification_type="order_accepted",
-        title="Order Accepted 🛠️",
-        body="Your booking has been accepted.",
-        payload=OrderNotificationBuilder.order_accepted(order),
-    )
+    if client:
+        NotificationService.notify_client(
+            client=client,
+            notification_type="order_accepted",
+            title="Order Accepted 🛠️",
+            body="Your booking has been accepted.",
+            payload=OrderNotificationBuilder.order_accepted(order),
+        )
+
+    for provider in order.invited_providers.all():
+        notify_provider_booking_removed(
+            provider_id=provider.id,
+            order_id=order.order_id,
+        )
 
 
 def handle_provider_in_transit(payload):
@@ -175,6 +256,54 @@ def handle_order_rescheduled(payload):
         body="The client has rescheduled the booking.",
         payload=OrderNotificationBuilder.order_rescheduled(order),
     )
+    for provider in order.invited_providers.all():
+        notify_provider_booking_removed(
+            provider_id=provider.id,
+            order_id=order.order_id,
+        )
+
+def handle_provider_declined_invitation(payload):
+    order = payload["order"]
+    provider = payload["provider"]
+    order_cancelled = payload["order_cancelled"]
+
+    client = getattr(order.client, "client_profile", None)
+
+    if not client:
+        return
+
+    remaining_providers = order.invited_providers.count()
+
+    if order_cancelled:
+        NotificationService.notify_client(
+            client=client,
+            notification_type="booking_cancelled",
+            title="Booking Cancelled ❌",
+            body=(
+                "All invited providers have declined your booking. "
+                "Your booking has been cancelled."
+            ),
+            payload={
+                **OrderNotificationBuilder.booking_cancelled(order),
+                "provider_id": provider.id,
+                "remaining_providers": remaining_providers,
+            },
+        )
+    else:
+        NotificationService.notify_client(
+            client=client,
+            notification_type="provider_declined",
+            title="Provider Declined",
+            body=(
+                "One of the invited providers declined your booking. "
+                "We're still waiting for responses from the remaining providers."
+            ),
+            payload={
+                **OrderNotificationBuilder.order_updated(order),
+                "provider_id": provider.id,
+                "remaining_providers": remaining_providers,
+            },
+        )
 
 EventBus.register(
     "order.created",
@@ -194,6 +323,15 @@ EventBus.register(
 EventBus.register(
     "order.final_price_updated",
     handle_final_price_updated
+)
+EventBus.register(
+    "provider.declined_invitation",
+    handle_provider_declined_invitation
+)
+
+EventBus.register(
+    "negotiation.created",
+    handle_negotiation_created,
 )
 
 EventBus.register(

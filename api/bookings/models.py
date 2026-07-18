@@ -16,6 +16,8 @@ from api.serviceProvidersDB.notifications.services.provider_push_notification_se
 from .utils.choices import ORDER_STATUS, SESSION_STATUS, SHIPMENT_STATUS, PAYMENT_STATUS
 from django.db.models import Avg
 import json
+from datetime import datetime, timedelta
+from django.utils import timezone
 
 
 
@@ -107,6 +109,7 @@ class OrderService(models.Model):
         null=True,
         blank=True
     )
+    reschedule_count = models.PositiveSmallIntegerField(default=0)
     date_and_time_created = models.DateTimeField(auto_now_add=True)
     status = models.CharField(max_length=100, choices=ORDER_STATUS, default='pending')
     is_broadcasted = models.BooleanField(default=False)
@@ -127,6 +130,7 @@ class OrderService(models.Model):
                 .values_list('status', flat=True)
                 .first()
             )
+        self._auto_reschedule_if_needed()
 
         # 1. Save the order status change first
         super().save(*args, **kwargs)
@@ -137,8 +141,50 @@ class OrderService(models.Model):
                 self._cascade_negotiation_cancellation()
 
             self._log_order_history(old_status=old_status, new_status=self.status)
-          
-           
+
+
+
+
+    def _auto_reschedule_if_needed(self):
+        """
+        Automatically reschedule orders that are about to expire.
+
+        - If less than 10 minutes remain, move the booking forward by 1 hour.
+        - Maximum of 72 automatic reschedules (3 days).
+        - After that, mark the order as overdue.
+        """
+
+        if self.status not in ["pending", "in-negociation", "rescheduled"]:
+            return
+
+        if not self.requested_date or not self.requested_date_time:
+            return
+
+        scheduled = timezone.make_aware(
+            datetime.combine(
+                self.requested_date,
+                self.requested_date_time
+            ),
+            timezone.get_current_timezone()
+        )
+
+        minimum_time = timezone.now() + timedelta(minutes=10)
+
+        while scheduled < minimum_time:
+
+            # Already rescheduled for 3 days
+            if self.reschedule_count >= 72:
+                self.status = "overdue"
+                return
+
+            scheduled += timedelta(hours=1)
+            self.reschedule_count += 1
+
+        self.requested_date = scheduled.date()
+        self.requested_date_time = scheduled.time()
+
+        if self.status == "pending":
+            self.status = "rescheduled"         
 
     def _cascade_negotiation_cancellation(self):
         """

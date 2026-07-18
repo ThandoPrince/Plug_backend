@@ -76,17 +76,21 @@ def push_session_created(shipment_id, session):
         }
     )
 
-    def push_session_completed(session):
-        channel_layer = get_channel_layer()
+def push_session_completed(session):
+    channel_layer = get_channel_layer()
 
-        async_to_sync(channel_layer.group_send)(
+    async_to_sync(channel_layer.group_send)(
         f"shipment_route_{session.shipment.shipment_id}",
         {
             "type": "session_completed",
             "shipment_id": session.shipment.shipment_id,
             "session_id": session.session_id,
             "session_status": session.session_status,
-            "checkout_time": session.checkout_time.isoformat(),
+            "checkout_time": (
+                session.checkout_time.isoformat()
+                if session.checkout_time
+                else None
+            ),
         },
     )
 

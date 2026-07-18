@@ -7,6 +7,7 @@ ORDER_STATUS = [
     ('declined', 'Declined'),
     ('awaiting_confirmation', 'Awaiting Confirmation'),
     ('expired', 'Expired'),
+    ('overdue', 'Overdue'),
     ('completed', 'Completed'),
     ('canceled', 'Canceled'),
     ('failed', 'Failed'),

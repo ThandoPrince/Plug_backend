@@ -2,18 +2,6 @@ from asgiref.sync import async_to_sync
 from channels.layers import get_channel_layer
 
 
-def safe_group(value: str) -> str:
-    return (
-        value.strip()
-        .lower()
-        .replace("@", "_")
-        .replace(".", "_")
-        .replace("-", "_")
-        .replace("+", "_")
-        .replace(" ", "_")
-    )
-
-
 def _send_group_event(group_name: str, event_type: str, payload: dict) -> None:
     channel_layer = get_channel_layer()
 
@@ -25,34 +13,61 @@ def _send_group_event(group_name: str, event_type: str, payload: dict) -> None:
         },
     )
 
-
-def notify_provider_booking_invite(email: str, payload: dict) -> None:
+def notify_provider_booking_removed(provider_id: int, order_id: int) -> None:
     _send_group_event(
-        group_name=f"provider_{safe_group(email)}",
+        group_name=f"provider_{provider_id}",
+        event_type="booking_removed",
+        payload={
+            "order_id": order_id,
+        },
+    )
+
+
+def notify_provider_booking_invite(provider_id: int, payload: dict) -> None:
+    _send_group_event(
+        group_name=f"provider_{provider_id}",
         event_type="booking_invite",
         payload=payload,
-    )   
+    )
 
+def notify_provider_negotiation_update(provider_id, payload):
+    channel_layer = get_channel_layer()
 
-def notify_provider_booking_update(email: str, payload: dict) -> None:
+    async_to_sync(channel_layer.group_send)(
+        f"provider_{provider_id}",
+        {
+            "type": "negotiation_update",
+            "data": payload,
+        },
+    )
+
+def notify_client_location(order_id: str, payload: dict) -> None:
     _send_group_event(
-        group_name=f"provider_{safe_group(email)}",
+        group_name=f"order_{order_id}",
+        event_type="provider_location_updated",
+        payload=payload,
+    )
+
+
+def notify_provider_booking_update(provider_id: int, payload: dict) -> None:
+    _send_group_event(
+        group_name=f"provider_{provider_id}",
         event_type="booking_update",
         payload=payload,
     )
 
 
-def notify_client_booking(email: str, payload: dict) -> None:
+def notify_client_booking(client_id: int, payload: dict) -> None:
     _send_group_event(
-        group_name=f"client_{safe_group(email)}",
+        group_name=f"client_{client_id}",
         event_type="booking_update",
         payload=payload,
     )
 
 
-def notify_client_location(email: str, payload: dict) -> None:
+def notify_client_location(client_id: int, payload: dict) -> None:
     _send_group_event(
-        group_name=f"client_{safe_group(email)}",
+        group_name=f"client_{client_id}",
         event_type="location_update",
         payload=payload,
     )

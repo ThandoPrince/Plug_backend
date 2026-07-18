@@ -23,6 +23,7 @@ class ClientProfileSerializer(serializers.ModelSerializer):
         extra_kwargs = {
             'password': {'write_only': True},
         }
+    
 
     def create(self, validated_data):
         validated_data['password'] = make_password(validated_data['password'])
@@ -39,6 +40,15 @@ class ClientProfileSerializer(serializers.ModelSerializer):
 
         instance.save()
         return instance
+    
+
+class ClientProfileBookingSerializer(serializers.ModelSerializer):
+    
+
+    class Meta:
+        model = ClientAuth
+        fields = ['id']
+        
 
 
 
@@ -173,6 +183,21 @@ class ClientProfileSerializer(serializers.ModelSerializer):
 
         instance.save()
         return instance
+    
+class ClientBookingReadSerializer(serializers.ModelSerializer):
+    client_profile = ClientProfileBookingSerializer(read_only=True)  # Lock nested profiles from modifications here
+    client_pp = serializers.ImageField(required=False, allow_null=True)
+
+    class Meta:
+        model = ClientDetails
+        fields  = [
+            'first_name', 
+            'last_name', 
+            'date_of_birth', 
+            'client_profile', 
+            'rating', 
+            'client_pp'
+        ]
 
 class ClientSerializer(serializers.ModelSerializer):
     client_profile = ClientProfileSerializer(read_only=True)  # Lock nested profiles from modifications here
@@ -570,9 +595,7 @@ class ClientLoginSerializer(serializers.Serializer):
 
             raise serializers.ValidationError({
                 "non_field_errors": ["Invalid credentials."],
-                "meta": {
-                    "remaining_attempts": remaining_attempts
-                }
+                
             })
 
         # -------------------------------------------------
@@ -594,6 +617,22 @@ class ClientLoginSerializer(serializers.Serializer):
 
         data["user"] = user
         return data
+    
+
+class ClientViewSerializer(serializers.ModelSerializer):
+
+    
+
+    class Meta:
+        model = ClientDetails
+        fields = ['first_name', 'last_name', 'client_pp']
+
+class HouseholdMemberSerializer(serializers.ModelSerializer):
+    client = ClientViewSerializer()
+
+    class Meta:
+        model = ClientAddress
+        fields =  '__all__'
     
     
 class ClientProfileUpdateSerializer(serializers.ModelSerializer):
@@ -676,17 +715,45 @@ class ClientUpdateSerializer(serializers.ModelSerializer):
         return instance
 
 class AddressOnlySerializer(serializers.ModelSerializer):
-    address_type = serializers.CharField(source='clientaddress.address_type', read_only=True)
-    is_owner = serializers.BooleanField(source='clientaddress.is_owner', read_only=True)
+    address_type = serializers.CharField(
+        source="clientaddress.address_type",
+        read_only=True,
+    )
+    is_owner = serializers.BooleanField(
+        source="clientaddress.is_owner",
+        read_only=True,
+    )
+    formatted_address = serializers.SerializerMethodField()
 
     class Meta:
         model = Address
         fields = [
-            'id', 'latitude', 'longitude', 'place_id', 'street_number',
-            'route', 'locality', 'administrative_area_level_1',
-            'formatted_address', 'country', 'postal_code',
-            'address_type', 'is_owner'
+            "id",
+            "latitude",
+            "longitude",
+            "place_id",
+            "street_number",
+            "route",
+            "locality",
+            "administrative_area_level_1",
+            "formatted_address",
+            "country",
+            "postal_code",
+            "address_type",
+            "is_owner",
         ]
+
+    def get_formatted_address(self, obj):
+        return ", ".join(
+            filter(
+                None,
+                [
+                    obj.route,
+                    obj.locality,
+                    obj.administrative_area_level_1,
+                ],
+            )
+        )
 
 class AddressClaimSerializer(serializers.Serializer):
     street_number = serializers.CharField()

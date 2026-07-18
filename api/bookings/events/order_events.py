@@ -23,3 +23,13 @@ class OrderArrivedEvent(Event):
 
 class OrderRescheduledEvent(Event):
     name = "order.rescheduled"
+
+class ProviderLocationUpdatedEvent(Event):
+    name = "provider.location_updated"
+
+
+class ProviderDeclinedInvitationEvent(Event):
+    name = "provider.declined_invitation"
+
+class NegotiationCreatedEvent(Event):
+    name = "negotiation.created"

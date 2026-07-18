@@ -44,7 +44,7 @@ class NotificationService:
 
         try:
             notify_client_booking(
-                client.email_address,
+                client.id,
                 {
                     "event": "notification",
                     "notification": {
@@ -94,12 +94,12 @@ class NotificationService:
 
             if websocket_invite:
                 notify_provider_booking_invite(
-                    provider.email_address,
+                    provider.id,
                     payload
                 )
             else:
                 notify_provider_booking_update(
-                    provider.email_address,
+                    provider.id,
                     {
                         "event": "notification",
                         "notification": {

@@ -119,7 +119,7 @@ DATABASES = {
             f"{get_env('DB_PORT', '5432')}/"
             f"{get_env('DB_NAME', 'plug_db')}"
         ),
-        conn_max_age=600,
+        conn_max_age=0,
         ssl_require=False,
     )
 }
@@ -147,6 +147,9 @@ USE_TZ = True
 
 STATIC_URL = "static/"
 STATIC_ROOT = BASE_DIR / "staticfiles"
+STATICFILES_DIRS = [
+    BASE_DIR / "plug_backend" / "static",
+]
 STATICFILES_STORAGE = "whitenoise.storage.CompressedManifestStaticFilesStorage"
 
 MEDIA_URL = "/media/"

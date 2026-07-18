@@ -4,6 +4,7 @@ from django.forms import ValidationError
 from api.bookings.utils.choices import BUILDING_TYPE_CHOICES
 from django.contrib.auth.hashers import make_password
 from django.db.models import Q
+import hashlib
 from django.db import transaction
 from api.serviceProvidersDB.services.service_category_constants import RiskLevel, ServiceCategoryID, ServiceCategoryName
 
@@ -140,6 +141,43 @@ class ServiceKeyword(models.Model):
         return f"{self.keyword} ({self.risk_level})"
     
 
+    
+class ProviderRegistrationHistory(models.Model):
+
+    email = models.CharField(max_length=255, null=True, blank=True)
+    mobile_number = models.CharField(max_length=20, null=True, blank=True)
+
+    successful = models.BooleanField(default=False)
+
+    ip_address = models.GenericIPAddressField(null=True)
+    user_agent = models.TextField(blank=True, null=True)
+    device_name = models.CharField(max_length=100, blank=True, null=True)
+
+    error_message = models.TextField(blank=True, null=True)
+
+    created_at = models.DateTimeField(auto_now_add=True,null=True)
+
+    class Meta:
+        db_table = "sp_registration_history"
+
+        indexes = [
+            models.Index(fields=["email"]),
+            models.Index(fields=["mobile_number"]),
+            models.Index(fields=["ip_address"]),
+            models.Index(fields=["created_at"]),
+            models.Index(fields=["successful"]),
+        ]
+
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        status = "SUCCESS" if self.successful else "FAILED"
+        return f"{status} | {self.email or self.mobile_number} | {self.ip_address}"
+    
+
+
+    
+
 class SPProfile(models.Model):
     id = models.AutoField(primary_key=True, db_index=True)
     email_address = models.EmailField(unique=True, db_index=True)
@@ -150,14 +188,34 @@ class SPProfile(models.Model):
         ("in-address", "In-Address"),
         ("in-services", "In-Services"),
         ("in-cost", "In-Cost"),
+        ("in_verification", "In-Verification"),
         ("completed", "Completed"),
     ]
+    mfa_enabled = models.BooleanField(default=False)
+    mfa_secret = models.CharField(max_length=32, null=True, blank=True)
+    failed_login_attempts = models.PositiveIntegerField(default=0)
+    total_failed_login_attempts = models.PositiveIntegerField(default=0)
+
+    account_locked_until = models.DateTimeField(
+    null=True,
+    blank=True
+)
+
+    last_login_at = models.DateTimeField(
+    null=True,
+    blank=True
+)
+
+    last_login_ip = models.GenericIPAddressField(
+    null=True,
+    blank=True
+)
     is_profile_completed = models.CharField(default="in-details", choices=Profile_CHOICES, max_length= 20, db_index=True)
     is_active = models.BooleanField(default=True, db_index=True)
     class Meta:
         db_table = 'sp_profiles'
         indexes = [
-            models.Index(fields=['email_address', 'is_active', 'is_profile_completed'],name='sp_profile_lookup_idx'),
+            models.Index(fields=['email_address', 'is_active', 'is_profile_completed','mfa_enabled','mobile_number'],name='sp_profile_lookup_idx'),
             models.Index(fields=['id'])
         ]
 
@@ -173,6 +231,20 @@ class SPProfile(models.Model):
 
     def __str__(self):
         return f"SPProfile: {self.email_address}"
+    
+class ProviderLoginHistory(models.Model):
+    service_provider = models.ForeignKey(
+        SPProfile,
+        on_delete=models.CASCADE, null=True
+    )
+    successful = models.BooleanField(default=False)
+    identifier = models.CharField(max_length=100, null=True)
+    user_agent = models.TextField(blank=True, null=True)
+    ip_address = models.GenericIPAddressField(null=True,
+    blank=True,)
+    device_name = models.CharField(max_length=100, blank=True, null=True)
+
+
 
     
     
@@ -215,6 +287,8 @@ class DeviceToken(models.Model):
         default="firebase",
         db_index=True
     )
+    ip_address = models.GenericIPAddressField(null=True,
+    blank=True,)
 
     service_provider = models.ForeignKey(
         'SPProfile',
@@ -291,6 +365,7 @@ class ProviderService(models.Model):
         related_name='provider_services',
         db_index=True
     )
+    id = models.AutoField(primary_key=True, editable=False, db_index=True),
 
     service = models.ForeignKey(
         'Service',
@@ -305,6 +380,14 @@ class ProviderService(models.Model):
         blank=True,
         related_name='provider_service', db_index=True
     )
+    has_uploaded_affidavit = models.BooleanField(
+    default=False,
+    db_index=True,
+)
+    is_affidavit_verified = models.BooleanField(
+    default=False,
+    db_index=True,
+)
     
 
     is_primary = models.BooleanField(default=False, db_index=True)
@@ -325,6 +408,8 @@ class ProviderService(models.Model):
             models.Index(fields=['service']),
             models.Index(fields=['cost_of_service']),
             models.Index(fields=['is_primary']),
+            models.Index(fields=['is_affidavit_verified']),
+            models.Index(fields=['has_uploaded_affidavit']),
 
         ]
 
@@ -372,6 +457,214 @@ class ProviderService(models.Model):
     def __str__(self):
         return f"{self.provider.full_name} - {self.service.service_name}"
 
+
+class ProviderServiceAffidavit(models.Model):
+
+    class VerificationStatus(models.TextChoices):
+        APPROVED = "APPROVED", "Approved"
+        PENDING = "PENDING", "Pending"
+        REJECTED = "REJECTED", "Rejected"
+        EXPIRED = "EXPIRED", "Expired"
+        SUPERSEDED = "SUPERSEDED", "Superseded"
+
+    affidavit_id = models.AutoField(primary_key=True)
+
+    provider_service = models.ForeignKey(
+        "ProviderService",
+        on_delete=models.CASCADE,
+        related_name="affidavits",
+        db_index=True,
+    )
+
+    affidavit = models.FileField(
+        upload_to="provider/affidavits/%Y/%m/",
+    )
+
+    version = models.PositiveIntegerField()
+
+    is_current = models.BooleanField(
+        default=True,
+        db_index=True,
+    )
+
+    verification_status = models.CharField(
+        max_length=20,
+        choices=VerificationStatus.choices,
+        default=VerificationStatus.PENDING,
+        db_index=True,
+    )
+
+    # ---------------------------------------------------
+    # File Metadata
+    # ---------------------------------------------------
+
+    document_hash = models.CharField(
+        max_length=64,
+        unique=True,
+        editable=False,
+        db_index=True,null=True,
+    )
+
+    original_filename = models.CharField(
+        max_length=255,
+        db_index=True,null=True,
+    )
+
+    file_size = models.BigIntegerField(
+        db_index=True,null=True,
+    )
+
+    mime_type = models.CharField(
+        max_length=100,
+        db_index=True,null=True,
+    )
+
+    # ---------------------------------------------------
+    # AI Verification
+    # ---------------------------------------------------
+
+    ai_confidence = models.FloatField(
+        default=0.0,null=True,
+    )
+
+    ai_result = models.JSONField(
+        default=dict,
+        blank=True,null=True,
+    )
+
+    verification_engine = models.CharField(
+        max_length=50,
+        default="Plug AI v1",null=True,
+    )
+
+    verified_at = models.DateTimeField(
+        auto_now_add=True,null=True,
+    )
+
+    # ---------------------------------------------------
+    # Legacy Review (Audit Only)
+    # ---------------------------------------------------
+
+    review_notes = models.TextField(
+        blank=True,
+        null=True,
+    )
+
+    reviewed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="reviewed_affidavits",
+    )
+
+    class Meta:
+        ordering = ["-version"]
+
+        constraints = [
+            models.UniqueConstraint(
+                fields=["provider_service", "version"],
+                name="unique_affidavit_version",
+            ),
+            models.UniqueConstraint(
+                fields=["provider_service"],
+                condition=Q(is_current=True),
+                name="one_current_affidavit",
+            ),
+        ]
+
+    def __str__(self):
+        return (
+            f"{self.provider_service.provider.full_name} - "
+            f"{self.provider_service.service.service_name} "
+            f"(v{self.version})"
+        )
+    
+
+
+
+class ProviderQualification(models.Model):
+
+    class DocumentType(models.TextChoices):
+        QUALIFICATION = "QUALIFICATION", "Qualification"
+        CERTIFICATE = "CERTIFICATE", "Certificate"
+        LICENSE = "LICENSE", "Licence"
+        PORTFOLIO = "PORTFOLIO", "Portfolio"
+        INSURANCE = "INSURANCE", "Insurance"
+        REFERENCE = "REFERENCE", "Reference"
+        OTHER = "OTHER", "Other"
+
+    class VerificationStatus(models.TextChoices):
+        PENDING = "PENDING", "Pending"
+        APPROVED = "APPROVED", "Approved"
+        REJECTED = "REJECTED", "Rejected"
+
+    provider_service = models.ForeignKey(
+        "ProviderService",
+        on_delete=models.CASCADE,
+        related_name="qualifications",
+    )
+
+    
+
+    document_type = models.CharField(
+        max_length=30,
+        choices=DocumentType.choices,
+        default=DocumentType.QUALIFICATION,
+    )
+
+    title = models.CharField(
+        max_length=200,
+    )
+
+    issuing_body = models.CharField(
+        max_length=200,
+        blank=True,
+    )
+
+    issue_date = models.DateField(
+        null=True,
+        blank=True,
+    )
+
+    expiry_date = models.DateField(
+        null=True,
+        blank=True,
+    )
+
+    document = models.FileField(
+        upload_to="provider/qualifications/%Y/%m/",
+    )
+
+    verification_status = models.CharField(
+        max_length=20,
+        choices=VerificationStatus.choices,
+        default=VerificationStatus.PENDING,
+        db_index=True,
+    )
+
+    verified = models.BooleanField(
+        default=False,
+        db_index=True,
+    )
+
+    verified_at = models.DateTimeField(
+        null=True,
+        blank=True,
+    )
+
+    rejection_reason = models.TextField(
+        blank=True,
+        null=True,
+    )
+
+    uploaded_at = models.DateTimeField(
+        auto_now_add=True,
+    )
+
+    def __str__(self):
+        return self.title
+
     
 class SupportingDocument(models.Model):
 
@@ -379,22 +672,32 @@ class SupportingDocument(models.Model):
         ("greenbook", "Green Book"),
         ("card", "ID Card"), 
     ]
-
     provider = models.ForeignKey(
         'ServiceProvider',
         on_delete=models.CASCADE,
-        related_name='documents', db_index=True
+        related_name='documents',
+        db_index=True
     )
 
-    id_type = models.CharField(max_length=20, choices=ID_TYPE_CHOICES, default= 'card', db_index=True)
+    id_type = models.CharField(max_length=20, choices=ID_TYPE_CHOICES, default='card')
 
-    front_file = models.FileField(upload_to='sp_ids/', blank=True, null=True, db_index=True)
-    back_file = models.FileField(upload_to='sp_ids/', blank=True, null=True, db_index=True)
+    front_file = models.FileField(upload_to='sp_ids/', blank=True, null=True)
+    back_file = models.FileField(upload_to='sp_ids/', blank=True, null=True)
 
-    uploaded_at = models.DateTimeField(auto_now_add=True, db_index=True)
+    # 🔥 NEW FIELDS
+    liveness_video = models.FileField(upload_to='sp_liveness/', blank=True, null=True)
+    
+    verification_status = models.CharField(
+        max_length=20,
+        default="pending"
+    )
 
-    def __str__(self):
-        return f"{self.id_type} for {self.provider.full_name}"
+    verification_score = models.FloatField(null=True, blank=True)
+    risk_level = models.CharField(max_length=20, default="unknown")
+
+    ai_response = models.JSONField(null=True, blank=True)
+
+    uploaded_at = models.DateTimeField(auto_now_add=True)
 
 
 

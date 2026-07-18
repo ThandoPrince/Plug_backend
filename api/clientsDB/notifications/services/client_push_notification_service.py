@@ -19,6 +19,7 @@ HMS_APP_SECRET = settings.HMS_APP_SECRET
 _hms_cached_token = None
 _hms_token_expiry = 0
 
+
 ALLOWED_PROVIDERS = {"firebase", "huawei"}
 
 
@@ -90,53 +91,46 @@ def _normalize_provider(provider: str) -> str:
     return (provider or "").strip().lower()
 
 
+def _chunks(iterable, size):
+    """Yield successive chunks of given size from iterable."""
+    seq = list(iterable)
+    for i in range(0, len(seq), size):
+        yield seq[i : i + size]
+
+
 # =========================================================
 # FIREBASE
 # =========================================================
 
 def _send_firebase_batch(tokens, title, body, data, device_map):
     firebase_data = _normalize_firebase_data(data)
+    invalid_tokens = []
 
-    def send_single(token):
-        device = device_map.get(token)
-
-        try:
-            message = messaging.Message(
+    # FCM caps batch sends at 500 messages
+    for chunk in _chunks(tokens, 500):
+        messages = [
+            messaging.Message(
                 token=token,
-                notification=messaging.Notification(
-                    title=title,
-                    body=body,
-                ),
+                notification=messaging.Notification(title=title, body=body),
                 data=firebase_data,
                 android=messaging.AndroidConfig(
                     priority="high",
                     notification=messaging.AndroidNotification(
-                        sound="default",
-                        channel_id="default_channel",
+                        sound="default", channel_id="default_channel",
                     ),
                 ),
             )
+            for token in chunk
+        ]
+        response = messaging.send_each(messages)  # single batch API call
+        for token, result in zip(chunk, response.responses):
+            if not result.success:
+                error = str(result.exception).lower()
+                if any(x in error for x in ["not registered", "unregistered", "invalid registration"]):
+                    invalid_tokens.append(token)
 
-            response = messaging.send(message)
-            print(f"[Firebase SUCCESS] {response}")
-
-        except Exception as e:
-            error = str(e).lower()
-            print(f"[Firebase ERROR] {token}: {error}")
-
-            # auto-clean invalid tokens
-            if any(x in error for x in [
-                "not registered",
-                "unregistered",
-                "invalid registration",
-                "requested entity was not found",
-            ]):
-                if device:
-                    print(f"[Firebase] Deleting invalid token {device.id}")
-                    device.delete()
-
-    with ThreadPoolExecutor(max_workers=10) as executor:
-        executor.map(send_single, tokens)
+    if invalid_tokens:
+        DeviceToken.objects.filter(fcm_token__in=invalid_tokens).delete()
 
 
 # =========================================================

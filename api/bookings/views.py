@@ -9,11 +9,12 @@ from rest_framework.decorators import api_view, authentication_classes, permissi
 from rest_framework.response import Response
 from rest_framework import status
 from django.db import transaction
-from django.db.models import Exists, OuterRef
+from django.db.models import Q, Avg, Exists, OuterRef
 from api.bookings.events.event_base import EventBus
 from api.bookings.events.negotiation_events import NegotiationRoundCreatedEvent
-from api.bookings.events.order_events import OrderAcceptedEvent, OrderCancelledEvent, OrderCreatedEvent, OrderRescheduledEvent
-from api.bookings.events.websoket_event_emitters.shipment_event_emitters import push_session_created, push_shipment_status_update
+from api.bookings.events.order_events import NegotiationCreatedEvent, OrderAcceptedEvent, OrderCancelledEvent, OrderCreatedEvent, OrderRescheduledEvent, ProviderDeclinedInvitationEvent
+from api.bookings.events.websoket_event_emitters.shipment_event_emitters import push_session_completed, push_session_created, push_shipment_status_update
+from api.bookings.events.ws_events import notify_provider_booking_update
 from api.bookings.services.calculate_distance_meters import calculate_distance_meters
 from api.bookings.services.order_status_service import OrderStatusService
 from api.bookings.services.shipment_transition_function import InvalidShipmentTransition, transition_shipment
@@ -23,7 +24,7 @@ from api.clientsDB.notifications.services.notification_service import Notificati
 from api.clientsDB.services.jwt_client_authentication import ClientJWTAuthentication
 from api.serviceProvidersDB.models import ProviderService, ServiceProvider
 from api.serviceProvidersDB.services.sp_jwt_authentication import SPJWTAuthentication
-from plug_backend.helpers.auth_helpers import get_client_details
+from plug_backend.helpers.auth_helpers import get_client_details, get_sp_profile
 from plug_backend.throttles import BookingLikeWriteThrottle, HeavyReadThrottle, ProfileWriteThrottle, UserReadThrottle
 from channels.layers import get_channel_layer
 from asgiref.sync import async_to_sync
@@ -31,6 +32,7 @@ from .models import BookingItem, NegotiationRound, OrderService, Negotiation, Ra
 from .serializers import (
     CancelOrderSerializer,
     ClientRatingReadSerializer,
+    ClientRatingSerializer,
     ConfirmCheckinResponseSerializer,
     ConfirmCheckinSerializer,
     NegotiationRoundWriteSerializer,
@@ -45,6 +47,7 @@ from .serializers import (
     NegotiationRoundReadSerializer,
     RatingReadSerializer,
     RatingWriteSerializer,
+    RemoveInvitedProviderSerializer,
     SessionLocationPingReadSerializer,
     SessionLocationPingWriteSerializer,
     SessionReadSerializer,
@@ -70,7 +73,7 @@ def order_service_list(request):
 
 
 @api_view(['POST'])
-@throttle_classes([HeavyReadThrottle])
+@throttle_classes([BookingLikeWriteThrottle])
 @authentication_classes([ClientJWTAuthentication])
 @permission_classes([IsAuthenticated])
 def order_service_create(request):
@@ -87,80 +90,107 @@ def order_service_create(request):
     else:
         data["invited_providers"] = []
 
-    # 3. Explicitly re-attach files since request.data.dict() only captures the last item in a file list
+    # 3. Re-attach uploaded files
     if request.FILES:
         data["service_pictures"] = request.FILES.getlist("service_pictures")
 
-    # 4. Initialize serializer with clean python data structures
     serializer = OrderServiceWriteSerializer(
         data=data,
-        context={"request": request}
+        context={"request": request},
     )
 
     if not serializer.is_valid():
         return Response(
             serializer.errors,
-            status=status.HTTP_400_BAD_REQUEST
+            status=status.HTTP_400_BAD_REQUEST,
         )
 
     with transaction.atomic():
         order = serializer.save()
 
-    transaction.on_commit(
-        lambda: EventBus.emit(
-            OrderCreatedEvent({
-                "order_id": order.order_id
-            })
-        )
+        transaction.on_commit(
+    lambda: EventBus.emit(
+        OrderCreatedEvent({
+            "order": order,
+        })
     )
-
-    read_serializer = OrderServiceReadSerializer(order)
-
+)
     return Response(
-        read_serializer.data,
-        status=status.HTTP_201_CREATED
+        OrderServiceReadSerializer(order).data,
+        status=status.HTTP_201_CREATED,
     )
 
 
-@api_view(['GET', 'PUT', 'PATCH'])
+@api_view(["GET"])
+@throttle_classes([HeavyReadThrottle])
+@authentication_classes([SPJWTAuthentication])
+@permission_classes([IsAuthenticated])
+def client_ratings(request, client_id):
+    ratings = (
+        Rating.objects
+        .filter(
+            session__shipment__service_ordered__order__client__client_profile_id=client_id,
+            score__isnull=False,
+        )
+        .order_by("-created_at")
+    )
+
+    serializer = ClientRatingSerializer(
+        ratings[:3],  # Only the latest 3 reviews
+        many=True,
+        context={"request": request},
+    )
+
+    return Response({
+        "average_rating": ratings.aggregate(
+            average=Avg("score")
+        )["average"] or 0,
+        "total_reviews": ratings.count(),
+        "ratings": serializer.data,
+    })
+    
+
+@api_view(['GET'])
 @throttle_classes([HeavyReadThrottle])
 @authentication_classes([ClientJWTAuthentication])
 @permission_classes([IsAuthenticated])
 def order_service_detail(request, pk):
-    """Retrieve, update, or delete a specific order"""
-    order = get_object_or_404(OrderService, pk=pk)
+    """Retrieve a specific order belonging to the authenticated client."""
 
-    if request.method == 'GET':
-        serializer = OrderServiceReadSerializer(order)
-        return Response(serializer.data)
+    client = get_client_details(request)
 
-    elif request.method in ['PUT', 'PATCH']:
-        serializer = OrderServiceWriteSerializer(order, data=request.data, partial=(request.method == 'PATCH'), context={'request': request})
-        if serializer.is_valid():
-            order = serializer.save()
-            read_serializer = OrderServiceReadSerializer(order)
-            return Response(read_serializer.data)
-        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+    order = get_object_or_404(
+        OrderService,
+        pk=pk,
+        client=client,
+    )
+
+    serializer = OrderServiceReadSerializer(order)
+    return Response(serializer.data)
+
     
-@api_view(['GET', 'PUT', 'PATCH'])
+    
+@api_view(['GET'])
 @throttle_classes([HeavyReadThrottle])
 @authentication_classes([SPJWTAuthentication])
 @permission_classes([IsAuthenticated])
 def provider_order_service_detail(request, pk):
-    """Retrieve, update, or delete a specific order"""
-    order = get_object_or_404(OrderService, pk=pk)
+    """Retrieve a specific order belonging to the authenticated provider."""
 
-    if request.method == 'GET':
-        serializer = OrderServiceReadSerializer(order)
-        return Response(serializer.data)
+    provider = get_sp_profile(request)
 
-    elif request.method in ['PUT', 'PATCH']:
-        serializer = OrderServiceWriteSerializer(order, data=request.data, partial=(request.method == 'PATCH'), context={'request': request})
-        if serializer.is_valid():
-            order = serializer.save()
-            read_serializer = OrderServiceReadSerializer(order)
-            return Response(read_serializer.data)
-        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+    order = get_object_or_404(
+        OrderService.objects.filter(
+            
+            Q(invited_providers=provider)
+        ).distinct(),
+        pk=pk,
+    )
+
+    serializer = OrderServiceReadSerializer(order)
+    return Response(serializer.data)
+
+  
 
  
 
@@ -172,9 +202,21 @@ def provider_order_service_detail(request, pk):
 @authentication_classes([SPJWTAuthentication])
 @permission_classes([IsAuthenticated])
 def negotiation_list(request):
-    """List all negotiations"""
-    negotiations = Negotiation.objects.all()
-    serializer = NegotiationReadSerializer(negotiations, many=True)
+    """List negotiations belonging to the authenticated provider."""
+
+    provider = get_provider_profile(request)
+
+    negotiations = (
+        Negotiation.objects
+        .filter(provider_for_negotiation__provider=provider)
+        .distinct()
+    )
+
+    serializer = NegotiationReadSerializer(
+        negotiations,
+        many=True,
+    )
+
     return Response(serializer.data)
 
 
@@ -344,69 +386,105 @@ def reject_negotiation(request, negotiation_id):
 @authentication_classes([SPJWTAuthentication])
 @permission_classes([IsAuthenticated])
 def provider_accept_negotiation(request, negotiation_id):
+    """
+    Accept a negotiation for the authenticated provider only.
+    """
 
-    negotiation = get_object_or_404(
-        Negotiation,
-        pk=negotiation_id
-    )
+    try:
+        profile = get_sp_profile(request)
+        provider = ServiceProvider.objects.get(sp_profile=profile)
 
-    order = negotiation.service_order
-
-    if order.status == 'accepted':
-        return Response(
-            {"detail": "This order has already been accepted."},
-            status=status.HTTP_200_OK
+        negotiation = get_object_or_404(
+            Negotiation.objects.select_related(
+                "service_order",
+                "provider_for_negotiation__provider__sp_profile",
+            ),
+            pk=negotiation_id,
+            provider_for_negotiation__provider=provider,
         )
 
-    provider_service = negotiation.provider_for_negotiation
+        order = negotiation.service_order
 
-    if not provider_service:
-        return Response(
-            {"detail": "No provider assigned to this negotiation."},
-            status=status.HTTP_400_BAD_REQUEST
-        )
-
-    with transaction.atomic():
-
-        negotiation.provider_response_price = (
-            negotiation.provider_response_price
-            or negotiation.proposed_price
-        )
-
-        negotiation.status = 'accepted'
-        negotiation.last_responder = 'provider'
-        negotiation.save()
-
-        order.final_price = negotiation.provider_response_price
-        order.provider_for_service = provider_service
-        order.is_negotiated = True
-        order.status = 'accepted'
-        order.save()
-
-        order.invited_providers.clear()
-
-        transaction.on_commit(
-            lambda: EventBus.emit(
-                OrderAcceptedEvent(
-                    order=order,
-                    negotiation=negotiation,
-                    provider_service=provider_service,
-                )
+        if order.status == "accepted":
+            return Response(
+                {"detail": "This order has already been accepted."},
+                status=status.HTTP_200_OK,
             )
+
+        provider_service = negotiation.provider_for_negotiation
+
+        if provider_service is None:
+            return Response(
+                {"detail": "No provider assigned to this negotiation."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        with transaction.atomic():
+
+            negotiation.provider_response_price = (
+                negotiation.provider_response_price
+                or negotiation.proposed_price
+            )
+
+            negotiation.status = "accepted"
+            negotiation.last_responder = "provider"
+            negotiation.save()
+
+            order.final_price = negotiation.provider_response_price
+            order.provider_for_service = provider_service
+            order.is_negotiated = True
+            order.status = "accepted"
+            order.save()
+
+            order.invited_providers.clear()
+
+            transaction.on_commit(
+    lambda: (
+        EventBus.emit(
+            OrderAcceptedEvent({
+                "order": order,
+                "negotiation": negotiation,
+                "provider_service": provider_service,
+            })
+        ),
+        
+        notify_provider_booking_update(
+            provider_id=provider.sp_profile.id,
+            payload=OrderServiceReadSerializer(order).data,
+        ),
+    )
+)
+
+        return Response(
+            {
+                "detail": "Negotiation accepted successfully.",
+                "order_id": order.order_id,
+                "final_price": order.final_price,
+                "provider_id": provider.sp_profile.id,
+            },
+            status=status.HTTP_200_OK,
         )
 
-    return Response(
-        {
-            "detail": "Negotiation accepted successfully.",
-            "order_id": order.order_id,
-            "final_price": order.final_price,
-            "provider": (
-                provider_service.provider.sp_profile.email_address
-            )
-        },
-        status=status.HTTP_200_OK
-    )
+    except ObjectDoesNotExist as e:
+        logger.warning(
+            "Provider lookup failed for user_id=%s: %s",
+            request.user.id,
+            str(e),
+        )
+        return Response(
+            {"error": str(e)},
+            status=status.HTTP_404_NOT_FOUND,
+        )
 
+    except Exception:
+        logger.exception(
+            "Unexpected error accepting negotiation for user_id=%s",
+            request.user.id,
+        )
+        return Response(
+            {"error": "An unexpected error occurred while accepting the negotiation."},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
 
 
 
@@ -428,7 +506,7 @@ def negotiations_by_order(request, order_id):
             client=client   # or client_fk depending on schema
         )
 
-        allowed_statuses = ['pending', 'in-negotiation']
+        allowed_statuses = ['pending', 'in-negotiation','rescheduled']
 
         if order.status not in allowed_statuses:
             return Response(
@@ -472,15 +550,45 @@ def negotiations_by_order(request, order_id):
 @authentication_classes([SPJWTAuthentication])
 @permission_classes([IsAuthenticated])
 @throttle_classes([HeavyReadThrottle])
-def negotiations_by_order_and_provider(request, order_id, email):
-    """Get all negotiations for a specific order and provider email"""
-    order = get_object_or_404(OrderService, pk=order_id)
-    negotiations = Negotiation.objects.filter(
-        service_order=order,
-        provider_for_negotiation__provider__sp_profile__email_address=email
-    ).order_by('-created_at')
-    serializer = NegotiationReadSerializer(negotiations, many=True)
-    return Response(serializer.data)
+def negotiations_by_order_and_provider(request, order_id):
+    """
+    Get all negotiations for a specific order belonging to the authenticated provider.
+    """
+    try:
+        profile = get_sp_profile(request)
+        provider = ServiceProvider.objects.get(sp_profile=profile)
+
+        order = get_object_or_404(OrderService, pk=order_id)
+
+        negotiations = Negotiation.objects.filter(
+            service_order=order,
+            provider_for_negotiation__provider=provider,
+        ).order_by("-created_at")
+
+        serializer = NegotiationReadSerializer(negotiations, many=True)
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+    except ObjectDoesNotExist as e:
+        logger.warning(
+            "Negotiation lookup failed for user_id=%s: %s",
+            request.user.id,
+            str(e),
+        )
+        return Response(
+            {"error": str(e)},
+            status=status.HTTP_404_NOT_FOUND,
+        )
+
+    except Exception:
+        logger.exception(
+            "Unexpected error retrieving negotiations for user_id=%s",
+            request.user.id,
+        )
+        return Response(
+            {"error": "An unexpected error occurred while retrieving negotiations."},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
+
 
 
 @api_view(['GET'])
@@ -490,8 +598,8 @@ def negotiations_by_order_and_provider(request, order_id, email):
 def bookings_by_invited_provider(request, id):
     """Get all bookings where the given provider email is invited"""
     orders = OrderService.objects.filter(
-        invited_providers__provider__sp_profile__id=id,
-        status__in=['pending', 'in_progress', 'in-negotiation']
+        invited_providers__id=id,
+        status__in=['pending', 'in_progress', 'in-negotiation','rescheduled']
     ).distinct().order_by('-date_and_time_created')
 
     serializer = OrderServiceReadSerializer(orders, many=True)
@@ -607,7 +715,7 @@ def pending_orders_by_client_id(request, client_id):
 
         orders = OrderService.objects.filter(
             client=client,
-            status__in=['pending', 'in-negotiation']
+            status__in=['pending', 'in-negotiation','rescheduled','overdue']
         ).annotate(
             in_negotiation=Exists(negotiation_subquery)
         ).order_by('-date_and_time_created')
@@ -630,6 +738,73 @@ def pending_orders_by_client_id(request, client_id):
             },
             status=status.HTTP_500_INTERNAL_SERVER_ERROR
         )
+    
+
+
+
+@api_view(['POST'])
+@authentication_classes([SPJWTAuthentication])
+@permission_classes([IsAuthenticated])
+@throttle_classes([HeavyReadThrottle])
+def remove_from_invited_providers(request, order_id):
+    """
+    Allows the authenticated provider to remove themselves
+    from an order's invited providers list.
+
+    If no invited providers remain, the order is automatically cancelled.
+    """
+
+    order = get_object_or_404(OrderService, pk=order_id)
+
+    serializer = RemoveInvitedProviderSerializer(data=request.data)
+    serializer.is_valid(raise_exception=True)
+
+    provider = request.user
+
+    if not order.invited_providers.filter(pk=provider.pk).exists():
+        return Response(
+            {
+                "error": "You are not an invited provider for this order."
+            },
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    with transaction.atomic():
+        # Remove the provider
+        order.invited_providers.remove(provider)
+        order_cancelled = False
+
+        # Cancel the order if nobody is left to invite
+        if not order.invited_providers.exists():
+            order.status = "cancelled"
+            order.save(update_fields=["status"])
+            order_cancelled = True
+
+
+        payload = OrderServiceReadSerializer(order).data
+
+        transaction.on_commit(
+            lambda: notify_provider_booking_update(
+                provider_id=provider.id,
+                payload=payload,
+            )
+        )
+        EventBus.emit(
+        ProviderDeclinedInvitationEvent({
+            "order": order,
+            "provider": provider,
+            "order_cancelled": order_cancelled,
+        })
+    )
+
+    return Response(
+        {
+            "message": "You have successfully removed yourself from this booking invitation.",
+            "order_status": order.status,
+        },
+        status=status.HTTP_200_OK,
+    )
+
 
 @api_view(['POST'])
 @authentication_classes([SPJWTAuthentication])
@@ -642,6 +817,12 @@ def provider_start_round(request, negotiation_id):
     """
     negotiation = get_object_or_404(Negotiation, pk=negotiation_id)
     order = negotiation.service_order
+
+    if negotiation.provider_for_negotiation.provider.sp_profile.id != request.user.id:
+        return Response(
+            {"detail": "You do not have permission to modify this order."},
+            status=status.HTTP_403_FORBIDDEN
+        )
 
     # Prevent negotiation if order or negotiation is already finalized
     if order.status in ['accepted', 'cancelled'] or negotiation.status in ['accepted', 'cancelled']:
@@ -670,12 +851,20 @@ def provider_start_round(request, negotiation_id):
             offered_price=offered_price,
             message=message,
         )
+
+        transaction.on_commit(
+    lambda: notify_provider_booking_update(
+        provider_id=negotiation.provider_for_negotiation.provider.sp_profile.id,
+        payload=OrderServiceReadSerializer(order).data,
+    )
+)
         EventBus.emit(
-    NegotiationRoundCreatedEvent(
-        negotiation=negotiation,
-        round=new_round,
-        sender_type="provider",
-    ))
+    NegotiationRoundCreatedEvent({
+        "negotiation": negotiation,
+        "round": new_round,
+        "sender_type": "provider",
+    })
+)
         channel_layer = get_channel_layer()
 
         async_to_sync(channel_layer.group_send)(
@@ -813,20 +1002,15 @@ def client_start_round(request, negotiation_id):
                 message=message,
             )
 
-        # 📡 WebSocket broadcast (real-time update)
-        try:
-            channel_layer = get_channel_layer()
+            EventBus.emit(
+    NegotiationCreatedEvent({
+        "negotiation": negotiation,
+        "round": new_round,
+    })
+)
 
-            async_to_sync(channel_layer.group_send)(
-                f"negotiation_{negotiation.negotiation_id}",
-                {
-                    "type": "negotiation_counter_offer",
-                    "negotiation_id": negotiation.negotiation_id,
-                    "data": NegotiationRoundReadSerializer(new_round).data
-                }
-            )
-        except Exception:
-            logger.exception("WebSocket broadcast failed (client counter offer)")
+      
+        
 
         # ✅ response
         return Response(
@@ -897,6 +1081,7 @@ def accepted_orders_by_provider(request):
     
 @api_view(['GET'])
 @throttle_classes([HeavyReadThrottle])
+@authentication_classes([SPJWTAuthentication])
 @permission_classes([IsAuthenticated])
 def get_shipment_by_id(request, shipment_id):
     """
@@ -915,51 +1100,72 @@ def get_shipment_by_id(request, shipment_id):
     return Response(serializer.data, status=status.HTTP_200_OK)
 
 
-
+from django.core.exceptions import ObjectDoesNotExist
 @api_view(['GET'])
 @throttle_classes([HeavyReadThrottle])
 @authentication_classes([SPJWTAuthentication])
 @permission_classes([IsAuthenticated])
-def get_shipments_by_provider(request, provider_email):
+def get_shipments_by_provider(request):
     """
-    Returns all shipments for a given provider based on provider email
-    filtered by specific statuses.
+    Returns all active shipments for the authenticated provider.
     """
 
-    # 1️⃣ Find the ServiceProvider
     try:
-        provider = ServiceProvider.objects.get(
-            sp_profile__email_address=provider_email
+        profile = get_sp_profile(request)
+        provider = ServiceProvider.objects.get(sp_profile=profile)
+
+        provider_services = ProviderService.objects.filter(
+            provider=provider
         )
-    except ServiceProvider.DoesNotExist:
-        return Response({"error": "Provider not found."}, status=status.HTTP_404_NOT_FOUND)
 
-    # 2️⃣ Get all ProviderService instances for this provider
-    provider_services = ProviderService.objects.filter(provider=provider)
+        provider_orders = OrderService.objects.filter(
+            provider_for_service__in=provider_services
+        )
 
-    # 3️⃣ Get all OrderService instances assigned to these provider_services
-    provider_orders = OrderService.objects.filter(provider_for_service__in=provider_services)
+        booking_items = BookingItem.objects.filter(
+            order__in=provider_orders
+        )
 
-    # 4️⃣ Get BookingItems linked to these orders
-    booking_items = BookingItem.objects.filter(order__in=provider_orders)
+        shipments = Shipment.objects.filter(
+            service_ordered__in=booking_items,
+            shipment_status__in=[
+                "Pending",
+                "in_transit",
+                "arrived",
+                "delivered",
+                "in_session",
+            ],
+        ).order_by("-created_at")
 
-    # 5️⃣ Get all Shipments linked to these booking items with specific statuses
-    shipments = Shipment.objects.filter(
-        service_ordered__in=booking_items,
-        shipment_status__in=[
-            "Pending",
-            "in_transit",
-            "arrived",
-            "delivered",
-            "in_session"
-        ]
-    ).order_by('-created_at')  # newest first
+        serializer = ShipmentReadSerializer(shipments, many=True)
+        return Response(serializer.data, status=status.HTTP_200_OK)
 
-    # 6️⃣ Serialize and return
-    serializer = ShipmentReadSerializer(shipments, many=True)
-    return Response(serializer.data, status=status.HTTP_200_OK)
+    except ObjectDoesNotExist as e:
+        logger.warning(
+            "Provider lookup failed for user_id=%s: %s",
+            request.user.id,
+            str(e),
+        )
 
+        return Response(
+            {"error": str(e)},
+            status=status.HTTP_404_NOT_FOUND,
+        )
 
+    except Exception:
+        logger.exception(
+            "Unexpected error while retrieving shipments for user_id=%s",
+            request.user.id,
+        )
+
+        return Response(
+            {
+                "error": "An unexpected error occurred while retrieving shipments."
+            },
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
+    
+    
 
 @api_view(['GET'])
 @throttle_classes([HeavyReadThrottle])
@@ -1031,6 +1237,16 @@ def change_shipment_status(request, shipment_id):
     shipment = get_object_or_404(Shipment, pk=shipment_id)
 
     new_status = request.data.get("status")
+    provider = request.user
+
+    shipment = get_object_or_404(
+        Shipment.objects.select_related(
+            "service_ordered__order__provider_for_service"
+        ),
+        shipment_id=shipment_id,
+        service_ordered__order__provider_for_service__provider__sp_profile=provider,
+    )
+
 
     if not new_status:
         return Response(
@@ -1054,52 +1270,100 @@ def change_shipment_status(request, shipment_id):
         status=status.HTTP_200_OK
     )
 
-
-
-
-
 @api_view(["GET"])
 @authentication_classes([ClientJWTAuthentication])
 @permission_classes([IsAuthenticated])
 @throttle_classes([HeavyReadThrottle])
-# @permission_classes([IsAuthenticated])
+def client_shipment_routes_view(request, shipment_id):
+    """
+    GET  -> List routes for a shipment
+    POST -> Create a new route for a shipment
+    """
+
+    client = request.user
+
+    shipment = get_object_or_404(
+        Shipment.objects.select_related(
+            "service_ordered__order__provider_for_service"
+        ),
+        shipment_id=shipment_id,
+        service_ordered__order__client__client_profile=client,
+    )
+
+    # --------------------
+    # GET
+    # --------------------
+    if request.method == "GET":
+        routes = ShipmentRoute.objects.filter(
+            shipment=shipment
+        ).order_by("-created_at")
+
+        serializer = ShipmentRouteReadSerializer(routes, many=True)
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+
+
+    return Response(
+        serializer.errors,
+        status=status.HTTP_400_BAD_REQUEST,
+    )
+
+
+
+
+@api_view(["GET", "POST"])
+@authentication_classes([SPJWTAuthentication])
+@permission_classes([IsAuthenticated])
+@throttle_classes([HeavyReadThrottle])
 def shipment_routes_view(request, shipment_id):
     """
     GET  -> List routes for a shipment
     POST -> Create a new route for a shipment
     """
 
+    provider = request.user
+
+    shipment = get_object_or_404(
+        Shipment.objects.select_related(
+            "service_ordered__order__provider_for_service"
+        ),
+        shipment_id=shipment_id,
+        service_ordered__order__provider_for_service__provider__sp_profile=provider,
+    )
+
     # --------------------
-    # GET: Read routes
+    # GET
     # --------------------
     if request.method == "GET":
         routes = ShipmentRoute.objects.filter(
-            shipment_id=shipment_id
+            shipment=shipment
         ).order_by("-created_at")
 
         serializer = ShipmentRouteReadSerializer(routes, many=True)
         return Response(serializer.data, status=status.HTTP_200_OK)
 
     # --------------------
-    # POST: Create route
+    # POST
     # --------------------
-    if request.method == "POST":
-        data = request.data.copy()
-        data["shipment_id"] = shipment_id
+    data = request.data.copy()
+    data["shipment_id"] = shipment.shipment_id
 
-        serializer = ShipmentRouteWriteSerializer(data=data)
+    serializer = ShipmentRouteWriteSerializer(data=data)
 
-        if serializer.is_valid():
-            route = serializer.save()
-            return Response(
-                ShipmentRouteReadSerializer(route).data,
-                status=status.HTTP_201_CREATED,
-            )
+    if serializer.is_valid():
+        route = serializer.save()
 
         return Response(
-            serializer.errors,
-            status=status.HTTP_400_BAD_REQUEST,
+            ShipmentRouteReadSerializer(route).data,
+            status=status.HTTP_201_CREATED,
         )
+
+    return Response(
+        serializer.errors,
+        status=status.HTTP_400_BAD_REQUEST,
+    )
+
+
     
 @api_view(["POST"])
 @throttle_classes([BookingLikeWriteThrottle])
@@ -1262,7 +1526,7 @@ def confirm_checkin(request):
         shipment = token.shipment
 
         # 🔒 RLS
-        if shipment.service_provider.sp_profile != request.user:
+        if shipment.service_ordered.order.provider_for_service.provider.sp_profile != request.user:
             return Response(
                 {
                     "detail": "You do not have permission to check in for this shipment."
@@ -1309,9 +1573,40 @@ def confirm_checkin(request):
             },
             status=status.HTTP_500_INTERNAL_SERVER_ERROR
         )
+    
+@api_view(["GET"])
+@authentication_classes([ClientJWTAuthentication])
+@permission_classes([IsAuthenticated])
+@throttle_classes([HeavyReadThrottle])
+def client_get_session_by_shipment(request, shipment_id):
+    """
+    Retrieve the session associated with a shipment.
+    Includes shipment details and session duration.
+    """
+    try:
+        session = Session.objects.select_related(
+            "shipment",
+            "shipment__service_ordered",
+            "shipment__service_ordered__order",
+            "shipment__service_ordered__order__client",
+            "shipment__service_ordered__order__client__client_profile",
+        ).get(
+            shipment_id=shipment_id,
+            shipment__service_ordered__order__client__client_profile=request.user,
+        )
+    except Session.DoesNotExist:
+        return Response(
+            {"detail": "Session not found."},
+            status=status.HTTP_404_NOT_FOUND,
+        )
+
+    serializer = SessionReadSerializer(session)
+    return Response(serializer.data, status=status.HTTP_200_OK)
 
 
 @api_view(["GET"])
+@authentication_classes([SPJWTAuthentication])
+@permission_classes([IsAuthenticated])
 @throttle_classes([HeavyReadThrottle])
 def get_session_by_shipment(request, shipment_id):
     """
@@ -1319,11 +1614,21 @@ def get_session_by_shipment(request, shipment_id):
     Includes shipment details and session duration.
     """
     try:
-        session = Session.objects.get(shipment_id=shipment_id)
+        session = Session.objects.select_related(
+            "shipment",
+            "shipment__service_ordered",
+            "shipment__service_ordered__order",
+            "shipment__service_ordered__order__provider_for_service",
+            "shipment__service_ordered__order__provider_for_service__provider",
+            "shipment__service_ordered__order__provider_for_service__provider__sp_profile",
+        ).get(
+            shipment_id=shipment_id,
+            shipment__service_ordered__order__provider_for_service__provider__sp_profile=request.user,
+        )
     except Session.DoesNotExist:
         return Response(
-            {"detail": "Session not found for this shipment."},
-            status=status.HTTP_404_NOT_FOUND
+            {"detail": "Session not found."},
+            status=status.HTTP_404_NOT_FOUND,
         )
 
     serializer = SessionReadSerializer(session)
@@ -1361,11 +1666,15 @@ def session_geofence_check(request, session_id):
 
         # 🔒 RLS: provider can only access their own sessions
         session = Session.objects.select_related(
-            "shipment__service_provider__sp_profile",
-            "shipment__service_ordered__order__delivery_address"
+            "shipment",
+            "shipment__service_ordered",
+            "shipment__service_ordered__order",
+            "shipment__service_ordered__order__provider_for_service",
+            "shipment__service_ordered__order__provider_for_service__provider",
+            
         ).get(
             session_id=session_id,
-            shipment__service_provider__sp_profile=request.user
+            shipment__service_ordered__order__provider_for_service__provider__sp_profile=request.user,
         )
 
         # Geofence center (client address)
@@ -1682,8 +1991,24 @@ def session_location_pings(request, session_id):
     serializer = SessionLocationPingReadSerializer(pings, many=True)
     return Response(serializer.data)
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+###add rls
+
 @api_view(['GET'])
 @throttle_classes([HeavyReadThrottle])
+@authentication_classes([ClientJWTAuthentication])
 # @permission_classes([IsAuthenticated])
 def session_latest_ping(request, session_id):
     """
@@ -1712,42 +2037,66 @@ def session_latest_ping(request, session_id):
 @throttle_classes([HeavyReadThrottle])
 def update_session_status(request, session_id):
 
-    try:
-        session = Session.objects.get(session_id=session_id)
-    except Session.DoesNotExist:
-        return Response(
-            {"detail": "Session not found"},
-            status=status.HTTP_404_NOT_FOUND,
+    with transaction.atomic():
+        try:
+            session = (
+                Session.objects
+                .select_related(
+                    "shipment",
+                    "shipment__service_ordered",
+                    "shipment__service_ordered__order",
+                    "shipment__service_ordered__order__provider_for_service",
+                    "shipment__service_ordered__order__provider_for_service__provider",
+                    "shipment__service_ordered__order__provider_for_service__provider__sp_profile",
+                )
+                .select_for_update()
+                .get(
+                    session_id=session_id,
+                    shipment__service_ordered__order__provider_for_service__provider__sp_profile=request.user,
+                )
+            )
+        except Session.DoesNotExist:
+            return Response(
+                {"detail": "Session not found."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        # Prevent reopening sessions
+        if session.session_status == "completed":
+            return Response(
+                {"detail": "Session already completed."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        new_status = request.data.get("session_status")
+
+        if (
+            new_status == "completed"
+            and not request.data.get("checkout_location")
+        ):
+            return Response(
+                {
+                    "detail": "Checkout location required when completing a session."
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        serializer = SessionStatusUpdateSerializer(
+            session,
+            data=request.data,
+            partial=True,
         )
 
-    # Prevent reopening sessions
+        serializer.is_valid(raise_exception=True)
+        session = serializer.save()
+
+        # Finalize checkout
+        if session.session_status == "completed":
+            session.checkout_time = timezone.now()
+            session.save(update_fields=["checkout_time"])
+
+    # Notify after the transaction commits.
     if session.session_status == "completed":
-        return Response(
-            {"detail": "Session already completed."},
-            status=status.HTTP_400_BAD_REQUEST,
-        )
-
-    new_status = request.data.get("session_status")
-
-    if new_status == "completed" and not request.data.get("checkout_location"):
-        return Response(
-            {"detail": "Checkout location required when completing a session."},
-            status=status.HTTP_400_BAD_REQUEST,
-        )
-
-    serializer = SessionStatusUpdateSerializer(
-        session,
-        data=request.data,
-        partial=True,
-    )
-
-    serializer.is_valid(raise_exception=True)
-    session = serializer.save()
-
-    # finalize checkout
-    if session.session_status == "completed":
-        session.checkout_time = timezone.now()
-        session.save(update_fields=["checkout_time"])
         push_session_completed(session)
 
     return Response(
@@ -1761,6 +2110,7 @@ def update_session_status(request, session_id):
         status=status.HTTP_200_OK,
     )
 
+    
 @api_view(['GET'])
 @authentication_classes([SPJWTAuthentication])
 @permission_classes([IsAuthenticated])
