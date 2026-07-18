@@ -47,15 +47,8 @@ CSRF_TRUSTED_ORIGINS = [
 ]
 
 SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
-
-CORS_ALLOWED_ORIGINS = [
-    origin.strip()
-    for origin in get_env(
-        "DJANGO_CORS_ALLOWED_ORIGINS",
-        "http://127.0.0.1:8000,http://localhost:8000,https://web-production-7dfca.up.railway.app"
-    ).split(",")
-    if origin.strip()
-]
+CORS_ALLOW_ALL_ORIGINS = False
+CORS_ALLOWED_ORIGINS = []
 
 INSTALLED_APPS = [
     "daphne",
@@ -76,9 +69,11 @@ INSTALLED_APPS = [
     "api.bookings",
     "api.posts",
     "api.audits",
+    "csp",
 ]
 
 MIDDLEWARE = [
+    "csp.middleware.CSPMiddleware",
     "django.middleware.security.SecurityMiddleware",
     "whitenoise.middleware.WhiteNoiseMiddleware",
     "corsheaders.middleware.CorsMiddleware",
@@ -209,3 +204,46 @@ else:
 SESSION_GEOFENCE_RADIUS_METERS = int(get_env("SESSION_GEOFENCE_RADIUS_METERS", "45"))
 SESSION_GEOFENCE_GRACE_SECONDS = int(get_env("SESSION_GEOFENCE_GRACE_SECONDS", "120"))
 SESSION_GEOFENCE_PING_INTERVAL_SECONDS = int(get_env("SESSION_GEOFENCE_PING_INTERVAL_SECONDS", "20"))
+
+
+# ============================================================================
+# Content Security Policy (CSP)
+# ============================================================================
+
+CONTENT_SECURITY_POLICY = {
+    "DIRECTIVES": {
+        "default-src": ("'self'",),
+
+        "script-src": (
+            "'self'",
+        ),
+
+        "style-src": (
+            "'self'",
+            "'unsafe-inline'",
+        ),
+
+        "img-src": (
+            "'self'",
+            "data:",
+            "https:",
+        ),
+
+        "font-src": (
+            "'self'",
+            "https:",
+        ),
+
+        "connect-src": (
+            "'self'",
+            "https://fcm.googleapis.com",
+            "https://firebaseinstallations.googleapis.com",
+            "https://firebase.googleapis.com",
+        ),
+
+        "object-src": ("'none'",),
+        "base-uri": ("'self'",),
+        "frame-ancestors": ("'none'",),
+        "form-action": ("'self'",),
+    }
+}
