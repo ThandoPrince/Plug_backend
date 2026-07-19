@@ -200,6 +200,8 @@ class SPProfile(models.Model):
     null=True,
     blank=True
 )
+    updated_at = models.DateField(null=True, blank=True)
+    date_created = models.DateField(null=True,blank=True)
 
     last_login_at = models.DateTimeField(
     null=True,
@@ -256,9 +258,22 @@ class ServiceProvider(models.Model):
     id_number = models.CharField(max_length=20, db_index=True)
     sp_description = models.CharField(max_length=255, null=True, blank=True, help_text="Brief description of yourself and qualities")
     dob = models.DateField()
+    updated_at = models.DateField(null=True, blank=True, db_index=True)
+    date_created = models.DateField(null=True,blank=True, db_index=True)
     is_active = models.BooleanField(default=True)
     location = models.ForeignKey(Address, on_delete=models.SET_NULL, null=True, db_index=True)
     sp_profile = models.OneToOneField(SPProfile, on_delete=models.CASCADE, primary_key=True, db_index=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=['rating']),
+            models.Index(fields=['dob']),
+            models.Index(fields=['sp_profile']),
+            models.Index(fields=['date_created']),
+            models.Index(fields=['updated_at']),
+            models.Index(fields=['id_number','gender','full_name']),
+
+        ]
 
     def service_provider_upload_path(instance, filename):
         
@@ -311,6 +326,11 @@ class DeviceToken(models.Model):
                 name="unique_token_per_service_provider"
             )
         ]
+        indexes = [
+            models.Index(fields=['fcm_token','device_type','service_provider']),
+            
+
+        ]
 
     def __str__(self):
         return f"{self.service_provider.email_address} - {self.device_name or self.device_type}"
@@ -319,6 +339,13 @@ class CostOfService(models.Model):
     base_price = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True, db_index=True)
     negotiable = models.BooleanField(default=True, db_index=True)
     notes = models.TextField(blank=True, null=True, db_index=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=['base_price']),
+            
+
+        ]
 
     
     def __str__(self):
@@ -337,6 +364,12 @@ class CostOfServiceImage(models.Model):
     image = models.ImageField(upload_to='service_images/', db_index=True)
 
     uploaded_at = models.DateTimeField(auto_now_add=True, db_index=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=['cost_of_service']),
+            
+        ]
 
     def save(self, *args, **kwargs):
         if self.cost_of_service_id:
@@ -572,6 +605,15 @@ class ProviderServiceAffidavit(models.Model):
                 name="one_current_affidavit",
             ),
         ]
+        indexes = [
+            models.Index(fields=['verified_at','verification_status']),
+            models.Index(fields=['ai_result','verification_status']),
+            models.Index(fields=['ai_confidence']),
+            models.Index(fields=['verification_status','provider_service']),
+            models.Index(fields=['provider_service']),
+            
+
+        ]
 
     def __str__(self):
         return (
@@ -715,6 +757,7 @@ class SPLiveLocation(models.Model):
     class Meta:
         indexes = [
             models.Index(fields=["provider","latitude", "longitude"]),
+             models.Index(fields=["updated_at"]),
            
     ]
 
