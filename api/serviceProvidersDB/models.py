@@ -264,8 +264,7 @@ class ServiceProvider(models.Model):
     )
     dob = models.DateField()
 
-    updated_at = models.DateField(auto_now=True, db_index=True)
-    date_created = models.DateField(auto_now_add=True, db_index=True)
+    
 
     is_active = models.BooleanField(default=True)
     location = models.ForeignKey(Address, on_delete=models.SET_NULL, null=True, db_index=True)
@@ -281,8 +280,7 @@ class ServiceProvider(models.Model):
             models.Index(fields=['rating']),
             models.Index(fields=['dob']),
             models.Index(fields=['sp_profile']),
-            models.Index(fields=['date_created']),
-            models.Index(fields=['updated_at']),
+           
             models.Index(fields=['id_number', 'gender', 'full_name']),
         ]
 
