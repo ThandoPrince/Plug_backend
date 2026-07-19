@@ -1,10 +1,16 @@
 import os
 
-from google_crc32c import value
 import requests
+from django.conf import settings
 
 
 class KYCService:
+
+    @staticmethod
+    def get_base_url():
+        if settings.DEBUG:
+            return "http://localhost:8001"
+        return settings.AI_KYC_API_URL.rstrip("/")
 
     @staticmethod
     def verify_with_ai(
@@ -14,42 +20,40 @@ class KYCService:
         back_path=None,
         selfie_path=None,
     ):
-        url = "http://localhost:8001/api/kyc/initiate"
+        url = f"{KYCService.get_base_url()}/api/kyc/initiate"
 
         files = {}
 
         try:
             files["id_document"] = (
-    os.path.basename(front_path),
-    open(front_path, "rb"),
-    "image/jpeg"
-)
+                os.path.basename(front_path),
+                open(front_path, "rb"),
+                "image/jpeg",
+            )
 
             if selfie_path:
                 files["liveness_video"] = (
-        os.path.basename(selfie_path),
-        open(selfie_path, "rb"),
-        "video/mp4"
-    )
+                    os.path.basename(selfie_path),
+                    open(selfie_path, "rb"),
+                    "video/mp4",
+                )
 
             data = {
                 "customer_id": str(customer_id),
                 "full_name": full_name,
             }
 
+            headers = {
+                "X-API-Key": settings.AI_API_KEY,
+            }
+
             response = requests.post(
                 url,
+                headers=headers,
                 files=files,
                 data=data,
                 timeout=120,
             )
-
-            print("========== AI RESPONSE ==========")
-            print("Status:", response.status_code)
-            print("Headers:", response.headers.get("content-type"))
-            print("Body:")
-            print(response.text)
-            print("=================================")
 
             response.raise_for_status()
 
@@ -70,5 +74,5 @@ class KYCService:
             }
 
         finally:
-            for value in files.values():
-                value[1].close()
+            for file_info in files.values():
+                file_info[1].close()

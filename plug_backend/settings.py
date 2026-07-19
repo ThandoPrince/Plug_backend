@@ -8,6 +8,9 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 load_dotenv(BASE_DIR / ".env")
 
 
+
+
+
 def get_env(name: str, default: str | None = None, required: bool = False) -> str:
     value = os.getenv(name, default)
     if required and not value:
@@ -27,6 +30,8 @@ SIMPLE_JWT = {
 
 SECRET_KEY = get_env("DJANGO_SECRET_KEY", required=True)
 DEBUG = get_env("DJANGO_DEBUG", "False").lower() == "true"
+AI_API_KEY = get_env("AI_API_KEY")
+AI_KYC_API_URL = os.getenv("AI_KYC_API_URL")
 
 ALLOWED_HOSTS = [
     host.strip()

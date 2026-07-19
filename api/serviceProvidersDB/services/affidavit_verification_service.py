@@ -1,8 +1,14 @@
 import requests
 
+from django.conf import settings
+
 
 class AIKYCClient:
-    BASE_URL = "http://localhost:8001"
+    @classmethod
+    def get_base_url(cls):
+        if settings.DEBUG:
+            return "http://localhost:8001"
+        return settings.AI_KYC_API_URL.rstrip("/")
 
     @classmethod
     def verify_affidavit(
@@ -28,8 +34,13 @@ class AIKYCClient:
             "service_name": provider_service.service.service_name,
         }
 
+        headers = {
+            "X-API-Key": settings.AI_API_KEY,
+        }
+
         response = requests.post(
-            f"{cls.BASE_URL}/api/affidavit/verify",
+            f"{cls.get_base_url()}/api/affidavit/verify",
+            headers=headers,
             data=data,
             files=files,
             timeout=180,
