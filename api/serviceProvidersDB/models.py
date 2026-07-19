@@ -200,8 +200,8 @@ class SPProfile(models.Model):
     null=True,
     blank=True
 )
-    updated_at = models.DateField(null=True, blank=True)
-    date_created = models.DateField(null=True,blank=True)
+    updated_at = models.DateField(auto_created=True,null=True, blank=True)
+    date_created = models.DateField(null=True,blank=True,auto_created=True)
 
     last_login_at = models.DateTimeField(
     null=True,
