@@ -410,6 +410,7 @@ class ProviderService(models.Model):
         related_name='provider_services',
         db_index=True
     )
+    is_active = models.BooleanField(default=True, db_index=True)
     id = models.AutoField(primary_key=True, editable=False, db_index=True),
 
     service = models.ForeignKey(
@@ -449,7 +450,7 @@ class ProviderService(models.Model):
         ]
 
         indexes = [
-            models.Index(fields=['provider']),
+            models.Index(fields=['provider','is_active']),
             models.Index(fields=['service']),
             models.Index(fields=['cost_of_service']),
             models.Index(fields=['is_primary']),
@@ -470,8 +471,9 @@ class ProviderService(models.Model):
             ).exclude(pk=self.pk).count()
         else:
             existing_count = ProviderService.objects.filter(
-                provider=self.provider
-            ).count()
+    provider=self.provider,
+    is_active=True,
+).count()
 
         if existing_count >= 3:
             raise ValidationError(

@@ -15,7 +15,7 @@ from rest_framework.response import Response
 from rest_framework.decorators import api_view, authentication_classes, permission_classes, throttle_classes
 import logging
 from django.db.models.functions import ACos, Cast, Cos, Radians, Sin
-from django.db.models import F, Count, Q, ExpressionWrapper, FloatField, OuterRef, Subquery
+from django.db.models import F, Count, Q, ExpressionWrapper, FloatField, OuterRef, Prefetch, Subquery
 from rest_framework import status
 from rest_framework.decorators import api_view, parser_classes
 from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
@@ -1355,19 +1355,25 @@ def toggle_provider_active(request):
 def get_provider_services(request, provider_id):
 
     try:
-        provider = ServiceProvider.objects.select_related(
-            'sp_profile'
-        ).get(
-            sp_profile__id=provider_id,
-            is_active=True
-        )
+        provider = get_object_or_404(
+    ServiceProvider.objects.select_related("sp_profile"),
+    sp_profile=request.user,
+    sp_profile__id=provider_id,
 
-        provider_services = ProviderService.objects.select_related(
-            'service',
-            'provider',
-            'cost_of_service',
-            'provider__sp_profile'
-        ).filter(provider=provider)
+)
+
+        provider_services = (
+            ProviderService.objects.select_related(
+                'service',
+                'provider',
+                'cost_of_service',
+                'provider__sp_profile',
+            )
+            .filter(
+                provider=provider,
+                is_active=True,
+            )
+        )
 
         serializer = ProviderSeviceSerializer(provider_services, many=True)
 
@@ -1748,13 +1754,14 @@ def service_provider_list_service(request):
 
         if service_id:
             live_locations = live_locations.filter(
-                provider__provider_services__service_id=service_id
-            )
-
+        provider__provider_services__is_active=True,
+        provider__provider_services__service_id=service_id,
+    )
         if group_id:
             live_locations = live_locations.filter(
-                provider__provider_services__service__service_group_id=group_id
-            )
+        provider__provider_services__is_active=True,
+        provider__provider_services__service__service_group_id=group_id,
+    )
 
         if search:
             live_locations = live_locations.filter(
@@ -2215,19 +2222,23 @@ def costs_by_sp(request, provider_id, service_id=None):
             is_active=True
         )
 
-        provider_services = ProviderService.objects.select_related(
-            'service',
-            'cost_of_service'
-        ).filter(
-            provider=sp,
-            cost_of_service__isnull=False
+        provider_services = (
+            ProviderService.objects.select_related(
+                'service',
+                'cost_of_service',
+            )
+            .filter(
+                provider=sp,
+                is_active=True,          # Only active linked services
+                cost_of_service__isnull=False,
+            )
         )
 
         # ---------------- SINGLE COST ----------------
         if service_id is not None:
             provider_service = provider_services.filter(
-                service_id=service_id
-            ).select_related('cost_of_service').first()
+                service_id=service_id,
+            ).first()
 
             if not provider_service or not provider_service.cost_of_service:
                 return Response(
@@ -2367,10 +2378,16 @@ def fetch_sp_live_locations_by_service(request, service_id):
 
         # 3. Base Query Trace
         
-        base_query = SPLiveLocation.objects.select_related('provider').filter(
-            provider__provider_services__service__service_id=service_id,
-            provider__is_active=True
-        ).annotate(distance_km=distance_expression)
+        base_query = (
+            SPLiveLocation.objects
+            .select_related("provider")
+            .filter(
+                provider__is_active=True,
+                provider__provider_services__is_active=True,
+                provider__provider_services__service__service_id=service_id,
+            )
+            .annotate(distance_km=distance_expression)
+        )
 
     
         pre_filter_count = base_query.count()
@@ -2421,15 +2438,25 @@ def sps_by_live_location(request):
 
     id_list = [int(i) for i in ids.split(',') if i.isdigit()]
 
-    sps = ServiceProvider.objects.filter(
-        sp_profile_id__in=id_list,   # ✅ IMPORTANT FIX
-        is_active=True
-    ).select_related(
-        'sp_profile',
-        'location'
-    ).prefetch_related(
-        'provider_services__service'
-    ).distinct()
+    sps = (
+        ServiceProvider.objects.filter(
+            sp_profile_id__in=id_list,
+            is_active=True,
+        )
+        .select_related(
+            "sp_profile",
+            "location",
+        )
+        .prefetch_related(
+            Prefetch(
+                "provider_services",
+                queryset=ProviderService.objects.filter(
+                    is_active=True,
+                ).select_related("service"),
+            )
+        )
+        .distinct()
+    )
 
     if not sps.exists():
         return Response(
@@ -2473,15 +2500,25 @@ def client_get_sps_by_live_location(request):
         id__in=id_list
     ).select_related('provider')
 
-    sps = ServiceProvider.objects.filter(
-        sp_profile__in=[loc.provider.sp_profile for loc in live_locations],
-        is_active=True
-    ).select_related(
-        'sp_profile',
-        'location'
-    ).prefetch_related(
-        'provider_services__service'   # ✅ FIXED
-    ).distinct()
+    sps = (
+        ServiceProvider.objects.filter(
+            sp_profile__in=[loc.provider.sp_profile for loc in live_locations],
+            is_active=True,
+        )
+        .select_related(
+            "sp_profile",
+            "location",
+        )
+        .prefetch_related(
+            Prefetch(
+                "provider_services",
+                queryset=ProviderService.objects.filter(
+                    is_active=True,
+                ).select_related("service"),
+            )
+        )
+        .distinct()
+    )
 
     if not sps.exists():
         return Response(
