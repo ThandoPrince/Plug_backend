@@ -3,6 +3,8 @@ import logging
 
 from asgiref.sync import sync_to_async
 from channels.generic.websocket import AsyncWebsocketConsumer
+from rest_framework_simplejwt.exceptions import TokenError
+from jwt import ExpiredSignatureError
 
 from api.bookings.utils.ws_auth import authenticate_ws_token
 

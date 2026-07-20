@@ -33,3 +33,6 @@ class ProviderDeclinedInvitationEvent(Event):
 
 class NegotiationCreatedEvent(Event):
     name = "negotiation.created"
+
+class ProviderOrderCancelledEvent(Event):
+    name = "provider.order_cancelled"

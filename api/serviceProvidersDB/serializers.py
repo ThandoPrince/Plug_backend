@@ -327,6 +327,62 @@ class ServiceProviderPatchSerializer(serializers.ModelSerializer):
     @transaction.atomic
     def update(self, instance, validated_data):
         return super().update(instance, validated_data)
+    
+
+class ServiceProviderProfileSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ServiceProvider
+        fields = [
+            "profile_image",
+            "sp_description",
+        ]
+
+    def validate_profile_image(self, value):
+        if value is None:
+            return value
+
+        allowed_types = {
+            "image/jpeg",
+            "image/png",
+            "image/webp",
+        }
+
+        if value.content_type not in allowed_types:
+            raise serializers.ValidationError(
+                "Only JPEG, PNG and WEBP images are allowed."
+            )
+
+        if value.size > 5 * 1024 * 1024:
+            raise serializers.ValidationError(
+                "Image size must not exceed 5 MB."
+            )
+
+        return value
+
+    def validate_sp_description(self, value):
+        if value is None:
+            return value
+
+        value = value.strip()
+
+        if not value:
+            return ""
+
+        if len(value) > 255:
+            raise serializers.ValidationError(
+                "Description cannot exceed 255 characters."
+            )
+
+        # Remove HTML tags
+        value = strip_tags(value)
+
+        # Reject control characters
+        if re.search(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]", value):
+            raise serializers.ValidationError(
+                "Description contains invalid characters."
+            )
+
+        return value
 
 class ProviderServiceAffidavitSerializer(serializers.ModelSerializer):
 
@@ -796,6 +852,15 @@ class ServiceWriteSerializer(serializers.ModelSerializer):
         model = Service
         fields = ["service_name", "description", "service_group"]
 
+class SPProfileMyReadSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = SPProfile
+        # List all fields except password
+        exclude = ['password', 'mfa_enabled','mfa_secret','failed_login_attempts','total_failed_login_attempts','account_locked_until','updated_at','date_created','last_login_at','last_login_ip']
+        # OR, alternatively, explicitly include fields you want:
+        # fields = ['id', 'email_address', 'mobile_number', 'is_profile_completed']
+        read_only_fields = ['id', 'email_address', 'mobile_number', 'is_profile_completed','id']
+
 
 class SPProfileReadSerializer(serializers.ModelSerializer):
     class Meta:
@@ -877,7 +942,7 @@ class ClientServiceSerializer(serializers.ModelSerializer):
         return Service.objects.create(service_group=group, **validated_data)
 
 class ServiceProviderReadSerializer(serializers.ModelSerializer):
-    sp_profile = ClientSPProfileReadSerializer()
+    sp_profile = SPProfileMyReadSerializer()
   
 
     class Meta:

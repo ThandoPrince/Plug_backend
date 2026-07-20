@@ -51,6 +51,8 @@ from .serializers import (
     SPProfileWriteSerializer,
     ServiceGroupSerializer,
     ServiceProviderPatchSerializer,
+    
+    ServiceProviderProfileSerializer,
     ServiceProviderReadSerializer,
     ServiceProviderSerializer,
     ServiceProviderWriteSerializer,
@@ -150,6 +152,69 @@ def sp_login(request):
             status=status.HTTP_500_INTERNAL_SERVER_ERROR
         )
     
+
+
+
+
+@api_view(["POST"])
+@throttle_classes([ProfileWriteThrottle])
+@authentication_classes([SPJWTAuthentication])
+@permission_classes([IsAuthenticated])
+def sp_update_profile(request):
+    print("FILES RECEIVED:", request.FILES)
+    print("POST DATA:", request.data)
+
+    try:
+        service_provider = ServiceProvider.objects.get(
+            sp_profile=request.user
+        )
+    except ServiceProvider.DoesNotExist:
+        return Response(
+            {
+                "success": False,
+                "message": "Service provider not found.",
+            },
+            status=status.HTTP_404_NOT_FOUND,
+        )
+
+    serializer = ServiceProviderProfileSerializer(
+        service_provider,
+        data=request.data,
+        partial=True,
+    )
+
+    if not serializer.is_valid():
+        return Response(
+            {
+                "success": False,
+                "message": "Validation failed.",
+                "errors": serializer.errors,
+            },
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    serializer.save()  # updated_at is automatically updated
+
+    return Response(
+        {
+            "success": True,
+            "message": "Profile updated successfully.",
+            "data": {
+                "profile_image": (
+                    request.build_absolute_uri(
+                        service_provider.profile_image.url
+                    )
+                    if service_provider.profile_image
+                    else None
+                ),
+                "sp_description": service_provider.sp_description,
+                "updated_at": service_provider.updated_at,
+            },
+        },
+        status=status.HTTP_200_OK,
+    )
+
+
 
 
 @api_view(["POST"])

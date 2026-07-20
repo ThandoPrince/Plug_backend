@@ -12,7 +12,7 @@ from django.db import transaction
 from django.db.models import Q, Avg, Exists, OuterRef
 from api.bookings.events.event_base import EventBus
 from api.bookings.events.negotiation_events import NegotiationRoundCreatedEvent
-from api.bookings.events.order_events import NegotiationCreatedEvent, OrderAcceptedEvent, OrderCancelledEvent, OrderCreatedEvent, OrderRescheduledEvent, ProviderDeclinedInvitationEvent
+from api.bookings.events.order_events import NegotiationCreatedEvent, OrderAcceptedEvent, OrderCancelledEvent, OrderCreatedEvent, OrderRescheduledEvent, ProviderDeclinedInvitationEvent, ProviderOrderCancelledEvent
 from api.bookings.events.websoket_event_emitters.shipment_event_emitters import push_session_completed, push_session_created, push_shipment_status_update
 from api.bookings.events.ws_events import notify_provider_booking_update
 from api.bookings.services.calculate_distance_meters import calculate_distance_meters
@@ -1830,6 +1830,81 @@ def cancel_shipment(request, shipment_id):
         status=status.HTTP_200_OK
     )
 
+@api_view(["PATCH"])
+@authentication_classes([SPJWTAuthentication])
+@permission_classes([IsAuthenticated])
+@throttle_classes([HeavyReadThrottle])
+@transaction.atomic
+def provider_cancel_shipment(request, shipment_id):
+
+    shipment = get_object_or_404(
+        Shipment.objects.select_related(
+            "service_ordered__order__provider_for_service__provider__sp_profile",
+            "service_ordered__order__client",
+        ),
+        shipment_id=shipment_id,
+        service_ordered__order__provider_for_service__provider__sp_profile=request.user,
+    )
+
+    booking_item = shipment.service_ordered
+    order = booking_item.order
+
+    if shipment.shipment_status in [
+        "in_session",
+        "completed",
+    ]:
+        return Response(
+            {
+                "detail": "This booking has already started and can no longer be cancelled."
+            },
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    if shipment.shipment_status == "canceled":
+        return Response(
+            {
+                "detail": "Shipment already cancelled."
+            },
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    old_status = shipment.shipment_status
+
+    shipment.shipment_status = "canceled"
+    shipment.save(update_fields=["shipment_status", "updated_date"])
+
+    OrderStatusService.set_status(order, "canceled")
+
+    ShipmentHistory.objects.create(
+        shipment=shipment,
+        previous_status=old_status,
+        new_status="canceled",
+        notes="Shipment cancelled by provider.",
+    )
+
+    EventBus.emit(
+        ProviderOrderCancelledEvent(
+            {
+                "shipment": shipment,
+                "order": order,
+                "provider": shipment.service_ordered.order.provider_for_service,
+            }
+        )
+    )
+
+    return Response(
+        {
+            "success": True,
+            "message": "Shipment cancelled successfully.",
+            "data": {
+                "shipment_id": shipment.shipment_id,
+                "shipment_status": shipment.shipment_status,
+                "order_id": order.order_id,
+                "order_status": order.status,
+            },
+        },
+        status=status.HTTP_200_OK,
+    )
 
 @api_view(["PATCH"])
 @authentication_classes([ClientJWTAuthentication])
@@ -2115,17 +2190,13 @@ def update_session_status(request, session_id):
 @authentication_classes([SPJWTAuthentication])
 @permission_classes([IsAuthenticated])
 @throttle_classes([HeavyReadThrottle])
-def get_ratings_by_provider_email(request, email):
-    """
-    Get ratings for a provider.
-    Optional query param:
-        ?session_id=5
-    """
+def get_my_ratings(request):
+    sp_profile = get_sp_profile(request)
 
     session_id = request.query_params.get("session_id")
 
     ratings = Rating.objects.filter(
-        rater_provider__sp_profile__email_address=email
+        rater_provider__sp_profile=sp_profile
     )
 
     if session_id:
@@ -2134,7 +2205,7 @@ def get_ratings_by_provider_email(request, email):
     serializer = RatingReadSerializer(ratings, many=True)
     return Response(serializer.data)
 
-logger = logging.getLogger(__name__)
+
 
 @api_view(['GET'])
 @throttle_classes([HeavyReadThrottle])

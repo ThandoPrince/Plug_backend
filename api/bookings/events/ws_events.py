@@ -71,3 +71,13 @@ def notify_client_location(client_id: int, payload: dict) -> None:
         event_type="location_update",
         payload=payload,
     )
+
+def notify_client_booking_cancelled(
+    client_id: int,
+    payload: dict,
+) -> None:
+    _send_group_event(
+        group_name=f"client_{client_id}",
+        event_type="booking_update",
+        payload=payload,
+    )

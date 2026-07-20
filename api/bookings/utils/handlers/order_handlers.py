@@ -2,8 +2,8 @@
 
 
 from api.bookings.events.event_base import EventBus
-from api.bookings.events.order_events import ProviderDeclinedInvitationEvent
-from api.bookings.events.ws_events import notify_provider_booking_invite, notify_provider_booking_removed, notify_provider_negotiation_update
+from api.bookings.events.order_events import ProviderDeclinedInvitationEvent, ProviderOrderCancelledEvent
+from api.bookings.events.ws_events import notify_client_booking_cancelled, notify_provider_booking_invite, notify_provider_booking_removed, notify_provider_negotiation_update
 from api.bookings.models import OrderService
 from api.bookings.serializers import NegotiationRoundReadSerializer, OrderServiceReadSerializer
 from api.clientsDB.notifications.services.notification_builder import OrderNotificationBuilder
@@ -96,6 +96,41 @@ def handle_negotiation_created(payload):
             "negotiation_id": negotiation.negotiation_id,
         },
         websocket_invite=False,
+    )
+
+
+def handle_provider_order_cancelled(payload):
+
+    order = payload.get("order")
+    shipment = payload.get("shipment")
+
+    if not order or not shipment:
+        return
+
+    client = order.client
+
+    if not client:
+        return
+
+    client_profile = client.client_profile
+
+    if not client_profile:
+        return
+
+    # Broadcast websocket update so the booking disappears immediately
+    handle_order_updated(order)
+
+    NotificationService.notify_client(
+        client=client_profile,
+        notification_type="provider_order_cancelled",
+        title="Booking Cancelled ❌",
+        body="Your service provider has cancelled this booking.",
+        payload=OrderNotificationBuilder.provider_order_cancelled(order),
+    )
+
+    notify_client_booking_cancelled(
+        client_id=client_profile.id,
+       
     )
 
 
@@ -332,6 +367,11 @@ EventBus.register(
 EventBus.register(
     "negotiation.created",
     handle_negotiation_created,
+)
+
+EventBus.register(
+    ProviderOrderCancelledEvent,
+    handle_provider_order_cancelled,
 )
 
 EventBus.register(

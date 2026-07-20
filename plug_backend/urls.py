@@ -94,6 +94,12 @@ path(
     sp_views.upload_provider_service_affidavit,
     name="upload-provider-service-affidavit",
 ),
+path(
+    "api/provider/profile-image/",
+    sp_views.sp_update_profile,
+    name="update-provider-profile-image",
+),
+
     path(
         "api/provider-services/<int:service_id>/qualifications/",
         sp_views.upload_provider_qualification,
@@ -191,6 +197,12 @@ path(
         name="cancel-shipment"
     ),
 
+    path(
+        "api/bookings/shipment/sp/<int:shipment_id>/cancel/",
+        booking_views.provider_cancel_shipment,
+        name="cancel-shipment"
+    ),
+
      # Session  endpoints
     path('api/bookings/sessions/confirm_checkin/', booking_views.confirm_checkin, name='confirm_checkin'), #used
     path('api/bookings/sessions/get_checkin_token/<int:shipment_id>/', booking_views.get_checkin_token, name='get_checkin_token'), ##used
@@ -207,7 +219,7 @@ path(
     path('api/bookings/sp_active_orders/<int:id>/', booking_views.bookings_by_invited_provider, name='sp_active_orders'), #used
     path('api/bookings/client_active_orders/<int:client_id>/', booking_views.pending_orders_by_client_id, name='client_active_orders'), ##used
     path('api/bookings/get_ratings/by_client_email/<int:client_id>/', booking_views.get_ratings_by_client_email, name='client_ratings'), ##used
-    path('api/bookings/get_ratings/by_provider_email/<str:email>/', booking_views.get_ratings_by_provider_email, name='provider_ratings'), #used
+    path('api/bookings/ratings/provider/', booking_views.get_my_ratings, name='provider_ratings'), #used
     path('api/bookings/<int:session_id>/rate-provider/<str:client_id>/', booking_views.submit_client_rating, name='client_submit_rating'),  #used
     path('api/bookings/<int:session_id>/rate-client/<int:provider_id>/', booking_views.submit_provider_rating, name='provider_submit_rating'),  #used
     path('api/bookings/cancel_order/', booking_views.cancel_order, name='client_cancel_order'), ##used
