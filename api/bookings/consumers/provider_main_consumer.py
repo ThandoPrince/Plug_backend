@@ -8,11 +8,13 @@ from api.bookings.consumers.provider_base_consumer import ProviderBaseConsumer
 from api.bookings.events.event_base import EventBus
 from api.bookings.events.order_events import ProviderLocationUpdatedEvent
 from api.serviceProvidersDB.models import SPLiveLocation, SPLocationHistory, ServiceProvider
+from api.serviceProvidersDB.services.location_servicelocation_service import LocationService
 
 
 class ProviderMainConsumer(ProviderBaseConsumer):
 
     async def booking_invite(self, event):
+        
         await self.send_json({
             "type": "booking_invite",
             "data": event["data"],
@@ -87,36 +89,67 @@ class ProviderMainConsumer(ProviderBaseConsumer):
     
 
     @sync_to_async
-    def update_provider_location(self, provider, latitude, longitude):
-        
+    def update_provider_location(
+        self,
+        provider,
+        latitude,
+        longitude,
+    ):
+
         lat = Decimal(str(latitude))
         lon = Decimal(str(longitude))
- 
 
         live_location, created = SPLiveLocation.objects.get_or_create(
-    provider=provider,
+            provider=provider,
             defaults={
                 "latitude": lat,
                 "longitude": lon,
             },
         )
 
-        if not created:
-            live_location.latitude = lat
-            live_location.longitude = lon
-            live_location.save(update_fields=[
-                "latitude",
-                "longitude",
-                "updated_at",
-            ])
+        should_reverse_geocode = False
+
+        if created:
+            should_reverse_geocode = True
+
+        else:
+
+            if (
+                not live_location.suburb
+                or not live_location.city
+                or not live_location.province
+            ):
+                should_reverse_geocode = True
+
+            elif LocationService.has_moved(
+                float(live_location.latitude),
+                float(live_location.longitude),
+                float(lat),
+                float(lon),
+                minimum_distance=500,
+            ):
+                should_reverse_geocode = True
+
+        live_location.latitude = lat
+        live_location.longitude = lon
+
+        if should_reverse_geocode:
+
+            location = LocationService.reverse_geocode(
+                float(lat),
+                float(lon),
+            )
+
+            live_location.suburb = location["suburb"]
+            live_location.city = location["city"]
+            live_location.province = location["province"]
+
+        live_location.save()
 
         SPLocationHistory.objects.create(
-    provider=provider,
+            provider=provider,
             latitude=lat,
             longitude=lon,
         )
 
         return live_location
-        
-
-        

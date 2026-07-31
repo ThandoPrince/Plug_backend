@@ -2,8 +2,12 @@ from asgiref.sync import async_to_sync
 from channels.layers import get_channel_layer
 
 
-def _send_group_event(group_name: str, event_type: str, payload: dict) -> None:
+def _send_group_event(group_name, event_type, payload):
     channel_layer = get_channel_layer()
+
+    print("CHANNEL LAYER:", channel_layer)
+    print("GROUP:", group_name)
+    print("EVENT:", event_type)
 
     async_to_sync(channel_layer.group_send)(
         group_name,
@@ -12,6 +16,8 @@ def _send_group_event(group_name: str, event_type: str, payload: dict) -> None:
             "data": payload,
         },
     )
+
+    print("GROUP SEND COMPLETE")
 
 def notify_provider_booking_removed(provider_id: int, order_id: int) -> None:
     _send_group_event(

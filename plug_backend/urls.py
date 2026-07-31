@@ -128,8 +128,7 @@ path(
     path('api/approved_services/', sp_views.approved_services_list, name='service_list'), ##used
     
 
-path(
-    'api/service_providerDB/sps_by_live_location/',
+path('api/service_providerDB/sps_by_live_location/',
     sp_views.sps_by_live_location,
     name='service_provider_by_live_location'
 ), ##used
@@ -142,10 +141,48 @@ path(
     path('api/service_providers/by-service/<int:service_id>/', sp_views.providers_by_service, name='service_provider_detail_by_service'), ##used
     path('api/serviceProvidersDB/address/<int:id>/', sp_views.service_provider_address_detail, name='service_provider_address'),
     path('api/serviceProvidersDB/address/', sp_views.service_provider_address, name='service_provider_address_detail'),
+    path('api/providers/provider-services/<int:provider_service_id>/deactivate/', sp_views.deactivate_provider_service, name='service_provider_deactivate'),
+    path(
+    "api/provider-qualifications/<int:provider_service_id>/",
+    sp_views.get_provider_qualifications,
+    name="get_provider_qualification",
+),
+
+path(
+    "api/cost-of-service/<int:cost_of_service_id>/images/",
+    sp_views.get_cost_of_service_images,
+    name="get_cost_of_service_images",
+),
 
   
     path('api/service_providers/sp/update-live-location/', sp_views.update_sp_live_location, name='service_provider_update_live_location'),
     path('api/service_providersDB/live-loc-by-service/<int:service_id>/', sp_views.fetch_sp_live_locations_by_service, name='fetch_service_provider_live_location_by_service'),
+
+
+
+
+path(
+    "api/cost-of-service/<int:cost_id>/update/",
+    sp_views.provider_update_cost_of_service,
+    name="update_cost_of_service",
+),
+path(
+    "api/sp/cost-of-service/<int:cost_id>/images/",
+    sp_views.upload_cost_of_service_image,
+    name="upload_cost_of_service_image",
+),
+
+path(
+    "api/provider-qualification/<int:qualification_id>/",
+    sp_views.delete_provider_qualification,
+    name="delete_provider_qualification",
+),
+
+path(
+    "api/cost-of-service/sp/images/<int:image_id>/",
+    sp_views.delete_cost_of_service_image,
+    name="delete_cost_of_service_image",
+),
     
     
     path('api/service_provider/services/<int:provider_id>/',sp_views.get_provider_services,name='get_provider_services_by_email'),
@@ -176,7 +213,7 @@ path(
     path(
         'api/bookings/<int:order_id>/final-price/',
         booking_views.patch_order_final_price,
-        name='patch_order_final_price'
+        name='update_order_final_price'
     ), ##used
 
     path(
@@ -200,14 +237,14 @@ path(
     path(
         "api/bookings/shipment/sp/<int:shipment_id>/cancel/",
         booking_views.provider_cancel_shipment,
-        name="cancel-shipment"
+        name="provider-cancel-shipment"
     ),
 
      # Session  endpoints
     path('api/bookings/sessions/confirm_checkin/', booking_views.confirm_checkin, name='confirm_checkin'), #used
     path('api/bookings/sessions/get_checkin_token/<int:shipment_id>/', booking_views.get_checkin_token, name='get_checkin_token'), ##used
     path('api/bookings/sessions/get_session_by_shipment/<int:shipment_id>/', booking_views.get_session_by_shipment, name='get_session_by_shipment'), ##used
-    path('api/bookings/sessions/client/get_session_by_shipment/<int:shipment_id>/', booking_views.client_get_session_by_shipment, name='get_session_by_shipment'), ##used
+    path('api/bookings/sessions/client/get_session_by_shipment/<int:shipment_id>/', booking_views.client_get_session_by_shipment, name='client_get_session_by_shipment'), ##used
     path('api/bookings/sessions/geofence_check/<int:session_id>/', booking_views.session_geofence_check, name='session_geofence_check'), #used
     path('api/bookings/sessions/<int:session_id>/pings/', booking_views.session_location_pings, name='session_location_pings'), 
     path('api/bookings/sessions/<int:session_id>/latest-ping/', booking_views.session_latest_ping, name='session_latest_ping'),

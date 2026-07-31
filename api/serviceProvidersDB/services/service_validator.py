@@ -89,15 +89,15 @@ def analyze_service_submission(name: str, description: str = ""):
 
             if keyword_obj and keyword_obj.service:
                 return {
-                    "status": "mapped_existing",
+                    "status": "exists",
                     "service": keyword_obj.service,
                     "risk_level": keyword_obj.service.service_group.category.risk_level
                 }
 
     return {
-        "status": "auto_approve",
-        "risk_level": RiskLevel.LOW
-    }
+    "status": "requires_review",
+    "risk_level": RiskLevel.LOW,
+}
 
 def validate_service_submission(name: str, description: str = ""):
     """Master validation function."""

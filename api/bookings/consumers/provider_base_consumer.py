@@ -53,6 +53,10 @@ class ProviderBaseConsumer(AsyncWebsocketConsumer):
             self.group_name,
             self.channel_name,
         )
+        print(
+    f"JOINED GROUP: {self.group_name} "
+    f"CHANNEL: {self.channel_name}"
+)
 
         await self.accept()
         await self.send_json({

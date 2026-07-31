@@ -6,20 +6,14 @@ from api.bookings.events.order_events import ProviderDeclinedInvitationEvent, Pr
 from api.bookings.events.ws_events import notify_client_booking_cancelled, notify_provider_booking_invite, notify_provider_booking_removed, notify_provider_negotiation_update
 from api.bookings.models import OrderService
 from api.bookings.serializers import NegotiationRoundReadSerializer, OrderServiceReadSerializer
+
+from api.bookings.services.celery_task import process_order_created
+from api.bookings.utils.handlers.visibility import is_visible_to_provider
 from api.clientsDB.notifications.services.notification_builder import OrderNotificationBuilder
 from api.clientsDB.notifications.services.notification_service import NotificationService
 
 
-ACTIVE_PROVIDER_BOOKING_STATUSES = {
-    "pending",
-    "in_progress",
-    "in-negotiation",
-    "rescheduled",
-    "overdue",
-}
 
-def is_visible_to_provider(order):
-    return order.status in ACTIVE_PROVIDER_BOOKING_STATUSES
 
 
 def handle_order_created(payload):
@@ -29,26 +23,14 @@ def handle_order_created(payload):
         return
 
     serializer = OrderServiceReadSerializer(order)
-    booking_payload = serializer.data
-
-    notification_payload = (
-        OrderNotificationBuilder.booking_invite(order)
-    )
 
     for provider in order.invited_providers.all():
         notify_provider_booking_invite(
-            provider_id=provider.id,
-            payload=booking_payload,
+            provider.id,
+            serializer.data,
         )
 
-        NotificationService.notify_provider(
-            provider=provider,
-            notification_type="booking_invite",
-            title="New Booking Request 📩",
-            body=f"{notification_payload['client_name']} created a booking.",
-            payload=notification_payload,
-            websocket_invite=True,
-        )
+    process_order_created.delay(order.order_id)
 
 def handle_order_updated(order):
 

@@ -3,7 +3,8 @@ from decimal import Decimal, InvalidOperation
 import json
 import os
 import time
-
+from rest_framework_simplejwt.tokens import RefreshToken
+from tokenize import TokenError
 from unittest import result
 from django.db import DatabaseError, transaction, OperationalError
 from django.db import IntegrityError, transaction
@@ -15,12 +16,14 @@ from rest_framework.response import Response
 from rest_framework.decorators import api_view, authentication_classes, permission_classes, throttle_classes
 import logging
 from django.db.models.functions import ACos, Cast, Cos, Radians, Sin
-from django.db.models import F, Count, Q, ExpressionWrapper, FloatField, OuterRef, Prefetch, Subquery
+from django.db.models import F, Avg, Count, Q, ExpressionWrapper, FloatField, ObjectDoesNotExist, OuterRef, Prefetch, Subquery
 from rest_framework import status
 from rest_framework.decorators import api_view, parser_classes
 from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 from rest_framework.response import Response
 from rest_framework.permissions import AllowAny, IsAuthenticated
+from api.bookings.models import OrderService
+from api.bookings.utils.choices import ACTIVE_ORDER_STATUSES
 from api.clientsDB.models.models import ClientAddress, ClientDetails, DeviceToken
 from api.clientsDB.services.client_ip_address_helper import get_client_ip, get_device_info
 from api.clientsDB.services.jwt_client_authentication import ClientJWTAuthentication
@@ -30,26 +33,31 @@ from api.serviceProvidersDB.services.affidavit_verification_service import AIKYC
 from api.serviceProvidersDB.services.kyc_verification_service import KYCService
 from api.serviceProvidersDB.services.service_validator import validate_service_submission
 from api.serviceProvidersDB.services.sp_jwt_authentication import SPJWTAuthentication
-from plug_backend.helpers.auth_helpers import get_service_provider
+from plug_backend.helpers.auth_helpers import get_service_provider, get_sp_profile
 from plug_backend.throttles import AuthThrottle, HeavyReadThrottle, LiveLocationReadThrottle, LiveLocationWriteThrottle, ProfileWriteThrottle, RegisterThrottle, UploadThrottle, UserReadThrottle
 from plug_backend.utils.sp_jwt_helper import generate_sp_tokens
-from .models import CostOfService, CostOfServiceImage, ProviderLoginHistory, ProviderRegistrationHistory, ProviderService, ProviderServiceAffidavit, SPLiveLocation, SPLocationHistory, SPProfile, ServiceGroup, Service, ServiceProvider, Address
+from .models import CostOfService, CostOfServiceImage, ProviderLoginHistory, ProviderQualification, ProviderRegistrationHistory, ProviderService, ProviderServiceAffidavit, ProviderServiceHistory, SPLiveLocation, SPLocationHistory, SPProfile, ServiceGroup, Service, ServiceProvider, Address
 from .serializers import (
     ClientSPProfileReadSerializer,
     ClientServiceProviderReadSerializer,
     CostOfServiceImageReadSerializer,
+    CostOfServiceImageSerializer,
     CostOfServiceImageWriteSerializer,
     CostOfServiceSerializer,
     DeviceTokenWriteSerializer,
+    ProviderQualificationReadSerializer,
     ProviderQualificationSerializer,
     ProviderServiceAffidavitSerializer,
     ProviderSeviceSerializer,
     SPAddressDocumentWriteSerializer,
+    SPCostOfServiceImageReadSerializer,
     SPLiveLocationSerializer,
     SPLoginSerializer,
     SPProfileReadSerializer,
     SPProfileWriteSerializer,
+    SPProviderSeviceSerializer,
     ServiceGroupSerializer,
+    ServiceProviderMyReadSerializer,
     ServiceProviderPatchSerializer,
     
     ServiceProviderProfileSerializer,
@@ -59,7 +67,8 @@ from .serializers import (
     ServiceReadSerializer,
     ServiceSerializer,
     SPAddressSerializer,
-    ServiceWriteSerializer
+    ServiceWriteSerializer,
+    UpdateCostOfServiceSerializer
 )
 from rest_framework.exceptions import ValidationError
 
@@ -791,36 +800,73 @@ def submit_service(request, provider_id):
 
         with transaction.atomic():
 
-            # Existing service
             if validation["status"] == "exists":
-
                 service = validation["service"]
 
-                if ProviderService.objects.filter(
+                existing_provider_service = ProviderService.objects.filter(
                     provider=provider,
-                    service=service
-                ).exists():
-                    return Response(
-                        {"error": "Service already linked to provider."},
-                        status=status.HTTP_400_BAD_REQUEST
+                    service=service,
+                ).first()
+
+                if existing_provider_service:
+                    if existing_provider_service.is_active:
+                        return Response(
+                            {"error": "Service already linked to provider."},
+                            status=status.HTTP_400_BAD_REQUEST,
+                        )
+
+                    existing_provider_service.is_active = True
+                    existing_provider_service.save(update_fields=["is_active"])
+                    ProviderServiceHistory.objects.create(
+                        provider_service=existing_provider_service,
+                        provider=provider,
+                        service=service,
+                        action="reactivated",
+                        notes="Service reactivated by provider.",
+                        created_by=request.user,
                     )
 
+                    provider.sp_profile.is_profile_completed = "in-cost"
+                    provider.sp_profile.save(update_fields=["is_profile_completed"])
+
+                    return Response(
+                        {
+                            "status": "reactivated",
+                            "id": existing_provider_service.id,
+                            "is_primary": existing_provider_service.is_primary,
+                            "service": ServiceReadSerializer(service).data,
+                            "profile_status": provider.sp_profile.is_profile_completed,
+                        },
+                        status=status.HTTP_200_OK,
+                    )
+
+                # First-time link to an already-existing service.
+                # No service_group needed -- the service already has one.
                 provider_service = ProviderService.objects.create(
                     provider=provider,
-                    service=service
+                    service=service,
+                )
+                ProviderServiceHistory.objects.create(
+                    provider_service=provider_service,
+                    provider=provider,
+                    service=service,
+                    action="linked",
+                    notes="Service linked by provider.",
+                    created_by=request.user,
                 )
 
                 provider.sp_profile.is_profile_completed = "in-cost"
                 provider.sp_profile.save(update_fields=["is_profile_completed"])
 
                 return Response({
-                    "status": "linked_existing",
                     "id": provider_service.id,
+                    "status": validation["status"],
                     "is_primary": provider_service.is_primary,
                     "service": ServiceReadSerializer(service).data,
-                    "profile_status": provider.sp_profile.is_profile_completed
-                }, status=status.HTTP_200_OK)
+                    "profile_status": provider.sp_profile.is_profile_completed,
+                }, status=status.HTTP_201_CREATED)
 
+            # --- Only "new" / "requires_review" services get here ---
             # New service requires group
             if not service_group_id:
                 return Response(
@@ -850,6 +896,14 @@ def submit_service(request, provider_id):
                 provider=provider,
                 service=service
             )
+            ProviderServiceHistory.objects.create(
+                provider_service=provider_service,
+                provider=provider,
+                service=service,
+                action="linked",
+                notes="Service linked by provider.",
+                created_by=request.user,
+            )
 
             provider.sp_profile.is_profile_completed = "in-cost"
             provider.sp_profile.save(update_fields=["is_profile_completed"])
@@ -875,7 +929,7 @@ def submit_service(request, provider_id):
         )
 
     except ValidationError:
-        # ❌ no message_dict exposure anymore
+        # No message_dict exposure
         return Response(
             {"error": "Invalid data provided."},
             status=status.HTTP_400_BAD_REQUEST
@@ -1363,19 +1417,30 @@ def get_provider_services(request, provider_id):
 )
 
         provider_services = (
-            ProviderService.objects.select_related(
-                'service',
-                'provider',
-                'cost_of_service',
-                'provider__sp_profile',
-            )
-            .filter(
-                provider=provider,
-                is_active=True,
-            )
-        )
+    ProviderService.objects.select_related(
+        "service",
+        "provider",
+        "cost_of_service",
+        "provider__sp_profile",
+    )
+    .filter(
+        provider=provider,
+        is_active=True,
+    )
+    .annotate(
+        completed_orders=Count(
+            "orderservice",
+            filter=Q(orderservice__status="completed"),
+            distinct=True,
+        ),
+        average_rating=Avg(
+            "orderservice__booking_items__shipments__session__ratings__score"
+        ),
+        
+    )
+)
 
-        serializer = ProviderSeviceSerializer(provider_services, many=True)
+        serializer = SPProviderSeviceSerializer(provider_services, many=True)
 
         return Response(
             {
@@ -1405,6 +1470,300 @@ def get_provider_services(request, provider_id):
             },
             status=status.HTTP_500_INTERNAL_SERVER_ERROR
         )
+
+@api_view(["PATCH"])
+@authentication_classes([SPJWTAuthentication])
+@permission_classes([IsAuthenticated])
+@throttle_classes([UserReadThrottle])
+def provider_update_cost_of_service(request, cost_id):
+    try:
+        sp_profile = get_sp_profile(request)
+        provider = sp_profile.serviceprovider
+
+        # Row-Level Security
+        cost = CostOfService.objects.filter(
+            pk=cost_id,
+            provider_service__provider=provider,
+        ).first()
+
+        if cost is None:
+            return Response(
+                {
+                    "success": False,
+                    "message": "Cost of service not found.",
+                },
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        serializer = UpdateCostOfServiceSerializer(
+            cost,
+            data=request.data,
+            partial=True,
+        )
+
+        if not serializer.is_valid():
+            logger.warning(
+                "Invalid CostOfService update by provider %s: %s",
+                sp_profile.id,
+                serializer.errors,
+            )
+
+            return Response(
+                {
+                    "success": False,
+                    "errors": serializer.errors,
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        serializer.save()
+
+        logger.info(
+            "Provider %s updated CostOfService %s",
+            sp_profile.id,
+            cost_id,
+        )
+
+        return Response(
+            {
+                "success": True,
+                "message": "Cost of service updated successfully.",
+                "data": serializer.data,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+    except ObjectDoesNotExist:
+        return Response(
+            {
+                "success": False,
+                "message": "Authenticated provider not found.",
+            },
+            status=status.HTTP_404_NOT_FOUND,
+        )
+
+    except Exception:
+        logger.exception(
+            "Unexpected error updating CostOfService %s",
+            cost_id,
+        )
+
+        return Response(
+            {
+                "success": False,
+                "message": "An unexpected error occurred. Please try again later.",
+            },
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
+
+
+
+@api_view(["POST"])
+@authentication_classes([SPJWTAuthentication])
+@permission_classes([IsAuthenticated])
+def provider_logout(request):
+    refresh_token = request.data.get("refresh")
+
+    if not refresh_token:
+        return Response(
+            {
+                "success": False,
+                "message": "Refresh token is required.",
+            },
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    try:
+        token = RefreshToken(refresh_token)
+        token.blacklist()
+
+        return Response(
+            {
+                "success": True,
+                "message": "Logged out successfully.",
+            },
+            status=status.HTTP_200_OK,
+        )
+
+    except TokenError:
+        return Response(
+            {
+                "success": False,
+                "message": "Invalid or expired refresh token.",
+            },
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    
+
+@api_view(["GET"])
+@authentication_classes([SPJWTAuthentication])
+@permission_classes([IsAuthenticated])
+@throttle_classes([UserReadThrottle])
+def get_provider_qualifications(request, provider_service_id):
+
+
+
+
+    provider_service = get_object_or_404(
+        ProviderService.objects.select_related(
+            "provider",
+            "provider__sp_profile",
+        ),
+        pk=provider_service_id,
+        provider__sp_profile=request.user,
+      
+        is_active=True,
+    )
+
+    qualifications = (
+        ProviderQualification.objects.filter(
+            provider_service=provider_service,
+        )
+        .order_by("-uploaded_at")
+    )
+    print(provider_service.id)
+
+    serializer = ProviderQualificationReadSerializer(
+        qualifications,
+        many=True,
+        context={"request": request},
+    )
+
+    return Response(
+        {
+            "success": True,
+            "data": serializer.data,
+        },
+        status=status.HTTP_200_OK,
+    )
+
+
+@api_view(["GET"])
+@authentication_classes([SPJWTAuthentication])
+@permission_classes([IsAuthenticated])
+@throttle_classes([UserReadThrottle])
+def get_cost_of_service_images(request, cost_of_service_id):
+    cost_of_service = get_object_or_404(
+        CostOfService.objects.select_related(
+            "provider_service",
+            "provider_service__provider",
+            "provider_service__provider__sp_profile",
+        ),
+        id=cost_of_service_id,
+        provider_service__provider__sp_profile=request.user,
+  
+        provider_service__is_active=True,
+    )
+
+    images = (
+        cost_of_service.images
+        .all()
+        .order_by("-uploaded_at")
+    )
+
+    serializer = SPCostOfServiceImageReadSerializer(
+        images,
+        many=True,
+        context={"request": request},
+    )
+
+    return Response(
+        {
+            "success": True,
+            "count": images.count(),
+            "data": serializer.data,
+        },
+        status=status.HTTP_200_OK,
+    )
+
+
+@api_view(["PATCH"])
+@authentication_classes([SPJWTAuthentication])
+@permission_classes([IsAuthenticated])
+@throttle_classes([ProfileWriteThrottle])
+@transaction.atomic
+def deactivate_provider_service(request, provider_service_id):
+
+    provider_service = get_object_or_404(
+        ProviderService.objects.select_related(
+            "provider",
+            "provider__sp_profile",
+            "service",
+            "cost_of_service",
+        ),
+        id=provider_service_id,
+        provider__sp_profile=request.user,
+        is_active=True,
+    )
+
+    # Primary service cannot be removed
+    if provider_service.is_primary:
+        return Response(
+            {
+                "success": False,
+                "message": "Your primary service cannot be removed.",
+            },
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    # ------------------------------------------------------------------
+    # Prevent removal if this service is still involved in active orders
+    # ------------------------------------------------------------------
+
+    has_active_orders = OrderService.objects.filter(
+        service_required=provider_service.service,
+        status__in=ACTIVE_ORDER_STATUSES,
+    ).filter(
+        Q(provider_for_service=provider_service) |
+        Q(invited_providers=provider_service.provider.sp_profile)
+    ).distinct().exists()
+
+    if has_active_orders:
+        return Response(
+            {
+                "success": False,
+                "message": (
+                    "This service cannot be removed because it is still linked "
+                    "to one or more active orders."
+                ),
+            },
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    # ------------------------------------------------------------------
+    # Delete all service images
+    # ------------------------------------------------------------------
+
+    if provider_service.cost_of_service:
+        for image in provider_service.cost_of_service.images.all():
+            if image.image:
+                image.image.delete(save=False)
+            image.delete()
+
+    # ------------------------------------------------------------------
+    # Deactivate service
+    # ------------------------------------------------------------------
+
+    provider_service.is_active = False
+    provider_service.save(update_fields=["is_active"])
+
+    ProviderServiceHistory.objects.create(
+        provider_service=provider_service,
+        provider=provider_service.provider,
+        service=provider_service.service,
+        action="deactivated",
+        notes="Service removed by provider.",
+    )
+
+    return Response(
+        {
+            "success": True,
+            "message": "Service removed successfully.",
+        },
+        status=status.HTTP_200_OK,
+    )
+
+    
 
 @api_view(['POST'])
 @throttle_classes([ProfileWriteThrottle])
@@ -1853,6 +2212,222 @@ def service_provider_list_service(request):
             status=status.HTTP_500_INTERNAL_SERVER_ERROR
         )
 
+@api_view(["POST"])
+@authentication_classes([SPJWTAuthentication])
+@permission_classes([IsAuthenticated])
+@throttle_classes([UserReadThrottle])
+def upload_cost_of_service_image(request, cost_id):
+    try:
+        sp_profile = get_sp_profile(request)
+        provider = sp_profile.serviceprovider
+
+        cost = CostOfService.objects.filter(
+            pk=cost_id,
+            provider_service__provider=provider,
+        ).first()
+
+        if cost is None:
+            return Response(
+                {
+                    "success": False,
+                    "message": "Cost of service not found.",
+                },
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        serializer = CostOfServiceImageSerializer(
+            data=request.data
+        )
+
+        if not serializer.is_valid():
+            
+            return Response(
+                {
+                    "success": False,
+                    "errors": serializer.errors,
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        serializer.save(cost_of_service=cost)
+
+        logger.info(
+            "Provider %s uploaded image for CostOfService %s",
+            sp_profile.id,
+            cost_id,
+        )
+
+        return Response(
+            {
+                "success": True,
+                "message": "Image uploaded successfully.",
+                "data": serializer.data,
+            },
+            status=status.HTTP_201_CREATED,
+        )
+
+    except ObjectDoesNotExist:
+        if not serializer.is_valid():
+            print(serializer.errors)
+            return Response(
+                {
+                    "success": False,
+                    "errors": serializer.errors,
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+    except Exception:
+        logger.exception(
+            "Unexpected error uploading service image."
+        )
+
+        return Response(
+            {
+                "success": False,
+                "message": "An unexpected error occurred.",
+            },
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
+
+
+@api_view(["DELETE"])
+@authentication_classes([SPJWTAuthentication])
+@permission_classes([IsAuthenticated])
+@throttle_classes([UserReadThrottle])
+def delete_provider_qualification(request, qualification_id):
+    try:
+        sp_profile = get_sp_profile(request)
+        provider = sp_profile.serviceprovider
+
+        qualification = ProviderQualification.objects.filter(
+            pk=qualification_id,
+            provider_service__provider=provider,
+        ).first()
+
+        if qualification is None:
+            return Response(
+                {
+                    "success": False,
+                    "message": "Qualification not found.",
+                },
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        qualification.document.delete(save=False)
+        qualification.delete()
+
+        logger.info(
+            "Provider %s deleted qualification %s",
+            sp_profile.id,
+            qualification_id,
+        )
+
+        return Response(
+            {
+                "success": True,
+                "message": "Qualification deleted successfully.",
+            },
+            status=status.HTTP_200_OK,
+        )
+
+    except ObjectDoesNotExist:
+        return Response(
+            {
+                "success": False,
+                "message": "Authenticated provider not found.",
+            },
+            status=status.HTTP_404_NOT_FOUND,
+        )
+
+    except Exception:
+        logger.exception(
+            "Unexpected error deleting qualification."
+        )
+
+        return Response(
+            {
+                "success": False,
+                "message": "An unexpected error occurred.",
+            },
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
+
+
+@api_view(["DELETE"])
+@authentication_classes([SPJWTAuthentication])
+@permission_classes([IsAuthenticated])
+@throttle_classes([UserReadThrottle])
+def delete_cost_of_service_image(request, image_id):
+    try:
+        sp_profile = get_sp_profile(request)
+        provider = sp_profile.serviceprovider
+
+        image = CostOfServiceImage.objects.filter(
+            pk=image_id,
+            cost_of_service__provider_service__provider=provider,
+        ).select_related("cost_of_service").first()
+
+        if image is None:
+            return Response(
+                {
+                    "success": False,
+                    "message": "Image not found.",
+                },
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        image_count = CostOfServiceImage.objects.filter(
+            cost_of_service=image.cost_of_service,
+        ).count()
+
+        if image_count <= 1:
+            return Response(
+                {
+                    "success": False,
+                    "message": "At least one service image is required.",
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        image.image.delete(save=False)
+        image.delete()
+
+        logger.info(
+            "Provider %s deleted service image %s",
+            sp_profile.id,
+            image_id,
+        )
+
+        return Response(
+            {
+                "success": True,
+                "message": "Image deleted successfully.",
+            },
+            status=status.HTTP_200_OK,
+        )
+
+    except ObjectDoesNotExist:
+        return Response(
+            {
+                "success": False,
+                "message": "Authenticated provider not found.",
+            },
+            status=status.HTTP_404_NOT_FOUND,
+        )
+
+    except Exception:
+        logger.exception(
+            "Unexpected error deleting service image."
+        )
+
+        return Response(
+            {
+                "success": False,
+                "message": "An unexpected error occurred.",
+            },
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
     
     
     
@@ -2020,38 +2595,42 @@ def service_provider_detail(request, provider_id):
     
 
 @api_view(['GET'])
+@throttle_classes([UserReadThrottle])
 @authentication_classes([SPJWTAuthentication])
 @permission_classes([IsAuthenticated])
 def service_provider_details(request, provider_id):
 
     try:
         provider = ServiceProvider.objects.select_related(
-            "sp_profile"
+            "sp_profile",
+            "live_location",
         ).get(
-            sp_profile__id=provider_id
+            sp_profile__id=provider_id,
         )
 
-        serializer = ServiceProviderReadSerializer(provider)
+        serializer = ServiceProviderMyReadSerializer(provider)
 
         return Response(
             serializer.data,
-            status=status.HTTP_200_OK
+            status=status.HTTP_200_OK,
         )
 
     except ServiceProvider.DoesNotExist:
         return Response(
             {"error": "Service Provider not found."},
-            status=status.HTTP_404_NOT_FOUND
+            status=status.HTTP_404_NOT_FOUND,
         )
 
     except Exception:
-        logger.error("Unexpected error in service_provider_details", exc_info=True)
+        logger.error(
+            "Unexpected error in service_provider_details",
+            exc_info=True,
+        )
 
         return Response(
             {"error": "Unexpected server error."},
-            status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
         )
-
 
     
 # -------- ServiceProvider Address --------

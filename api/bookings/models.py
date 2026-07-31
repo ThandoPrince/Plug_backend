@@ -154,7 +154,7 @@ class OrderService(models.Model):
         - After that, mark the order as overdue.
         """
 
-        if self.status not in ["pending", "in-negociation", "rescheduled"]:
+        if self.status not in ["pending", "in-negociation", "rescheduled","overdue"]:
             return
 
         if not self.requested_date or not self.requested_date_time:
@@ -169,6 +169,7 @@ class OrderService(models.Model):
         )
 
         minimum_time = timezone.now() + timedelta(minutes=10)
+        rescheduled = False
 
         while scheduled < minimum_time:
 
@@ -179,11 +180,12 @@ class OrderService(models.Model):
 
             scheduled += timedelta(hours=1)
             self.reschedule_count += 1
+            rescheduled = True
 
         self.requested_date = scheduled.date()
         self.requested_date_time = scheduled.time()
 
-        if self.status == "pending":
+        if rescheduled and self.status != "overdue":
             self.status = "rescheduled"         
 
     def _cascade_negotiation_cancellation(self):

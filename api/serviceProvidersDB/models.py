@@ -295,6 +295,10 @@ class ServiceProvider(models.Model):
         null=True,
         blank=True
     )
+
+
+
+
 class DeviceToken(models.Model):
     DEVICE_TYPES = (
         ("android", "Android"),
@@ -434,6 +438,10 @@ class ProviderService(models.Model):
     default=False,
     db_index=True,
 )
+    date_created = models.DateTimeField(
+        auto_now_add=True,
+        db_index=True,
+    )
     
 
     is_primary = models.BooleanField(default=False, db_index=True)
@@ -451,6 +459,7 @@ class ProviderService(models.Model):
 
         indexes = [
             models.Index(fields=['provider','is_active']),
+            models.Index(fields=['date_created']),
             models.Index(fields=['service']),
             models.Index(fields=['cost_of_service']),
             models.Index(fields=['is_primary']),
@@ -460,49 +469,90 @@ class ProviderService(models.Model):
         ]
 
     def clean(self):
-        """
-        Business Rules:
-        - Max 3 services per provider
-        """
-
-        if self.pk:
+        # Only validate when creating a new active service
+        if self.pk is None and self.is_active:
             existing_count = ProviderService.objects.filter(
-                provider=self.provider
-            ).exclude(pk=self.pk).count()
-        else:
-            existing_count = ProviderService.objects.filter(
-    provider=self.provider,
-    is_active=True,
-).count()
+                provider=self.provider,
+                is_active=True,
+            ).count()
 
-        if existing_count >= 3:
-            raise ValidationError(
-                "A provider can only have a maximum of 3 services."
-            )
-
+            if existing_count >= 3:
+                raise ValidationError(
+                    "A provider can only have a maximum of 3 active services."
+                )
     def save(self, *args, **kwargs):
         with transaction.atomic():
 
             is_new = self.pk is None
 
-            # If first service → auto primary
             if is_new and not ProviderService.objects.filter(
-                provider=self.provider
+                provider=self.provider,
+                is_active=True,
             ).exists():
                 self.is_primary = True
 
-            # If marking as primary → unset others
             if self.is_primary:
                 ProviderService.objects.filter(
                     provider=self.provider,
-                    is_primary=True
-                ).exclude(pk=self.pk).update(is_primary=False)
+                    is_primary=True,
+                ).exclude(pk=self.pk).update(
+                    is_primary=False,
+                )
 
             self.full_clean()
             super().save(*args, **kwargs)
+    
+class ProviderServiceHistory(models.Model):
+    ACTION_CHOICES = [
+        ("linked", "Linked"),
+        ("updated", "Updated"),
+        ("primary_changed", "Primary Changed"),
+        ("deactivated", "Deactivated"),
+        ("reactivated", "Reactivated"),
+    ]
 
-    def __str__(self):
-        return f"{self.provider.full_name} - {self.service.service_name}"
+    provider_service = models.ForeignKey(
+        ProviderService,
+        on_delete=models.CASCADE,
+        related_name="history",
+    )
+
+    provider = models.ForeignKey(
+        ServiceProvider,
+        on_delete=models.CASCADE,
+        related_name="provider_service_history",
+    )
+
+    service = models.ForeignKey(
+        Service,
+        on_delete=models.CASCADE,
+    )
+
+    action = models.CharField(
+        max_length=30,
+        choices=ACTION_CHOICES,
+        db_index=True,
+    )
+
+    notes = models.TextField(
+        blank=True,
+        null=True,
+    )
+
+    created_at = models.DateTimeField(
+        auto_now_add=True,
+        db_index=True,
+    )
+
+    created_by = models.ForeignKey(
+        SPProfile,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+    )
+
+    class Meta:
+        ordering = ["-created_at"]
 
 
 class ProviderServiceAffidavit(models.Model):
@@ -760,23 +810,40 @@ class SupportingDocument(models.Model):
 
 class SPLiveLocation(models.Model):
     provider = models.OneToOneField(
-        ServiceProvider, 
-        on_delete=models.CASCADE, 
-        related_name="live_location", db_index=True
+        ServiceProvider,
+        on_delete=models.CASCADE,
+        related_name="live_location",
+        db_index=True,
     )
-    latitude = models.DecimalField(max_digits=9, decimal_places=6, db_index=True)
-    longitude = models.DecimalField(max_digits=9, decimal_places=6, db_index=True)
-    updated_at = models.DateTimeField(auto_now=True, db_index=True)
 
-    class Meta:
-        indexes = [
-            models.Index(fields=["provider","latitude", "longitude"]),
-             models.Index(fields=["updated_at"]),
-           
-    ]
+    latitude = models.DecimalField(max_digits=9, decimal_places=6,db_index=True,)
+    longitude = models.DecimalField(max_digits=9, decimal_places=6,db_index=True,)
 
-    def __str__(self):
-        return f"{self.provider.full_name} - ({self.latitude}, {self.longitude}) @ {self.updated_at}"
+    suburb = models.CharField(
+        max_length=100,
+        blank=True,
+        null=True,db_index=True,
+    )
+
+    city = models.CharField(
+        max_length=100,
+        blank=True,
+        null=True,db_index=True,
+    )
+
+    province = models.CharField(
+        max_length=100,
+        blank=True,
+        null=True,db_index=True,
+    )
+
+    updated_at = models.DateTimeField(auto_now=True,db_index=True,)
+
+    class Meta: 
+        indexes = [ models.Index(fields=["provider","latitude", "longitude"]),
+                    models.Index(fields=["updated_at"]),
+                    models.Index(fields=["suburb","city"]),
+                     ]
     
 class SPLocationHistory(models.Model):
     provider = models.ForeignKey(ServiceProvider, on_delete=models.CASCADE, related_name="location_history", db_index=True)

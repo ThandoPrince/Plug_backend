@@ -10,12 +10,31 @@ ORDER_STATUS = [
     ('overdue', 'Overdue'),
     ('completed', 'Completed'),
     ('canceled', 'Canceled'),
-    ('failed', 'Failed'),
+    
     ('awaiting_payment', 'Awaiting Payment'),
     ('in_session', 'In Session'),
     ('awaiting_rating', 'Awaiting Rating'),
 
 ]
+
+CLOSED_STATUSES = [
+    "declined",
+    "completed",
+    "canceled",
+    "overdue",
+]
+
+ACTIVE_ORDER_STATUSES = [
+    "pending",
+    "accepted",
+    "scheduled",
+    "in_transit",
+    "arrived",
+    "in_session",
+    "rescheduled",
+]
+
+
 BUILDING_TYPE_CHOICES  = [("house", "House"),
         ("apartment", "Apartment / Flat"),
         ("complex", "Estate / Complex"),

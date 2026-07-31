@@ -31,7 +31,8 @@ SIMPLE_JWT = {
 SECRET_KEY = get_env("DJANGO_SECRET_KEY", required=True)
 DEBUG = get_env("DJANGO_DEBUG", "False").lower() == "true"
 AI_API_KEY = get_env("AI_API_KEY")
-AI_KYC_API_URL = os.getenv("AI_KYC_API_URL")
+AI_KYC_API_URL = get_env("AI_KYC_API_URL")
+GOOGLE_MAPS_API_KEY = os.getenv("GOOGLE_MAPS_API_KEY")
 
 ALLOWED_HOSTS = [
     host.strip()
@@ -186,15 +187,18 @@ REST_FRAMEWORK = {
 
 }
 
-REDIS_URL = get_env("REDIS_URL", "")  # optional, no crash
+REDIS_URL = get_env("REDIS_URL", "") 
 
 if DEBUG or not REDIS_URL:
     # Local or fallback (no Redis)
     CHANNEL_LAYERS = {
-        "default": {
-            "BACKEND": "channels.layers.InMemoryChannelLayer",
-        }
-    }
+    "default": {
+        "BACKEND": "channels_redis.core.RedisChannelLayer",
+        "CONFIG": {
+            "hosts": [REDIS_URL],
+        },
+    },
+}
 else:
     # Production with Redis
     CHANNEL_LAYERS = {
@@ -209,6 +213,19 @@ else:
 SESSION_GEOFENCE_RADIUS_METERS = int(get_env("SESSION_GEOFENCE_RADIUS_METERS", "45"))
 SESSION_GEOFENCE_GRACE_SECONDS = int(get_env("SESSION_GEOFENCE_GRACE_SECONDS", "120"))
 SESSION_GEOFENCE_PING_INTERVAL_SECONDS = int(get_env("SESSION_GEOFENCE_PING_INTERVAL_SECONDS", "20"))
+
+
+# CELERY_BROKER_URL = "redis://redis:6379/0"
+CELERY_BROKER_URL = "redis://127.0.0.1:6379/0"
+CELERY_RESULT_BACKEND = "redis://127.0.0.1:6379/0"
+
+CELERY_ACCEPT_CONTENT = ["json"]
+
+CELERY_TASK_SERIALIZER = "json"
+
+CELERY_RESULT_SERIALIZER = "json"
+
+CELERY_TIMEZONE = "Africa/Johannesburg"
 
 
 # ============================================================================

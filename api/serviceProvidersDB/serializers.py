@@ -941,6 +941,56 @@ class ClientServiceSerializer(serializers.ModelSerializer):
         )
         return Service.objects.create(service_group=group, **validated_data)
 
+
+
+
+
+class SPCostOfServiceImageReadSerializer(serializers.ModelSerializer):
+    image_url = serializers.SerializerMethodField()
+
+    class Meta:
+        model = CostOfServiceImage
+        fields = [
+            "id",
+            "image_url",
+            "uploaded_at",
+        ]
+
+    def get_image_url(self, obj):
+        request = self.context.get("request")
+
+        if obj.image:
+            if request:
+                return request.build_absolute_uri(obj.image.url)
+            return obj.image.url
+
+        return None
+
+class ProviderQualificationReadSerializer(serializers.ModelSerializer):
+    document_url = serializers.SerializerMethodField()
+
+    class Meta:
+        model = ProviderQualification
+        fields = [
+            "id",
+            "provider_service",
+            "document_type",
+            "title",
+            "issuing_body",
+            "issue_date",
+            "expiry_date",
+            "document_url",
+            "uploaded_at",
+        ]
+
+    def get_document_url(self, obj):
+        request = self.context.get("request")
+
+        if obj.document:
+            return request.build_absolute_uri(obj.document.url)
+
+        return None
+
 class ServiceProviderReadSerializer(serializers.ModelSerializer):
     sp_profile = SPProfileMyReadSerializer()
   
@@ -948,6 +998,38 @@ class ServiceProviderReadSerializer(serializers.ModelSerializer):
     class Meta:
         model = ServiceProvider
         exclude = ['id_number']
+
+
+class SPProfileLiveLocationSerializer(serializers.ModelSerializer):
+
+    class Meta:
+        model = SPLiveLocation
+        fields = [
+            "suburb",
+            "city",
+            "province",
+            "updated_at",
+        ]
+
+class ServiceProviderMyReadSerializer(serializers.ModelSerializer):
+    sp_profile = SPProfileMyReadSerializer()
+    live_location = SPProfileLiveLocationSerializer(
+        read_only=True,
+    )
+
+  
+
+    class Meta:
+        model = ServiceProvider
+        exclude = ['id_number']
+
+
+
+
+
+
+
+
 
 class ClientServiceProviderReadSerializer(serializers.ModelSerializer):
     sp_profile = ClientSPProfileReadSerializer()
@@ -964,6 +1046,59 @@ class CostOfServiceReadSerializer(serializers.ModelSerializer):
             "negotiable",
             "notes",
         ]
+
+class SPProviderSeviceSerializer(serializers.ModelSerializer):
+    service = ServiceSerializer()
+    provider = ServiceProviderReadSerializer()
+    cost_of_service = CostOfServiceReadSerializer()
+    completed_orders = serializers.IntegerField(read_only=True)
+    average_rating = serializers.FloatField(read_only=True)
+    class Meta:
+        model = ProviderService
+        fields = '__all__'
+
+class UpdateCostOfServiceSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = CostOfService
+        fields = [
+            "base_price",
+            "notes",
+        ]
+
+    def validate_base_price(self, value):
+        if value is not None and value < 0:
+            raise serializers.ValidationError(
+                "Base price cannot be negative."
+            )
+        return value
+
+class DeleteProviderQualificationSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ProviderQualification
+        fields = ("id",)
+
+class CostOfServiceImageSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = CostOfServiceImage
+        fields = [
+            "id",
+            "image",
+            "uploaded_at",
+        ]
+        read_only_fields = [
+            "id",
+            "uploaded_at",
+        ]
+
+    def validate_image(self, value):
+        max_size = 10 * 1024 * 1024  # 10MB
+
+        if value.size > max_size:
+            raise serializers.ValidationError(
+                "Image must not exceed 10MB."
+            )
+
+        return value
 
 class ProviderSeviceSerializer(serializers.ModelSerializer):
     service = ServiceSerializer()
