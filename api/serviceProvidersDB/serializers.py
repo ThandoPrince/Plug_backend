@@ -596,18 +596,18 @@ class ProviderServiceCostPatchSerializer(serializers.Serializer):
 
 
 class SPAddressDocumentWriteSerializer(serializers.Serializer):
-    email = serializers.EmailField(write_only=True)
     address = AddressWriteSerializer()
 
     id_type = serializers.ChoiceField(
-        choices=[("greenbook", "Green Book"), ("card", "ID Card")],
-        required=False
+        choices=[
+            ("greenbook", "Green Book"),
+            ("card", "ID Card"),
+        ],
+        required=False,
     )
 
     front_file = serializers.FileField(required=True)
     back_file = serializers.FileField(required=False, allow_null=True)
-
-    # 🔥 NEW: LIVENESS VIDEO
     liveness_video = serializers.FileField(required=False, allow_null=True)
 
     def validate(self, attrs):
@@ -627,62 +627,59 @@ class SPAddressDocumentWriteSerializer(serializers.Serializer):
 
         if id_type == "greenbook":
             if not front_file:
-                raise serializers.ValidationError("Greenbook requires a front file.")
+                raise serializers.ValidationError(
+                    "Green Book requires a front file."
+                )
 
             if back_file and back_file.size > 0:
                 raise serializers.ValidationError(
-                    "Greenbook does not require a back file."
+                    "Green Book does not require a back file."
                 )
 
         elif id_type == "card":
             if not front_file or not back_file:
                 raise serializers.ValidationError(
-                    "Card requires both front and back files."
+                    "ID Card requires both front and back files."
                 )
 
-        
-        if id_type == "card" and not liveness_video:
+        if not liveness_video:
             raise serializers.ValidationError(
-                "Liveness video is required for ID Card verification."
-            )
-        if id_type == "greenbook" and not liveness_video:
-            raise serializers.ValidationError(
-                "Liveness video is required for Green Book verification."
+                "A liveness video is required."
             )
 
-        if liveness_video:
-            if liveness_video.size > 10 * 1024 * 1024:
-                raise serializers.ValidationError(
-                    "Liveness video must be less than 10MB."
-                )
+        if liveness_video.size > 10 * 1024 * 1024:
+            raise serializers.ValidationError(
+                "Liveness video must be less than 10MB."
+            )
 
-            if liveness_video.size < 50 * 1024:
-                raise serializers.ValidationError(
-                    "Liveness video too small or invalid."
-                )
+        if liveness_video.size < 50 * 1024:
+            raise serializers.ValidationError(
+                "Liveness video is too small or invalid."
+            )
 
-        return attrs 
+        return attrs
+
     def create(self, validated_data):
         address_data = validated_data.pop("address")
-        email = validated_data.pop("email")
-        id_type = validated_data.pop("id_type", None)
 
-        front_file = validated_data.pop("front_file", None)
+        id_type = validated_data.pop("id_type")
+        front_file = validated_data.pop("front_file")
         back_file = validated_data.pop("back_file", None)
-        liveness_video = validated_data.pop("liveness_video", None)
+        liveness_video = validated_data.pop("liveness_video")
+
+        sp_profile = validated_data.pop("sp_profile")
 
         provider = ServiceProvider.objects.select_related(
             "sp_profile"
         ).get(
-            sp_profile__email_address=email
+            sp_profile=sp_profile,
         )
 
-        # Update provider address
-        address_obj = Address.objects.create(**address_data)
-        provider.location = address_obj
+        address = Address.objects.create(**address_data)
+
+        provider.location = address
         provider.save(update_fields=["location"])
 
-        # Create KYC document
         document = SupportingDocument.objects.create(
             provider=provider,
             id_type=id_type.lower(),
@@ -696,7 +693,6 @@ class SPAddressDocumentWriteSerializer(serializers.Serializer):
             "provider": provider,
             "document": document,
         }
-
 
 class CostOfServiceImageReadSerializer(serializers.ModelSerializer):
     image_url = serializers.SerializerMethodField()

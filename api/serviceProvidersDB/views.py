@@ -257,7 +257,7 @@ def sp_add_address_document(request):
     sp_profile = get_sp_profile(request)
 
     clean_data = {
-    "sp_profile": sp_profile,
+    
     "address": address_dict,
     "id_type": request.data.get("id_type"),
     "front_file": request.FILES.get("front_file"),
@@ -281,6 +281,7 @@ def sp_add_address_document(request):
             "SP address document validation failed: %s",
             serializer.errors
         )
+        
 
         return Response(
             {
@@ -290,6 +291,9 @@ def sp_add_address_document(request):
             },
             status=status.HTTP_400_BAD_REQUEST,
         )
+    result = serializer.save(
+                sp_profile=sp_profile,
+    )
 
     def save_temp(file_obj, filename):
         if not file_obj:
