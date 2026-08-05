@@ -1,5 +1,6 @@
 import os
 
+from psycopg import logger
 import requests
 from django.conf import settings
 

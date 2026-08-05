@@ -300,37 +300,51 @@ def sp_add_address_document(request):
         path = f"temp/{filename}"
         saved_path = default_storage.save(path, file_obj)
         return default_storage.path(saved_path)
-    
+
     front_path = back_path = liveness_path = None
 
     try:
         with transaction.atomic():
 
             # ----------------------------------
-            # Save provider + document
+            # Save temp files FIRST — before the
+            # serializer/model consumes (moves) them
+            # ----------------------------------
+            front_path = save_temp(
+                clean_data["front_file"],
+                f"{sp_profile.pk}_front.jpg"
+            )
+
+            back_path = save_temp(
+                clean_data["back_file"],
+                f"{sp_profile.pk}_back.jpg"
+            )
+
+            liveness_path = save_temp(
+                clean_data["liveness_video"],
+                f"{sp_profile.pk}_liveness.mp4"
+            )
+
+            # ----------------------------------
+            # Rewind file pointers — save_temp() read
+            # them to EOF, so without this the model
+            # save below will write empty files
+            # ----------------------------------
+            for f in (
+                clean_data["front_file"],
+                clean_data["back_file"],
+                clean_data["liveness_video"],
+            ):
+                if f:
+                    f.seek(0)
+
+            # ----------------------------------
+            # Now save provider + document
             # ----------------------------------
             result = serializer.save(sp_profile=sp_profile)
 
             service_provider = result["provider"]
             document = result["document"]
-
-            # ----------------------------------
-            # Save temp files
-            # ----------------------------------
-            front_path = save_temp(
-                clean_data["front_file"],
-                f"{service_provider.pk}_front.jpg"
-            )
-
-            back_path = save_temp(
-                clean_data["back_file"],
-                f"{service_provider.pk}_back.jpg"
-            )
-
-            liveness_path = save_temp(
-                clean_data["liveness_video"],
-                f"{service_provider.pk}_liveness.mp4"
-            )
 
             # ----------------------------------
             # Call AI
