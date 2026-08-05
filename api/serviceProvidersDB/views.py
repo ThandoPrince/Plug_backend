@@ -33,6 +33,7 @@ from api.serviceProvidersDB.services.affidavit_verification_service import AIKYC
 from api.serviceProvidersDB.services.kyc_verification_service import KYCService
 from api.serviceProvidersDB.services.service_validator import validate_service_submission
 from api.serviceProvidersDB.services.sp_jwt_authentication import SPJWTAuthentication
+from plug_backend import settings
 from plug_backend.helpers.auth_helpers import get_service_provider, get_sp_profile
 from plug_backend.throttles import AuthThrottle, HeavyReadThrottle, LiveLocationReadThrottle, LiveLocationWriteThrottle, ProfileWriteThrottle, RegisterThrottle, UploadThrottle, UserReadThrottle
 from plug_backend.utils.sp_jwt_helper import generate_sp_tokens
