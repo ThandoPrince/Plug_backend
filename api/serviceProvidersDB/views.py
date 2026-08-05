@@ -254,15 +254,17 @@ def sp_add_address_document(request):
             },
             status=status.HTTP_400_BAD_REQUEST,
         )
+    sp_profile = get_sp_profile(request)
 
     clean_data = {
-        "email": request.data.get("email"),
-        "address": address_dict,
-        "id_type": request.data.get("id_type"),
-        "front_file": request.FILES.get("front_file"),
-        "back_file": request.FILES.get("back_file"),
-        "liveness_video": request.FILES.get("liveness_video"),
-    }
+    "sp_profile": sp_profile,
+    "address": address_dict,
+    "id_type": request.data.get("id_type"),
+    "front_file": request.FILES.get("front_file"),
+    "back_file": request.FILES.get("back_file"),
+    "liveness_video": request.FILES.get("liveness_video"),
+}
+    
     liveness = request.FILES.get("liveness_video")
 
     if liveness:
@@ -955,6 +957,394 @@ def submit_service(request, provider_id):
             {"error": "Unexpected server error."},
             status=status.HTTP_500_INTERNAL_SERVER_ERROR
         )
+
+
+@api_view(['POST'])
+@throttle_classes([ProfileWriteThrottle])
+@authentication_classes([SPJWTAuthentication])
+@permission_classes([IsAuthenticated])
+def submit_service(request, provider_id):
+
+    try:
+        service_name = request.data.get("service_name")
+        description = request.data.get("description", "")
+        service_group_id = request.data.get("service_group")
+
+        if not service_name:
+            return Response(
+                {"error": "service_name is required"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # Provider lookup
+        provider = ServiceProvider.objects.select_related('sp_profile').get(
+            sp_profile__id=provider_id
+        )
+
+        validation = validate_service_submission(service_name, description)
+
+        if validation["status"] == "rejected":
+            return Response({
+                "status": "rejected",
+                "reason": validation.get("reason", "Service violates policy")
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        with transaction.atomic():
+
+            if validation["status"] == "exists":
+                service = validation["service"]
+
+                existing_provider_service = ProviderService.objects.filter(
+                    provider=provider,
+                    service=service,
+                ).first()
+
+                if existing_provider_service:
+                    if existing_provider_service.is_active:
+                        return Response(
+                            {"error": "Service already linked to provider."},
+                            status=status.HTTP_400_BAD_REQUEST,
+                        )
+
+                    existing_provider_service.is_active = True
+                    existing_provider_service.save(update_fields=["is_active"])
+                    ProviderServiceHistory.objects.create(
+                        provider_service=existing_provider_service,
+                        provider=provider,
+                        service=service,
+                        action="reactivated",
+                        notes="Service reactivated by provider.",
+                        created_by=request.user,
+                    )
+
+                    provider.sp_profile.is_profile_completed = "in-cost"
+                    provider.sp_profile.save(update_fields=["is_profile_completed"])
+
+                    return Response(
+                        {
+                            "status": "reactivated",
+                            "id": existing_provider_service.id,
+                            "is_primary": existing_provider_service.is_primary,
+                            "service": ServiceReadSerializer(service).data,
+                            "profile_status": provider.sp_profile.is_profile_completed,
+                        },
+                        status=status.HTTP_200_OK,
+                    )
+
+                # First-time link to an already-existing service.
+                # No service_group needed -- the service already has one.
+                provider_service = ProviderService.objects.create(
+                    provider=provider,
+                    service=service,
+                )
+                ProviderServiceHistory.objects.create(
+                    provider_service=provider_service,
+                    provider=provider,
+                    service=service,
+                    action="linked",
+                    notes="Service linked by provider.",
+                    created_by=request.user,
+                )
+
+                provider.sp_profile.is_profile_completed = "in-cost"
+                provider.sp_profile.save(update_fields=["is_profile_completed"])
+
+                return Response({
+                    "id": provider_service.id,
+                    "status": validation["status"],
+                    "is_primary": provider_service.is_primary,
+                    "service": ServiceReadSerializer(service).data,
+                    "profile_status": provider.sp_profile.is_profile_completed,
+                }, status=status.HTTP_201_CREATED)
+
+            # --- Only "new" / "requires_review" services get here ---
+            # New service requires group
+            if not service_group_id:
+                return Response(
+                    {"error": "service_group is required for new service."},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+            service_group = ServiceGroup.objects.select_related('category').get(
+                group_id=service_group_id
+            )
+
+            review_status = (
+                "PENDING"
+                if validation["status"] == "requires_review"
+                else "APPROVED"
+            )
+
+            service = Service.objects.create(
+                service_name=service_name.strip().title(),
+                description=description,
+                service_group=service_group,
+                review_status=review_status,
+                risk_level=service_group.category.risk_level
+            )
+
+            provider_service = ProviderService.objects.create(
+                provider=provider,
+                service=service
+            )
+            ProviderServiceHistory.objects.create(
+                provider_service=provider_service,
+                provider=provider,
+                service=service,
+                action="linked",
+                notes="Service linked by provider.",
+                created_by=request.user,
+            )
+
+            provider.sp_profile.is_profile_completed = "in-cost"
+            provider.sp_profile.save(update_fields=["is_profile_completed"])
+
+            return Response({
+                "id": provider_service.id,
+                "status": validation["status"],
+                "is_primary": provider_service.is_primary,
+                "service": ServiceReadSerializer(service).data,
+                "profile_status": provider.sp_profile.is_profile_completed
+            }, status=status.HTTP_201_CREATED)
+
+    except ServiceProvider.DoesNotExist:
+        return Response(
+            {"error": "Provider not found."},
+            status=status.HTTP_404_NOT_FOUND
+        )
+
+    except ServiceGroup.DoesNotExist:
+        return Response(
+            {"error": "Invalid service group."},
+            status=status.HTTP_400_BAD_REQUEST
+        )
+
+    except ValidationError as e:
+        message = (
+        e.messages[0]
+        if hasattr(e, "messages") and e.messages
+        else str(e)
+    )
+        
+        return Response(
+            {"error": message},
+        status=status.HTTP_400_BAD_REQUEST,
+    )
+
+    except IntegrityError:
+        logger.error("Integrity error in submit_service", exc_info=True)
+        return Response(
+            {"error": "Request could not be completed."},
+            status=status.HTTP_400_BAD_REQUEST
+        )
+
+    except DatabaseError:
+        logger.error("Database error in submit_service", exc_info=True)
+        return Response(
+            {"error": "Service temporarily unavailable."},
+            status=status.HTTP_503_SERVICE_UNAVAILABLE
+        )
+
+    except Exception:
+        logger.error("Unhandled error in submit_service", exc_info=True)
+        return Response(
+            {"error": "Unexpected server error."},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR
+        )
+
+
+
+@api_view(['POST'])
+@throttle_classes([ProfileWriteThrottle])
+@authentication_classes([SPJWTAuthentication])
+@permission_classes([IsAuthenticated])
+def a_submit_service(request, provider_id):
+
+    try:
+        service_name = request.data.get("service_name")
+        description = request.data.get("description", "")
+        service_group_id = request.data.get("service_group")
+
+        if not service_name:
+            return Response(
+                {"error": "service_name is required"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # Provider lookup
+        provider = ServiceProvider.objects.select_related('sp_profile').get(
+            sp_profile__id=provider_id
+        )
+
+        validation = validate_service_submission(service_name, description)
+
+        if validation["status"] == "rejected":
+            return Response({
+                "status": "rejected",
+                "reason": validation.get("reason", "Service violates policy")
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        with transaction.atomic():
+
+            if validation["status"] == "exists":
+                service = validation["service"]
+
+                existing_provider_service = ProviderService.objects.filter(
+                    provider=provider,
+                    service=service,
+                ).first()
+
+                if existing_provider_service:
+                    if existing_provider_service.is_active:
+                        return Response(
+                            {"error": "Service already linked to provider."},
+                            status=status.HTTP_400_BAD_REQUEST,
+                        )
+
+                    existing_provider_service.is_active = True
+                    existing_provider_service.save(update_fields=["is_active"])
+                    ProviderServiceHistory.objects.create(
+                        provider_service=existing_provider_service,
+                        provider=provider,
+                        service=service,
+                        action="reactivated",
+                        notes="Service reactivated by provider.",
+                        created_by=request.user,
+                    )
+
+                    provider.sp_profile.is_profile_completed = "in-cost"
+                    provider.sp_profile.save(update_fields=["is_profile_completed"])
+
+                    return Response(
+                        {
+                            "status": "reactivated",
+                            "id": existing_provider_service.id,
+                            "is_primary": existing_provider_service.is_primary,
+                            "service": ServiceReadSerializer(service).data,
+                            "profile_status": provider.sp_profile.is_profile_completed,
+                        },
+                        status=status.HTTP_200_OK,
+                    )
+
+                # First-time link to an already-existing service.
+                # No service_group needed -- the service already has one.
+                provider_service = ProviderService.objects.create(
+                    provider=provider,
+                    service=service,
+                )
+                ProviderServiceHistory.objects.create(
+                    provider_service=provider_service,
+                    provider=provider,
+                    service=service,
+                    action="linked",
+                    notes="Service linked by provider.",
+                    created_by=request.user,
+                )
+
+
+
+                return Response({
+                    "id": provider_service.id,
+                    "status": validation["status"],
+                    "is_primary": provider_service.is_primary,
+                    "service": ServiceReadSerializer(service).data,
+                    "profile_status": provider.sp_profile.is_profile_completed,
+                }, status=status.HTTP_201_CREATED)
+
+            # --- Only "new" / "requires_review" services get here ---
+            # New service requires group
+            if not service_group_id:
+                return Response(
+                    {"error": "service_group is required for new service."},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+            service_group = ServiceGroup.objects.select_related('category').get(
+                group_id=service_group_id
+            )
+
+            review_status = (
+                "PENDING"
+                if validation["status"] == "requires_review"
+                else "APPROVED"
+            )
+
+            service = Service.objects.create(
+                service_name=service_name.strip().title(),
+                description=description,
+                service_group=service_group,
+                review_status=review_status,
+                risk_level=service_group.category.risk_level
+            )
+
+            provider_service = ProviderService.objects.create(
+                provider=provider,
+                service=service
+            )
+            ProviderServiceHistory.objects.create(
+                provider_service=provider_service,
+                provider=provider,
+                service=service,
+                action="linked",
+                notes="Service linked by provider.",
+                created_by=request.user,
+            )
+
+            
+
+            return Response({
+                "id": provider_service.id,
+                "status": validation["status"],
+                "is_primary": provider_service.is_primary,
+                "service": ServiceReadSerializer(service).data,
+                "profile_status": provider.sp_profile.is_profile_completed
+            }, status=status.HTTP_201_CREATED)
+
+    except ServiceProvider.DoesNotExist:
+        return Response(
+            {"error": "Provider not found."},
+            status=status.HTTP_404_NOT_FOUND
+        )
+
+    except ServiceGroup.DoesNotExist:
+        return Response(
+            {"error": "Invalid service group."},
+            status=status.HTTP_400_BAD_REQUEST
+        )
+
+    except ValidationError as e:
+        message = (
+        e.messages[0]
+        if hasattr(e, "messages") and e.messages
+        else str(e)
+    )
+        return Response(
+            {"error": message},
+        status=status.HTTP_400_BAD_REQUEST,
+    )
+
+    except IntegrityError:
+        logger.error("Integrity error in submit_service", exc_info=True)
+        return Response(
+            {"error": "Request could not be completed."},
+            status=status.HTTP_400_BAD_REQUEST
+        )
+
+    except DatabaseError:
+        logger.error("Database error in submit_service", exc_info=True)
+        return Response(
+            {"error": "Service temporarily unavailable."},
+            status=status.HTTP_503_SERVICE_UNAVAILABLE
+        )
+
+    except Exception:
+        logger.error("Unhandled error in submit_service", exc_info=True)
+        return Response(
+            {"error": "Unexpected server error."},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR
+        )
+
+    
     
 
 @api_view(["POST"])
@@ -1157,6 +1547,8 @@ def upload_provider_service_affidavit(request, provider_service_id):
 @throttle_classes([ProfileWriteThrottle])
 def upload_provider_qualification(request, service_id):
 
+
+
     try:
         provider = ServiceProvider.objects.select_related(
             "sp_profile"
@@ -1195,6 +1587,7 @@ def upload_provider_qualification(request, service_id):
     )
 
     if not serializer.is_valid():
+        print("Serializer errors:", serializer.errors)
         return Response(
             {
                 "success": False,
@@ -1305,6 +1698,89 @@ def update_cost_of_service(request, service_id):
             {"error": "Unexpected server error"},
             status=status.HTTP_500_INTERNAL_SERVER_ERROR
         )
+
+@api_view(['PATCH'])
+@throttle_classes([ProfileWriteThrottle])
+@authentication_classes([SPJWTAuthentication])
+@permission_classes([IsAuthenticated])
+def a_update_cost_of_service(request, service_id):
+
+    try:
+        provider = ServiceProvider.objects.select_related(
+            'sp_profile'
+        ).get(sp_profile=request.user)
+
+    except ServiceProvider.DoesNotExist:
+        return Response(
+            {"error": "Provider not found"},
+            status=status.HTTP_404_NOT_FOUND
+        )
+
+    try:
+        service = Service.objects.get(service_id=service_id)
+
+    except Service.DoesNotExist:
+        return Response(
+            {"error": "Service not found"},
+            status=status.HTTP_404_NOT_FOUND
+        )
+
+    provider_service, _ = ProviderService.objects.get_or_create(
+        provider=provider,
+        service=service
+    )
+
+    data = request.data
+    base_price = data.get("base_price")
+    negotiable = data.get("negotiable", True)
+    notes = data.get("notes", "")
+
+    try:
+        with transaction.atomic():
+
+            if provider_service.cost_of_service is None:
+                cost = CostOfService.objects.create(
+                    base_price=base_price,
+                    negotiable=negotiable,
+                    notes=notes
+                )
+                provider_service.cost_of_service = cost
+                provider_service.save()
+            else:
+                cost = provider_service.cost_of_service
+                cost.base_price = base_price
+                cost.negotiable = negotiable
+                cost.notes = notes
+                cost.save()
+
+
+        return Response({
+            "success": True,
+            "cost_of_service": {
+                "id": cost.id,
+                "base_price": str(cost.base_price) if cost.base_price else None,
+                "negotiable": cost.negotiable,
+                "notes": cost.notes,
+            },
+            "profile_status": provider.sp_profile.is_profile_completed
+        }, status=status.HTTP_200_OK)
+
+    except DatabaseError:
+        logger.error("Database error in update_cost_of_service", exc_info=True)
+        return Response(
+            {"error": "Service temporarily unavailable"},
+            status=status.HTTP_503_SERVICE_UNAVAILABLE
+        )
+
+    except Exception:
+        logger.error("Unexpected error in update_cost_of_service", exc_info=True)
+        return Response(
+            {"error": "Unexpected server error"},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR
+        )
+
+
+
 @api_view(['GET'])
 @throttle_classes([UserReadThrottle])
 @authentication_classes([SPJWTAuthentication])
@@ -1621,7 +2097,8 @@ def get_provider_qualifications(request, provider_service_id):
         )
         .order_by("-uploaded_at")
     )
-    print(provider_service.id)
+
+    
 
     serializer = ProviderQualificationReadSerializer(
         qualifications,
@@ -2003,7 +2480,7 @@ def service_list(request):
 @permission_classes([IsAuthenticated])
 def service_provider_list_service(request):
 
-    print("\n=== [DEBUG START] service_provider_list_service ===")
+ 
 
     try:
         service_id = request.query_params.get('service_id')
@@ -2016,12 +2493,7 @@ def service_provider_list_service(request):
         except ValueError:
             limit = 20
 
-        print(
-            f"[FILTERS] service_id={service_id}, "
-            f"group_id={group_id}, "
-            f"search={search}, "
-            f"limit={limit}"
-        )
+        
 
         # --------------------------------------------------
         # CLIENT LOCATION
@@ -2046,10 +2518,7 @@ def service_provider_list_service(request):
                 client_default_address.address.longitude
             )
 
-            print(
-                f"[CLIENT LOCATION] "
-                f"lat={client_lat}, lon={client_lon}"
-            )
+            
 
         except ClientAddress.DoesNotExist:
 

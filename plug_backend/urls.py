@@ -86,6 +86,7 @@ path(
     path('api/sp_profile/register/', sp_views.sp_register, name='sp_profile_register'),##used
     path('api/sp_login/', sp_views.sp_login, name='sp_login'), ##used
     path('api/sp_service/cost/<int:service_id>/', sp_views.update_cost_of_service, name='sp_cost_of'), ##used
+    path('api/a_sp_service/cost/<int:service_id>/', sp_views.a_update_cost_of_service, name='a_sp_cost_of'),##used
     
     path('api/sp_details/upload/', sp_views.patch_sp_profile, name='sp_details_upload'), ##used
     path('api/sp/upload/address_document/', sp_views.sp_add_address_document, name='sp_details_upload'),
@@ -108,6 +109,7 @@ path(
 
 
     path('api/service/upload_or_create/<int:provider_id>/', sp_views.submit_service, name='sp_service_create  '), ##used
+    path('api/service/a_upload_or_create/<int:provider_id>/', sp_views.a_submit_service, name='a_sp_service_create'), ##used
     path('api/sp_profiles/', sp_views.sp_profile_list, name='sp_profile_list'),
     path('api/sp-profile/', sp_views.sp_profile_detail, name='sp_profile_detail'),
     path('api/cost_of_service/<int:provider_id>/', sp_views.costs_by_sp, name='cost_of_service'), ##used

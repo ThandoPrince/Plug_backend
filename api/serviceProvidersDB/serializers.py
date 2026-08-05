@@ -423,7 +423,6 @@ class ProviderServiceAffidavitSerializer(serializers.ModelSerializer):
     
 
 
-
 class ProviderQualificationSerializer(serializers.ModelSerializer):
     class Meta:
         model = ProviderQualification
@@ -441,6 +440,32 @@ class ProviderQualificationSerializer(serializers.ModelSerializer):
         if not value:
             raise serializers.ValidationError("Title is required.")
         return value
+
+    def validate_issue_date(self, value):
+        if value and value > timezone.localdate():
+            raise serializers.ValidationError(
+                "Issue date cannot be in the future."
+            )
+        return value
+
+    def validate(self, attrs):
+        issue_date = attrs.get("issue_date")
+        expiry_date = attrs.get("expiry_date")
+
+        if (
+            issue_date
+            and expiry_date
+            and expiry_date < issue_date
+        ):
+            raise serializers.ValidationError(
+                {
+                    "expiry_date": (
+                        "Expiry date cannot be before the issue date."
+                    )
+                }
+            )
+
+        return attrs
 
     def validate_document(self, value):
         max_size = 10 * 1024 * 1024  # 10MB
