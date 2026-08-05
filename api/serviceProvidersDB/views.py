@@ -374,9 +374,7 @@ def sp_add_address_document(request):
                 document.ai_response = ai_result
                 document.verification_status = "rejected"
                 document.risk_level = "high"
-                document.verification_score = ai_result.get(
-                    "face_match_score"
-                )
+                document.verification_score = ai_result.get("face_match_score")
 
                 document.save(update_fields=[
                     "ai_response",
@@ -389,12 +387,13 @@ def sp_add_address_document(request):
 
                 raise ValidationError({
                     "kyc": {
-                        "type": face_meta.get("error_type"),
-                        "message": face_meta.get(
-                            "message",
-                            "Identity verification failed."
+                        "type": face_meta.get("error_type") or ai_result.get("reason"),
+                        "message": (
+                            face_meta.get("message")
+                            or ai_result.get("message")
+                            or "Identity verification failed."
                         ),
-                        "details": face_meta.get("details"),
+                        "details": face_meta.get("details") or ai_result.get("reason"),
                         "score": ai_result.get("face_match_score"),
                     }
                 })
