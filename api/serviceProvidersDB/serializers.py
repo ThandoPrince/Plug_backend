@@ -647,7 +647,7 @@ class SPAddressDocumentWriteSerializer(serializers.Serializer):
                 "A liveness video is required."
             )
 
-        if liveness_video.size > 10 * 1024 * 1024:
+        if liveness_video.size > 25 * 1024 * 1024:
             raise serializers.ValidationError(
                 "Liveness video must be less than 10MB."
             )
