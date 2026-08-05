@@ -257,14 +257,13 @@ def sp_add_address_document(request):
     sp_profile = get_sp_profile(request)
 
     clean_data = {
-    
-    "address": address_dict,
-    "id_type": request.data.get("id_type"),
-    "front_file": request.FILES.get("front_file"),
-    "back_file": request.FILES.get("back_file"),
-    "liveness_video": request.FILES.get("liveness_video"),
-}
-    
+        "address": address_dict,
+        "id_type": request.data.get("id_type"),
+        "front_file": request.FILES.get("front_file"),
+        "back_file": request.FILES.get("back_file"),
+        "liveness_video": request.FILES.get("liveness_video"),
+    }
+
     liveness = request.FILES.get("liveness_video")
 
     if liveness:
@@ -281,7 +280,6 @@ def sp_add_address_document(request):
             "SP address document validation failed: %s",
             serializer.errors
         )
-        
 
         return Response(
             {
@@ -291,15 +289,28 @@ def sp_add_address_document(request):
             },
             status=status.HTTP_400_BAD_REQUEST,
         )
-    
 
     def save_temp(file_obj, filename):
+        """
+        Copies the uploaded file's bytes to a temp path WITHOUT
+        touching/moving/renaming the original uploaded file object,
+        so it remains fully readable/saveable afterward (e.g. by
+        the serializer's model save).
+        """
         if not file_obj:
             return None
 
         path = f"temp/{filename}"
-        saved_path = default_storage.save(path, file_obj)
-        return default_storage.path(saved_path)
+        full_path = os.path.join(settings.MEDIA_ROOT, path)
+        os.makedirs(os.path.dirname(full_path), exist_ok=True)
+
+        file_obj.seek(0)
+        with open(full_path, "wb") as dest:
+            for chunk in file_obj.chunks():
+                dest.write(chunk)
+
+        file_obj.seek(0)  # reset for whoever reads it next
+        return full_path
 
     front_path = back_path = liveness_path = None
 
@@ -307,8 +318,8 @@ def sp_add_address_document(request):
         with transaction.atomic():
 
             # ----------------------------------
-            # Save temp files FIRST — before the
-            # serializer/model consumes (moves) them
+            # Save temp files FIRST — copies bytes only,
+            # doesn't move/consume the original file objects
             # ----------------------------------
             front_path = save_temp(
                 clean_data["front_file"],
@@ -326,20 +337,8 @@ def sp_add_address_document(request):
             )
 
             # ----------------------------------
-            # Rewind file pointers — save_temp() read
-            # them to EOF, so without this the model
-            # save below will write empty files
-            # ----------------------------------
-            for f in (
-                clean_data["front_file"],
-                clean_data["back_file"],
-                clean_data["liveness_video"],
-            ):
-                if f:
-                    f.seek(0)
-
-            # ----------------------------------
             # Now save provider + document
+            # (safe: original file objects are untouched)
             # ----------------------------------
             result = serializer.save(sp_profile=sp_profile)
 
@@ -350,12 +349,12 @@ def sp_add_address_document(request):
             # Call AI
             # ----------------------------------
             ai_result = KYCService.verify_with_ai(
-    customer_id=service_provider.sp_profile.pk,
-    full_name=service_provider.full_name,
-    front_path=front_path,
-    back_path=back_path,
-    selfie_path=liveness_path,
-)
+                customer_id=service_provider.sp_profile.pk,
+                full_name=service_provider.full_name,
+                front_path=front_path,
+                back_path=back_path,
+                selfie_path=liveness_path,
+            )
 
             logger.info("AI RESULT: %s", ai_result)
 
@@ -514,6 +513,7 @@ def sp_add_address_document(request):
             except Exception:
                 logger.warning("Failed to delete temp file %s", path)
 
+                
 
 @api_view(["POST"])
 @permission_classes([AllowAny])
