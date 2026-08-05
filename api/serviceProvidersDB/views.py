@@ -291,9 +291,7 @@ def sp_add_address_document(request):
             },
             status=status.HTTP_400_BAD_REQUEST,
         )
-    result = serializer.save(
-                sp_profile=sp_profile,
-    )
+    
 
     def save_temp(file_obj, filename):
         if not file_obj:
@@ -302,6 +300,8 @@ def sp_add_address_document(request):
         path = f"temp/{filename}"
         saved_path = default_storage.save(path, file_obj)
         return default_storage.path(saved_path)
+    
+    front_path = back_path = liveness_path = None
 
     try:
         with transaction.atomic():
@@ -309,7 +309,7 @@ def sp_add_address_document(request):
             # ----------------------------------
             # Save provider + document
             # ----------------------------------
-            result = serializer.save()
+            result = serializer.save(sp_profile=sp_profile)
 
             service_provider = result["provider"]
             document = result["document"]
