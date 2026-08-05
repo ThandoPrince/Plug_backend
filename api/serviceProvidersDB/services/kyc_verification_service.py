@@ -21,6 +21,8 @@ class KYCService:
         selfie_path=None,
     ):
         url = f"{KYCService.get_base_url()}/api/kyc/initiate"
+        logger.info("AI URL: %s", url)
+        logger.info("AI_API_KEY configured: %s", bool(settings.AI_API_KEY))
 
         files = {}
 
