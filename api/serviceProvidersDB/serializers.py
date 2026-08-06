@@ -126,18 +126,22 @@ class SPProfileWriteSerializer(serializers.ModelSerializer):
     
 class DeviceTokenWriteSerializer(serializers.ModelSerializer):
     email = serializers.EmailField(write_only=True, required=True)
-    push_token = serializers.CharField(write_only=True, required=True, source='fcm_token')
+    push_token = serializers.CharField(
+        write_only=True,
+        required=True,
+        source="fcm_token",
+    )
 
     class Meta:
         model = DeviceToken
-        fields = '__all__'
+        fields = "__all__"
         extra_kwargs = {
-            'service_provider': {'read_only': True},
-            'fcm_token': {'required': False},
+            "service_provider": {"read_only": True},
+            "fcm_token": {"required": False},
         }
 
     def create(self, validated_data):
-        email = validated_data.pop('email').strip().lower()
+        email = validated_data.pop("email").strip().lower()
 
         try:
             service_provider = SPProfile.objects.get(email_address=email)
@@ -146,10 +150,26 @@ class DeviceTokenWriteSerializer(serializers.ModelSerializer):
                 "email": "No service provider found with this email."
             })
 
-        validated_data['service_provider'] = service_provider
-        return super().create(validated_data)
-    
+        token = validated_data["fcm_token"]
 
+        # Remove this token from any other provider
+        DeviceToken.objects.exclude(
+            service_provider=service_provider
+        ).filter(
+            fcm_token=token
+        ).delete()
+
+        device_token, _ = DeviceToken.objects.update_or_create(
+            service_provider=service_provider,
+            defaults={
+                **validated_data,
+                "fcm_token": token,
+            },
+        )
+
+        return device_token
+
+        
 
 
 class ServiceProviderPatchSerializer(serializers.ModelSerializer):

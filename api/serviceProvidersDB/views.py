@@ -644,7 +644,7 @@ def register_device_token(request):
     try:
         serializer = DeviceTokenWriteSerializer(
             data=request.data,
-            context={'request': request},
+            context={"request": request},
         )
 
         if not serializer.is_valid():
@@ -657,11 +657,6 @@ def register_device_token(request):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        token = serializer.validated_data["fcm_token"]
-
-        # Remove duplicate tokens across all providers
-        DeviceToken.objects.filter(fcm_token=token).delete()
-
         device_token = serializer.save()
 
         return Response(
@@ -670,7 +665,7 @@ def register_device_token(request):
                 "message": "Device token registered successfully",
                 "token_id": device_token.id,
             },
-            status=status.HTTP_201_CREATED,
+            status=status.HTTP_200_OK,
         )
 
     except Exception:
@@ -683,6 +678,8 @@ def register_device_token(request):
             },
             status=status.HTTP_500_INTERNAL_SERVER_ERROR,
         )
+
+        
 
 @api_view(["PATCH"])
 @throttle_classes([ProfileWriteThrottle])
