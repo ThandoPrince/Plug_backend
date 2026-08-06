@@ -169,7 +169,7 @@ class DeviceTokenWriteSerializer(serializers.ModelSerializer):
 
         return device_token
 
-        
+
 
 
 class ServiceProviderPatchSerializer(serializers.ModelSerializer):
@@ -1057,6 +1057,7 @@ class ServiceProviderMyReadSerializer(serializers.ModelSerializer):
     live_location = SPProfileLiveLocationSerializer(
         read_only=True,
     )
+    location = SPAddressSerializer(read_only=True)
 
   
 
