@@ -55,7 +55,7 @@ class SPProfileWriteSerializer(serializers.ModelSerializer):
 
         if SPProfile.objects.filter(email_address=email).exists():
             raise serializers.ValidationError(
-                "An account with these credentials already exists."
+                "Enter a valid email address."
             )
 
         return email
@@ -98,7 +98,7 @@ class SPProfileWriteSerializer(serializers.ModelSerializer):
 
         if SPProfile.objects.filter(mobile_number=normalized).exists():
             raise serializers.ValidationError(
-                "This mobile number is already registered."
+                "Please enter a valid mobile number."
             )
 
         return normalized
