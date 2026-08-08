@@ -1379,46 +1379,49 @@ def upload_provider_service_affidavit(request, provider_service_id):
         return Response(
             {
                 "success": False,
-                "message": "Provider not found."
+                "message": "Provider not found.",
             },
             status=status.HTTP_404_NOT_FOUND,
         )
 
-    try:
-        provider_service = ProviderService.objects.get(
-            pk=provider_service_id,
-            provider=provider
-        )
+    # --------------------------------------------
+    # Get ProviderService by provider_service_id
+    # and ensure it belongs to the authenticated provider
+    # --------------------------------------------
+    provider_service = ProviderService.objects.filter(
+        id=provider_service_id,
+        provider=provider,
+    ).first()
 
-    except ProviderService.DoesNotExist:
+    if not provider_service:
         return Response(
             {
                 "success": False,
-                "message": "Service not found."
+                "message": "Service not found.",
             },
             status=status.HTTP_404_NOT_FOUND,
         )
 
+    # --------------------------------------------
+    # Validate affidavit
+    # --------------------------------------------
     serializer = ProviderServiceAffidavitSerializer(
         data=request.data
     )
 
     if not serializer.is_valid():
-
         return Response(
             {
                 "success": False,
-                "errors": serializer.errors
+                "errors": serializer.errors,
             },
             status=status.HTTP_400_BAD_REQUEST,
         )
-    print("STEP 1 - Serializer OK")
-    
-
 
     
 
     with transaction.atomic():
+       
 
         uploaded_file = serializer.validated_data["affidavit"]
 
@@ -1430,10 +1433,7 @@ def upload_provider_service_affidavit(request, provider_service_id):
             provider_service=provider_service,
             uploaded_file=uploaded_file,
         )
-        print("\n========== AI RESULT ==========")
-        from pprint import pprint
-        pprint(ai_result)
-        print("================================\n")
+       
 
         # AI processing failed (OCR/System/etc.)
         if not ai_result["success"]:
@@ -1450,8 +1450,7 @@ def upload_provider_service_affidavit(request, provider_service_id):
         # AI rejected the affidavit
         
         if ai_result["verification_status"] not in ("verified", "approved"):
-            print("Verification rejected")
-            pprint(ai_result)
+        
 
             return Response(
                 {
