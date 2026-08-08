@@ -1,3 +1,5 @@
+import os
+
 from rest_framework import serializers
 from django.contrib.auth.hashers import check_password, make_password
 from django.db import transaction
@@ -504,7 +506,7 @@ class ProviderQualificationSerializer(serializers.ModelSerializer):
             ".docx",
         }
 
-        import os
+      
 
         extension = os.path.splitext(value.name)[1].lower()
 

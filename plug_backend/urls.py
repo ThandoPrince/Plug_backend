@@ -91,7 +91,7 @@ path(
     path('api/sp_details/upload/', sp_views.patch_sp_profile, name='sp_details_upload'), ##used
     path('api/sp/upload/address_document/', sp_views.sp_add_address_document, name='sp_details_upload'),
     path(
-    "provider-services/<int:provider_service_id>/affidavit/",
+    "api/provider-services/<int:provider_service_id>/affidavit/",
     sp_views.upload_provider_service_affidavit,
     name="upload-provider-service-affidavit",
 ),
