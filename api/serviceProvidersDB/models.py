@@ -235,16 +235,74 @@ class SPProfile(models.Model):
         return f"SPProfile: {self.email_address}"
     
 class ProviderLoginHistory(models.Model):
+
+    EVENT_CHOICES = [
+        ("login", "Login"),
+        ("logout", "Logout"),
+    ]
+
     service_provider = models.ForeignKey(
         SPProfile,
-        on_delete=models.CASCADE, null=True
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="login_history",
     )
+
+    event_type = models.CharField(
+    max_length=20,
+    choices=EVENT_CHOICES,
+    default="login",
+    db_index=True,
+)
     successful = models.BooleanField(default=False)
-    identifier = models.CharField(max_length=100, null=True)
-    user_agent = models.TextField(blank=True, null=True)
-    ip_address = models.GenericIPAddressField(null=True,
-    blank=True,)
-    device_name = models.CharField(max_length=100, blank=True, null=True)
+
+    identifier = models.CharField(
+        max_length=100,
+        null=True,
+        blank=True,
+    )
+
+    user_agent = models.TextField(
+        blank=True,
+        null=True,
+    )
+
+    ip_address = models.GenericIPAddressField(
+        null=True,
+        blank=True,
+    )
+
+    device_name = models.CharField(
+        max_length=100,
+        blank=True,
+        null=True,
+    )
+
+    created_at = models.DateTimeField(
+        auto_now_add=True,
+        db_index=True,
+    )
+
+    class Meta:
+        db_table = "provider_login_history"
+        indexes = [
+            models.Index(
+                fields=["service_provider", "-created_at"],
+                name="sp_login_history_idx",
+            ),
+            models.Index(
+                fields=["event_type", "-created_at"],
+                name="sp_event_history_idx",
+            ),
+        ]
+
+    def __str__(self):
+        return (
+            f"{self.service_provider} - "
+            f"{self.event_type} - "
+            f"{self.created_at}"
+        )
 
 
 

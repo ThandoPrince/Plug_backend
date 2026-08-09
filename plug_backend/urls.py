@@ -85,6 +85,11 @@ path(
     # Service Providers DB
     path('api/sp_profile/register/', sp_views.sp_register, name='sp_profile_register'),##used
     path('api/sp_login/', sp_views.sp_login, name='sp_login'), ##used
+    path(
+    "api/provider/logout/",
+    sp_views.provider_logout,
+    name="provider-logout",
+),##used
     path('api/sp_service/cost/<int:service_id>/', sp_views.update_cost_of_service, name='sp_cost_of'), ##used
     path('api/a_sp_service/cost/<int:service_id>/', sp_views.a_update_cost_of_service, name='a_sp_cost_of'),##used
     
@@ -94,12 +99,18 @@ path(
     "api/provider-services/<int:provider_service_id>/affidavit/",
     sp_views.upload_provider_service_affidavit,
     name="upload-provider-service-affidavit",
-),
+), ##used
 path(
     "api/provider/profile-image/",
     sp_views.sp_update_profile,
     name="update-provider-profile-image",
-),
+), ##used
+
+path(
+    "api/provider/logout/",
+    sp_views.provider_logout,
+    name="provider-logout",
+), 
 
     path(
         "api/provider-services/<int:service_id>/qualifications/",

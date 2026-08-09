@@ -78,32 +78,33 @@ logger = logging.getLogger(__name__)  ##do not remove
 
 
 
-@api_view(['POST'])
+@api_view(["POST"])
 @throttle_classes([AuthThrottle])
 @permission_classes([AllowAny])
 def sp_login(request):
-
     ip_address = get_client_ip(request)
     user_agent = get_device_info(request)
+    identifier = request.data.get("email")
+    device_name = request.data.get("device_name")
 
     try:
         serializer = SPLoginSerializer(
             data=request.data,
-            context={"request": request}
+            context={"request": request},
         )
 
         if serializer.is_valid():
-
             sp = serializer.validated_data["user"]
 
-            # 🔐 LOG SUCCESSFUL LOGIN
+            # Successful login
             ProviderLoginHistory.objects.create(
                 service_provider=sp,
                 successful=True,
-                identifier=request.data.get("email"),
+                identifier=identifier,
                 user_agent=user_agent,
                 ip_address=ip_address,
-                device_name=request.data.get("device_name")
+                device_name=device_name,
+                # event_type defaults to "login"
             )
 
             tokens = generate_sp_tokens(sp)
@@ -117,49 +118,50 @@ def sp_login(request):
                         "is_profile_completed": sp.is_profile_completed,
                         "access_token": tokens["access"],
                         "refresh_token": tokens["refresh"],
-                    }
+                    },
                 },
-                status=status.HTTP_200_OK
+                status=status.HTTP_200_OK,
             )
 
-        # 🔐 LOG FAILED LOGIN
+        # Failed login
         ProviderLoginHistory.objects.create(
             service_provider=None,
             successful=False,
-            identifier=request.data.get("email"),
+            identifier=identifier,
             user_agent=user_agent,
             ip_address=ip_address,
-            device_name=request.data.get("device_name")
+            device_name=device_name,
+            # event_type defaults to "login"
         )
 
         return Response(
             {
                 "success": False,
-                "errors": serializer.errors
+                "errors": serializer.errors,
             },
-            status=status.HTTP_400_BAD_REQUEST
+            status=status.HTTP_400_BAD_REQUEST,
         )
 
     except Exception:
-
         logger.exception("SP login failed unexpectedly")
 
-        # 🔐 LOG SYSTEM FAILURE
+        # System failure during login
         ProviderLoginHistory.objects.create(
             service_provider=None,
             successful=False,
-            identifier=request.data.get("email"),
+            identifier=identifier,
             user_agent=user_agent,
             ip_address=ip_address,
-            device_name=request.data.get("device_name")
+            device_name=device_name,
+            # event_type defaults to "login"
         )
 
         return Response(
             {
                 "success": False,
-                "message": "Unable to process login at this time."
+                "message": "Unable to process login at this time.",
             },
-            status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
         )
     
 
@@ -2050,6 +2052,7 @@ def provider_update_cost_of_service(request, cost_id):
 
 @api_view(["POST"])
 @authentication_classes([SPJWTAuthentication])
+@throttle_classes([ProfileWriteThrottle])
 @permission_classes([IsAuthenticated])
 def provider_logout(request):
     refresh_token = request.data.get("refresh")
@@ -2066,6 +2069,15 @@ def provider_logout(request):
     try:
         token = RefreshToken(refresh_token)
         token.blacklist()
+
+        ProviderLoginHistory.objects.create(
+            service_provider=request.user,
+            event_type="logout",
+            successful=True,
+            identifier=getattr(request.user, "email_address", None),
+            ip_address=get_client_ip(request),
+            user_agent=request.META.get("HTTP_USER_AGENT"),
+        )
 
         return Response(
             {
