@@ -19,6 +19,11 @@ class Command(BaseCommand):
     def handle(self, *args, **options):
         self.stdout.write(self.style.WARNING("Seeding Service Categories..."))
 
+        # NOTE: HIGH_STAKES (Security & Protection) and OTHER (Tutor/Babysitter/
+        # Pet Sitter/General Labourer) categories have been removed. These
+        # required verification/admin approval and were dropped to avoid
+        # regulatory + liability exposure (PSIRA/Firearms Control Act for
+        # armed security; unvetted care/labour services for the "Other" group).
         categories_data = [
             {
                 "id": ServiceCategoryID.DOMESTIC,
@@ -27,21 +32,6 @@ class Command(BaseCommand):
                 "verification": False,
                 "admin": False,
             },
-            {
-                "id": ServiceCategoryID.HIGH_STAKES,
-                "name": ServiceCategoryName.HIGH_STAKES,
-                "risk": RiskLevel.HIGH,
-                "verification": True, 
-                "admin": True,        
-            },
-             {
-                "id": ServiceCategoryID.OTHER,
-                "name": ServiceCategoryName.OTHER,
-                "risk": RiskLevel.HIGH,
-                "verification": True, 
-                "admin": True,        
-            },
-            
             {
                 "id": ServiceCategoryID.PERSONAL_BODY,
                 "name": ServiceCategoryName.PERSONAL_BODY,
@@ -89,68 +79,74 @@ class Command(BaseCommand):
 
         self.stdout.write(self.style.WARNING("\nSeeding Groups & Services..."))
 
+        # SEC001 (Security & Protection) and OTH001 (Other) groups removed.
         groups_data = [
-    {
-        "group_id": "BEA001",
-        "name": "Beauty & Personal Care",
-        "category": ServiceCategoryID.PERSONAL_BODY,
-        "services": ["Makeup Technician", "Hairdresser", "Nail Technician", "Barber", "Skincare Specialist", "Tattoo Artist"],
-    },
-    {
-        "group_id": "SEC001", # High Risk Group
-        "name": "Security & Protection",
-        "category": ServiceCategoryID.HIGH_STAKES,
-        "services": ["Armed Guard", "Bodyguard", "Security System Installer", "Private Investigator"],
-    },
-    {
-        "group_id": "FOD001",
-        "name": "Catering & Food",
-        "category": ServiceCategoryID.EVENTS_MEDIA,
-        "services": ["Private Chef", "Cake Baker", "Catering", "Spit Braai Specialist"],
-    },
-    {
-        "group_id": "AUT001",
-        "name": "Automotive Services",
-        "category": ServiceCategoryID.DOMESTIC,
-        "services": ["Mechanic", "Car Wash", "Auto Electrician", "Towing Service", "Tyre Specialist"],
-    },
-    {
-        "group_id": "HOL001",
-        "name": "Household Support",
-        "category": ServiceCategoryID.DOMESTIC,
-        "services": ["House Cleaner", "Laundry Helper", "Gardener", "Plumber", "Electrician", "Handyman", "Carpenter", "Painter", "Mover"],
-    },
-    {
-        "group_id": "LOG001",
-        "name": "Logistics & Transport",
-        "category": ServiceCategoryID.GENERAL,
-        "services": ["Runner"],
-    },
-    {
-        "group_id": "FIT001",
-        "name": "Fitness & Wellness",
-        "category": ServiceCategoryID.GENERAL,
-        "services": ["Personal Trainer", "Yoga Instructor", "Pilates Instructor", "Nutrition", "Massage Therapist", "Chiropractor", "Acupuncturist", "Reiki Practitioner"],
-    },
-    {
-        "group_id": "PRO001",
-        "name": "Professional & Business Services",
-        "category": ServiceCategoryID.GENERAL,
-        "services": ["Private Tutor", "Graphic Designer", "IT Technician", "Translator", "Marketing Specialist", "Legal Consultant", "CV Writer"],
-    },
-    {
-        "group_id": "ENT001",
-        "name": "Entertainment",
-        "category": ServiceCategoryID.EVENTS_MEDIA,
-        "services": ["DJ", "Photographer", "Videographer", "Event Host", "Magician", "Party Planner", "Sound Technician"],
-    },
-    {
-        "group_id": "OTH001",
-        "name": "Other",
-        "category": ServiceCategoryID.OTHER,
-        "services": ["Tutor", "Babysitter", "Pet Sitter", "General Labourer"],
-    },
-]
+            {
+                "group_id": "BEA001",
+                "name": "Beauty & Personal Care",
+                "category": ServiceCategoryID.PERSONAL_BODY,
+                "services": ["Makeup Technician", "Hairdresser", "Nail Technician", "Barber", "Skincare Specialist", "Tattoo Artist"],
+            },
+            {
+                "group_id": "FOD001",
+                "name": "Catering & Food",
+                "category": ServiceCategoryID.EVENTS_MEDIA,
+                "services": ["Private Chef", "Cake Baker", "Catering", "Spit Braai Specialist"],
+            },
+            {
+                "group_id": "AUT001",
+                "name": "Automotive Services",
+                "category": ServiceCategoryID.DOMESTIC,
+                "services": ["Mechanic", "Car Wash", "Auto Electrician", "Towing Service", "Tyre Specialist"],
+            },
+            {
+                "group_id": "HOL001",
+                "name": "Household Support",
+                "category": ServiceCategoryID.DOMESTIC,
+                # NOTE (compliance decision): "Electrician" legally requires a
+                # Wireman's Licence + DoL registration to perform electrical
+                # installation work / issue a Certificate of Compliance (COC).
+                # "Plumber" legally requires PIRB registration specifically to
+                # issue a COC for geyser/solar/gas work. Both services are kept
+                # here for general tasks per decision, but COC-issuing work
+                # should be excluded via Terms of Service / listing description
+                # rather than the data model, since these platforms don't
+                # distinguish "general repair" from "certificate-issuing work"
+                # as separate services. Consider a "verified for COC work"
+                # provider flag if that work needs to be offered later.
+                "services": ["House Cleaner", "Laundry Helper", "Gardener", "Plumber", "Electrician", "Handyman", "Carpenter", "Painter", "Mover"],
+            },
+            {
+                "group_id": "LOG001",
+                "name": "Logistics & Transport",
+                "category": ServiceCategoryID.GENERAL,
+                "services": ["Runner"],
+            },
+            {
+                "group_id": "FIT001",
+                "name": "Fitness & Wellness",
+                "category": ServiceCategoryID.GENERAL,
+                # "Chiropractor" and "Acupuncturist" removed: AHPCSA registration
+                # is legally mandatory to practise these (criminal offence
+                # otherwise). "Massage Therapist" and "Nutrition" are kept per
+                # decision, despite AHPCSA/HPCSA registration technically
+                # applying to those titles too — flag for a verification step
+                # if this changes later.
+                "services": ["Personal Trainer", "Yoga Instructor", "Pilates Instructor", "Nutrition", "Massage Therapist", "Reiki Practitioner"],
+            },
+            {
+                "group_id": "PRO001",
+                "name": "Professional & Business Services",
+                "category": ServiceCategoryID.GENERAL,
+                "services": ["Private Tutor", "Graphic Designer", "IT Technician", "Translator", "Marketing Specialist", "Legal Consultant", "CV Writer"],
+            },
+            {
+                "group_id": "ENT001",
+                "name": "Entertainment",
+                "category": ServiceCategoryID.EVENTS_MEDIA,
+                "services": ["DJ", "Photographer", "Videographer", "Event Host", "Magician", "Party Planner", "Sound Technician"],
+            },
+        ]
 
         for group_data in groups_data:
             category = category_map[group_data["category"]]
@@ -180,25 +176,33 @@ class Command(BaseCommand):
         prohibited_keywords = [
             # adult/illegal/prohibited terms...
             "escort", "prostitute", "prostitution", "sexual service", "sex worker", "happy ending", "erotic massage", "sex", "porn", "nudes",
-            "intimate service", "adult service", "sensual massage", "adult entertainment", "sex work", "porn service", 
-            "xxx service", "weed", "marijuana", "cannabis", "coke", "cocaine", "heroin", "meth", "methamphetamine", "drug delivery", 
+            "intimate service", "adult service", "sensual massage", "adult entertainment", "sex work", "porn service",
+            "xxx service", "weed", "marijuana", "cannabis", "coke", "cocaine", "heroin", "meth", "methamphetamine", "drug delivery",
             "narcotics", "ecstasy", "lsd", "opioid", "illegal drugs", "pill selling", "isibhamu", "gun for hire", "illegal firearm", "weapon sale",
-              "gun sale", "arms trade", "firearm trafficking", "inkabi","killer", "kill people","hitman", "fake id", "forged documents",
-                "identity fraud", "scam service", "phishing", "credit card fraud", "counterfeit", "imitation documents", "fake passport", "fraudulent service", "hacking service", "cybercrime", "illegal software", 
-                "pirated software", "smuggling","indunu","umdidi","ingquza", "inquza", "only fans", "only-fans", "thengisa ingquza",
-                "ngithengisa ingquza","thengisa inquza","ngithengisa inquza", "ngithengisa umdidi","isitho", "isitho esingaseze", 
-                "hookup", "strip club", "lap dance", "webcam service", "camgirl", "sugar daddy", "sugar baby", "blesser", "blessee", 
-                "adult chat", "massage parlor", "body to body", "B2B massage", "nude photos", "send nudes", "sexting", "ukudayisa umzimba", 
-                "thengisa umzimba", "ukuphinga", "dagga", "nyaope", "wunga", "crystal tik", "tik", "rock cocaine", "crack", "shrooms", "magic mushrooms", "lsd tabs", "xanax", "codeine syrup", 
-                "lean drink", "tramadol", "abortion pills", "cytotec", "mizoprostol", "zaza", "hubbly flavors nicotine", 
-                "assassination", "contract killer", "ukubulala", "idubula", "ukushaya", "hostage", "kidnapping", "protection money", 
-                "extortion", "debt collection force", "hijacking", "stolen goods", "hot property", "izimoto ezitshontshiwe", 
-                "money laundering", "wash wash", "black dollars", "ssd solution", "cloned cards", "carding", "money mule", 
-                "pyramid scheme", "ponzi", "invest and get double", 
-                "binary options trading", "forex signals scam", "bitcoin doubler", "account hacking", "bank login", "stolen id",
-                  "social engineering", "human organs", "kidney sale", "ivory", "rhino horn", "imfezi", "muthi for luck", 
-                  "bring back lost lover", "get rich quick muthi", "traditional healer luck", "penis enlargement", "hips and bum cream"
+            "gun sale", "arms trade", "firearm trafficking", "inkabi", "killer", "kill people", "hitman", "fake id", "forged documents",
+            "identity fraud", "scam service", "phishing", "credit card fraud", "counterfeit", "imitation documents", "fake passport", "fraudulent service", "hacking service", "cybercrime", "illegal software",
+            "pirated software", "smuggling", "indunu", "umdidi", "ingquza", "inquza", "only fans", "only-fans", "thengisa ingquza",
+            "ngithengisa ingquza", "thengisa inquza", "ngithengisa inquza", "ngithengisa umdidi", "isitho", "isitho esingaseze",
+            "hookup", "strip club", "lap dance", "webcam service", "camgirl", "sugar daddy", "sugar baby", "blesser", "blessee",
+            "adult chat", "massage parlor", "body to body", "B2B massage", "nude photos", "send nudes", "sexting", "ukudayisa umzimba",
+            "thengisa umzimba", "ukuphinga", "dagga", "nyaope", "wunga", "crystal tik", "tik", "rock cocaine", "crack", "shrooms", "magic mushrooms", "lsd tabs", "xanax", "codeine syrup",
+            "lean drink", "tramadol", "abortion pills", "cytotec", "mizoprostol", "zaza", "hubbly flavors nicotine",
+            "assassination", "contract killer", "ukubulala", "idubula", "ukushaya", "hostage", "kidnapping", "protection money",
+            "extortion", "debt collection force", "hijacking", "stolen goods", "hot property", "izimoto ezitshontshiwe",
+            "money laundering", "wash wash", "black dollars", "ssd solution", "cloned cards", "carding", "money mule",
+            "pyramid scheme", "ponzi", "invest and get double",
+            "binary options trading", "forex signals scam", "bitcoin doubler", "account hacking", "bank login", "stolen id",
+            "social engineering", "human organs", "kidney sale", "ivory", "rhino horn", "imfezi", "muthi for luck",
+            "bring back lost lover", "get rich quick muthi", "traditional healer luck", "penis enlargement", "hips and bum cream",
 
+            # Removed services (previously required compliance/verification/
+            # admin approval) — Security & Protection and "Other" groups
+            "armed guard", "bodyguard", "security system installer", "private investigator",
+            "tutor", "babysitter", "pet sitter", "general labourer",
+
+            # Removed services — mandatory AHPCSA registration required to
+            # legally practise; unregistered practice is a criminal offence
+            "chiropractor", "acupuncturist",
         ]
 
         for word in prohibited_keywords:
@@ -207,40 +211,38 @@ class Command(BaseCommand):
                 defaults={"service": None, "is_prohibited": True, "risk_level": RiskLevel.PROHIBITED},
             )
             if created:
-                self.stdout.write(f"🚫 Prohibited keyword added: {word}")
+                self.stdout.write(f"\U0001F6AB Prohibited keyword added: {word}")
 
         # -----------------------------
         # SERVICE SYNONYMS
         # -----------------------------
         self.stdout.write(self.style.WARNING("\nSeeding Service Synonyms..."))
+        # NOTE: "Armed Guard", "Bodyguard", "Security System Installer" and
+        # "Babysitter" synonym entries removed along with their services.
         service_synonyms = {
-    "House Cleaner": ["maid", "cleaner", "domestic worker", "housekeeping", "cleaning service"],
-    "Hairdresser": ["hairstylist", "hair stylist", "barber", "hair salon", "hair treatment"],
-    "Makeup Technician": ["makeup artist", "mua", "beauty artist", "bridal makeup", "special effects makeup"],
-    "DJ": ["disc jockey", "music dj", "deejay", "event dj"],
-    "Nail Technician": ["nail tech", "manicurist", "pedicurist", "nail salon"],
-    "Plumber": ["pipe repair", "plumbing service", "leak repair", "drain cleaning"],
-    "Electrician": ["electrical repair", "wiring", "circuit repair", "electrical maintenance"],
-    "Gardener": ["landscaper", "yard work", "lawn care", "garden maintenance"],
-    "Painter": ["house painter", "wall painting", "interior painter", "exterior painter"],
-    "Private Tutor": ["teacher", "private lessons", "academic support", "tutor", "coaching"],
-    "Graphic Designer": ["logo design", "branding", "digital artist", "illustrator"],
-    "IT Technician": ["computer repair", "tech support", "pc doctor", "network setup"],
-    "Accountant": ["bookkeeper", "tax consultant", "auditor", "financial advisor"],
-    "Translator": ["language service", "interpreting", "document translation"],
-    "Marketing Specialist": ["social media manager", "digital marketing", "seo expert", "content creator"],
-    "Armed Guard": ["security guard", "bouncer", "armed response", "protection officer", "psira"],
-    "Bodyguard": ["personal protection", "close protection", "cpo", "vip guard"],
-    "Security System Installer": ["alarm installer", "cctv technician", "electric fence installer", "gate motor repair"],
-    "Personal Trainer": ["fitness coach", "gym instructor", "workout partner", "personal training"],
-    "Massage Therapist": ["massage", "spa", "deep tissue", "reflexology"],
-    "Babysitter": ["nanny", "childcare", "au pair"],
-}
+            "House Cleaner": ["maid", "cleaner", "domestic worker", "housekeeping", "cleaning service"],
+            "Hairdresser": ["hairstylist", "hair stylist", "barber", "hair salon", "hair treatment"],
+            "Makeup Technician": ["makeup artist", "mua", "beauty artist", "bridal makeup", "special effects makeup"],
+            "DJ": ["disc jockey", "music dj", "deejay", "event dj"],
+            "Nail Technician": ["nail tech", "manicurist", "pedicurist", "nail salon"],
+            "Plumber": ["pipe repair", "plumbing service", "leak repair", "drain cleaning"],
+            "Electrician": ["electrical repair", "wiring", "circuit repair", "electrical maintenance"],
+            "Gardener": ["landscaper", "yard work", "lawn care", "garden maintenance"],
+            "Painter": ["house painter", "wall painting", "interior painter", "exterior painter"],
+            "Private Tutor": ["teacher", "private lessons", "academic support", "tutor", "coaching"],
+            "Graphic Designer": ["logo design", "branding", "digital artist", "illustrator"],
+            "IT Technician": ["computer repair", "tech support", "pc doctor", "network setup"],
+            "Accountant": ["bookkeeper", "tax consultant", "auditor", "financial advisor"],
+            "Translator": ["language service", "interpreting", "document translation"],
+            "Marketing Specialist": ["social media manager", "digital marketing", "seo expert", "content creator"],
+            "Personal Trainer": ["fitness coach", "gym instructor", "workout partner", "personal training"],
+            "Massage Therapist": ["massage", "spa", "deep tissue", "reflexology"],
+        }
 
         for service_name, keywords in service_synonyms.items():
             service = Service.objects.filter(service_name__iexact=service_name).first()
             if not service:
-                self.stdout.write(self.style.WARNING(f"⚠ Service not found: {service_name}"))
+                self.stdout.write(self.style.WARNING(f"\u26A0 Service not found: {service_name}"))
                 continue
 
             for word in keywords:
@@ -249,6 +251,6 @@ class Command(BaseCommand):
                     defaults={"service": service, "is_prohibited": False, "risk_level": service.risk_level},
                 )
                 if created:
-                    self.stdout.write(f"+ Synonym added: {word} → {service.service_name}")
+                    self.stdout.write(f"+ Synonym added: {word} \u2192 {service.service_name}")
 
         self.stdout.write(self.style.SUCCESS("\nAll categories, groups, services, and keywords seeded successfully!"))
