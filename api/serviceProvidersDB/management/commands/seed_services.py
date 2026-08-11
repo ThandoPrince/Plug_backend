@@ -214,6 +214,54 @@ class Command(BaseCommand):
                 self.stdout.write(f"\U0001F6AB Prohibited keyword added: {word}")
 
         # -----------------------------
+        # CLEANUP: REMOVE PROHIBITED SERVICES STILL IN DB
+        # -----------------------------
+        # Older runs of this script (or manual entries) may have created
+        # Service rows for things that are now prohibited (e.g. Armed Guard,
+        # Chiropractor). Removing a service from groups_data above does NOT
+        # delete it from an existing database — this pass finds and removes
+        # any Service whose name exactly matches a prohibited keyword, then
+        # removes any ServiceGroup/ServiceCategory left with nothing in it.
+        self.stdout.write(self.style.WARNING("\nRemoving prohibited services still present in the database..."))
+        prohibited_set = {word.lower().strip() for word in prohibited_keywords}
+
+        affected_groups = set()
+        removed_count = 0
+        for service in list(Service.objects.all()):
+            if service.service_name.lower().strip() in prohibited_set:
+                self.stdout.write(
+                    self.style.ERROR(f"\U0001F5D1 Deleting prohibited service found in DB: {service.service_name}")
+                )
+                affected_groups.add(service.service_group_id)
+                service.delete()
+                removed_count += 1
+
+        if removed_count:
+            self.stdout.write(self.style.SUCCESS(f"Removed {removed_count} prohibited service(s) from the database."))
+        else:
+            self.stdout.write("No prohibited services found in the database.")
+
+        # Remove any groups that are now empty (no services left)
+        affected_categories = set()
+        for group_id in affected_groups:
+            if group_id is None:
+                continue
+            group = ServiceGroup.objects.filter(pk=group_id).first()
+            if group and not Service.objects.filter(service_group=group).exists():
+                self.stdout.write(self.style.ERROR(f"\U0001F5D1 Deleting now-empty group: {group.name}"))
+                affected_categories.add(group.category_id)
+                group.delete()
+
+        # Remove any categories that are now empty (no groups left)
+        for category_id in affected_categories:
+            if category_id is None:
+                continue
+            category = ServiceCategory.objects.filter(pk=category_id).first()
+            if category and not ServiceGroup.objects.filter(category=category).exists():
+                self.stdout.write(self.style.ERROR(f"\U0001F5D1 Deleting now-empty category: {category.name}"))
+                category.delete()
+
+        # -----------------------------
         # SERVICE SYNONYMS
         # -----------------------------
         self.stdout.write(self.style.WARNING("\nSeeding Service Synonyms..."))
