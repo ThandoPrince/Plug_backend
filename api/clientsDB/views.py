@@ -1,5 +1,7 @@
 import re
 from sqlite3 import IntegrityError
+import requests
+from rest_framework.exceptions import ValidationError
 from rest_framework_simplejwt.tokens import RefreshToken
 from rest_framework_simplejwt.exceptions import TokenError
 from django.http import JsonResponse
@@ -12,6 +14,7 @@ from rest_framework.parsers import MultiPartParser, FormParser
 from rest_framework.permissions import AllowAny
 from rest_framework.permissions import IsAuthenticated
 from django.db import transaction
+from api.clientsDB.services.address_verify_service import AIAddressVerificationClient
 from api.clientsDB.services.client_ip_address_helper import get_client_ip, get_device_info
 from api.clientsDB.services.jwt_client_authentication import ClientJWTAuthentication
 from api.clientsDB.services.sa_phone_number_helper import normalize_sa_mobile
@@ -21,7 +24,7 @@ from plug_backend.utils.client_jwt_helper import generate_client_tokens
 from django.db.models import Q
 from django.utils import timezone
 from .models.models import ClientAuth, ClientDetails, Address, ClientAddress, ClientLoginHistory, ClientNotification, ClientRegistrationHistory, DeviceToken 
-from .serializers import AddressClaimSerializer, AddressOnlySerializer, AddressVerificationCreateSerializer, ClientAddressNoDuplicatesSerializer, AddressSerializer, ClientAddressSerializerr, ClientAddressWriteSerializer, ClientAuthReadSerializer, ClientLoginSerializer, ClientProfileAppUpdateSerializer, ClientProfileSerializer, ClientRegisterSerializer, ClientSerializer, ClientAddressSerializer, DefaultAddressSerializer, DeviceTokenWriteSerializer, HouseholdMemberSerializer
+from .serializers import AddressClaimSerializer, AddressOnlySerializer, AddressVerificationCreateSerializer, ClientAddressDeactivateSerializer, ClientAddressNoDuplicatesSerializer, AddressSerializer, ClientAddressSerializerr, ClientAddressWriteSerializer, ClientAuthReadSerializer, ClientLoginSerializer, ClientProfileAppUpdateSerializer, ClientProfileSerializer, ClientRegisterSerializer, ClientSavedAddressSerializer, ClientSerializer, ClientAddressSerializer, DefaultAddressSerializer, DeviceTokenWriteSerializer, HouseholdMemberSerializer
 from django.contrib.auth.hashers import check_password, make_password
 
 
@@ -625,6 +628,74 @@ def set_default_address(request, address_id):
 
 
 
+
+from rest_framework.exceptions import ValidationError
+
+
+@api_view(['POST'])
+@throttle_classes([ProfileWriteThrottle])
+@authentication_classes([ClientJWTAuthentication])
+@permission_classes([IsAuthenticated])
+def a_add_residential_address(request):
+
+    try:
+        client = get_object_or_404(
+            ClientDetails,
+            client_profile=request.user
+        )
+
+        serializer = ClientAddressWriteSerializer(
+            data=request.data,
+            context={"client": client}
+        )
+
+        if not serializer.is_valid():
+            return Response(
+                {
+                    "success": False,
+                    "message": "Address validation failed.",
+                    "errors": serializer.errors,
+                },
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        try:
+            with transaction.atomic():
+                client_address = serializer.save()
+
+        except ValidationError as exc:
+            return Response(
+                {
+                    "success": False,
+                    "message": "Address validation failed.",
+                    "errors": exc.detail,
+                },
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        return Response(
+            {
+                "success": True,
+                "message": "Address added successfully.",
+                "data": ClientAddressSerializerr(
+                    client_address
+                ).data,
+            },
+            status=status.HTTP_201_CREATED
+        )
+
+    except Exception:
+        logger.exception("Error adding residential address")
+
+        return Response(
+            {
+                "success": False,
+                "message": "Unable to add address at this time."
+            },
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR
+        )
+
+
 @api_view(['POST'])
 @throttle_classes([ProfileWriteThrottle])
 @authentication_classes([ClientJWTAuthentication])
@@ -677,6 +748,65 @@ def add_residential_address(request):
             },
             status=status.HTTP_500_INTERNAL_SERVER_ERROR
         )
+
+@api_view(["POST"])
+@throttle_classes([ProfileWriteThrottle])
+@authentication_classes([ClientJWTAuthentication])
+@permission_classes([IsAuthenticated])
+def deactivate_client_address(request, address_id):
+
+    try:
+        client = get_object_or_404(
+            ClientDetails,
+            client_profile=request.user
+        )
+
+        client_address = get_object_or_404(
+            ClientAddress,
+            id=address_id,
+            client=client
+        )
+
+        serializer = ClientAddressDeactivateSerializer(
+            instance=client_address,
+            data={},
+            context={"client": client}
+        )
+
+        if not serializer.is_valid():
+            return Response(
+                {
+                    "success": False,
+                    "message": "Unable to deactivate address.",
+                    "errors": serializer.errors,
+                },
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        with transaction.atomic():
+            client_address = serializer.save()
+
+        return Response(
+            {
+                "success": True,
+                "message": "Address deactivated successfully.",
+                "data": ClientAddressSerializerr(
+                    client_address
+                ).data,
+            },
+            status=status.HTTP_200_OK
+        )
+
+    except Exception:
+        logger.exception("Error deactivating client address")
+
+        return Response(
+            {
+                "success": False,
+                "message": "Unable to deactivate address at this time."
+            },
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR
+        )
     
 
 @api_view(['GET'])
@@ -718,54 +848,205 @@ def submit_address_verification(request, client_address_id):
 
     try:
         client = get_client_details(request)
+        client_auth = get_client_auth(request)
+        
+        customer_id = str(client_auth.id)
 
         client_address = ClientAddress.objects.get(
             id=client_address_id,
             client=client
         )
 
+        proof_of_residence = request.FILES.get("proof_of_residence")
+        id_document = request.FILES.get("id_document")
+        liveness_video = request.FILES.get("liveness_video")
+        id_number = request.data.get("id_number")
+
         serializer = AddressVerificationCreateSerializer(
             data={
                 "client_address": client_address.id,
-                "proof_of_residence": request.FILES.get("proof_of_residence"),
-                "id_document": request.FILES.get("id_document"),
+                "id_number": id_number,
+                "proof_of_residence": proof_of_residence,
+                "id_document": id_document,
+                "liveness_video": liveness_video,
             },
-            context={"request": request}
+            context={"request": request},
         )
 
         if not serializer.is_valid():
-            return Response(
+            logger.error(
+                "Address verification serializer errors: %s",
                 serializer.errors,
-                status=status.HTTP_400_BAD_REQUEST
             )
 
+            return Response(
+                {
+                    "success": False,
+                    "errors": serializer.errors,
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # -------------------------------------------------
+        # SAVE / RESET VERIFICATION
+        # -------------------------------------------------
         with transaction.atomic():
             verification = serializer.save()
 
-        return Response(
-            {
-                "success": True,
-                "message": "Verification submitted successfully.",
-                "status": verification.status,
-            },
-            status=status.HTTP_201_CREATED
+        # Use the validated value rather than the raw request value.
+        validated_id_number = serializer.validated_data["id_number"]
+
+        # -------------------------------------------------
+        # WAIT FOR AI VERIFICATION
+        # -------------------------------------------------
+        try:
+            ai_result = AIAddressVerificationClient.verify_address(
+    customer_id=customer_id,
+    client=client,
+    id_number=validated_id_number,
+    id_document=id_document,
+    liveness_video=liveness_video,
+    proof_of_residence=proof_of_residence,
+)
+
+        except requests.HTTPError as exc:
+            # -------------------------------------------------
+            # AI SERVER RESPONDED WITH HTTP ERROR
+            # -------------------------------------------------
+            detail = None
+
+            try:
+                response_data = exc.response.json()
+
+                detail = (
+                    response_data.get("detail")
+                    or response_data.get("message")
+                    or response_data.get("error")
+                )
+
+            except Exception:
+                pass
+
+            note = detail or "Address verification failed."
+
+            logger.warning(
+                "AI address verification rejected request for "
+                "client_address %s: %s",
+                client_address.id,
+                note,
+            )
+
+            verification.reject(note=note)
+
+            return Response(
+                {
+                    "success": False,
+                    "message": note,
+                    "status": verification.status,
+                },
+                status=status.HTTP_200_OK,
+            )
+
+        except requests.RequestException:
+            # -------------------------------------------------
+            # AI SERVER DID NOT RESPOND
+            # -------------------------------------------------
+            logger.exception(
+                "AI address verification service unreachable "
+                "for client_address %s",
+                client_address.id,
+            )
+
+            # Keep it pending. We don't know whether the user
+            # passed or failed verification.
+            return Response(
+                {
+                    "success": True,
+                    "message": (
+                        "Verification submitted successfully. "
+                        "AI verification is pending."
+                    ),
+                    "status": verification.status,
+                },
+                status=status.HTTP_202_ACCEPTED,
+            )
+
+        # -------------------------------------------------
+        # AI RESPONDED SUCCESSFULLY
+        # -------------------------------------------------
+        verification_status = ai_result.get("verification_status")
+
+        logger.info(
+            "AI address verification response for client_address %s: %s",
+            client_address.id,
+            ai_result,
         )
 
-    except ClientAddress.DoesNotExist:
-        return Response(
-            {"error": "Client address not found."},
-            status=status.HTTP_404_NOT_FOUND
-        )
+        # -------------------------------------------------
+        # VERIFIED
+        # -------------------------------------------------
+        if verification_status == "verified":
 
-    except Exception:
-        logger.exception("Error submitting address verification")
+            verification.approve()
+
+            return Response(
+                {
+                    "success": True,
+                    "message": (
+                        ai_result.get("message")
+                        or "Address verification successful."
+                    ),
+                    "status": verification.status,
+                },
+                status=status.HTTP_200_OK,
+            )
+
+        # -------------------------------------------------
+        # REJECTED / FAILED
+        # -------------------------------------------------
+        verification.reject(
+            note=(
+                ai_result.get("message")
+                or ai_result.get("detail")
+                or "Address verification failed."
+            )
+        )
 
         return Response(
             {
                 "success": False,
-                "message": "Unable to submit verification at this time."
+                "message": (
+                    ai_result.get("message")
+                    or ai_result.get("detail")
+                    or "Address verification failed."
+                ),
+                "status": verification.status,
             },
-            status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            status=status.HTTP_200_OK,
+        )
+
+    except ClientAddress.DoesNotExist:
+        return Response(
+            {
+                "success": False,
+                "message": "Client address not found.",
+            },
+            status=status.HTTP_404_NOT_FOUND,
+        )
+
+    except Exception:
+        logger.exception(
+            "Error submitting address verification"
+        )
+
+        return Response(
+            {
+                "success": False,
+                "message": (
+                    "Unable to submit verification at this time."
+                ),
+            },
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
         )
     
 
@@ -1030,7 +1311,7 @@ def address_detail(request, id, format=None):
             clientaddress__client=client  # 🔒 RLS enforcement
         )
 
-        serializer = AddressSerializer(address)
+        serializer = ClientSavedAddressSerializer(address)
 
         return Response(
             serializer.data,
@@ -1104,7 +1385,7 @@ def client_address_detail(request, client_id, format=None):
         client_addresses = (
             ClientAddress.objects
             .select_related('address')
-            .filter(client=client)
+            .filter(client=client, is_active=True)
             .order_by('-is_default', 'id')
         )
 

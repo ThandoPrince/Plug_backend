@@ -6,6 +6,7 @@ from django.core.exceptions import ValidationError as DjangoValidationError
 from django.utils import timezone
 from api.clientsDB.services.client_ip_address_helper import get_client_ip
 from api.clientsDB.services.sa_phone_number_helper import normalize_sa_mobile
+from api.serviceProvidersDB.services.sa_id_validator import SouthAfricanIDValidator
 from .models.models import AddressSuperUserVerification, ClientAuth, Address, ClientDetails, ClientAddress, ClientLoginHistory, ClientNotification, DeviceToken
 import re
 from django.db.models import Q
@@ -79,7 +80,7 @@ class ClientRegisterSerializer(serializers.ModelSerializer):
     def validate_email_address(self, value):
         value = value.lower()
         if ClientAuth.objects.filter(email_address=value).exists():
-            raise serializers.ValidationError("A user with this email already exists.")
+            raise serializers.ValidationError("This email address is invalid.")
         return value
 
     def validate_mobile_number(self, value):
@@ -111,23 +112,12 @@ class ClientRegisterSerializer(serializers.ModelSerializer):
             mobile_number=normalized
         ).exists():
             raise serializers.ValidationError(
-                "A user with this mobile number already exists."
+                "Enter a valid South African mobile number."
             )
 
         return normalized
 
-    # --------------------------------------
-    # Uniqueness check
-    # --------------------------------------
 
-        if ClientAuth.objects.filter(
-            mobile_number=normalized
-        ).exists():
-            raise serializers.ValidationError(
-            "A user with this mobile number already exists."
-        )
-
-        return normalized
 
 
     def validate_password(self, value):
@@ -148,15 +138,22 @@ class ClientRegisterSerializer(serializers.ModelSerializer):
         validated_data['password'] = make_password(validated_data['password'])
         return ClientAuth.objects.create(**validated_data)
 
-class AddressSerializer(serializers.ModelSerializer):
-    clients = serializers.SerializerMethodField()
+class ClientSavedAddressSerializer(serializers.ModelSerializer):
+    
 
     class Meta:
         model = Address
         fields = '__all__'
 
-    def get_clients(self, obj):
-        return ClientSerializer(obj.clients.all(), many=True).data
+ 
+class AddressSerializer(serializers.ModelSerializer):
+
+
+    class Meta:
+        model = Address
+        fields = '__all__'
+
+
     
 class ClientProfileSerializer(serializers.ModelSerializer):
     # Add 'profile_image' to fields if it exists in ClientAuth model
@@ -407,6 +404,40 @@ class ClientAddressWriteSerializer(serializers.ModelSerializer):
             **validated_data
         )
 
+
+
+
+
+class ClientAddressDeactivateSerializer(serializers.ModelSerializer):
+
+    class Meta:
+        model = ClientAddress
+        fields = ["id"]
+
+    def validate(self, attrs):
+        client_address = self.instance
+
+        if client_address.is_default:
+            raise serializers.ValidationError(
+                "The default address cannot be deactivated."
+            )
+
+        if not client_address.is_active:
+            raise serializers.ValidationError(
+                "This address is already inactive."
+            )
+
+        return attrs
+
+    def update(self, instance, validated_data):
+        instance.is_active = False
+        instance.is_super_user = False
+        instance.save(
+            update_fields=["is_active", "is_super_user"]
+        )
+        return instance
+    
+
 class ClientAddressSerializerr(serializers.ModelSerializer):
     
     # Lift the verification state from the Address object up to the root ClientAddress map
@@ -427,37 +458,94 @@ class AddressVerificationCreateSerializer(serializers.ModelSerializer):
         model = AddressSuperUserVerification
         fields = [
             "client_address",
+            "id_number",
             "proof_of_residence",
             "id_document",
+            "liveness_video",
         ]
 
     def validate(self, attrs):
         errors = {}
 
         client_address = attrs.get("client_address")
-
-        if not client_address:
-            errors["client_address"] = ["Client address is required."]
+        id_number = attrs.get("id_number")
 
         # -------------------------------------------------
-        # Existing verification logic
+        # CLIENT ADDRESS VALIDATION
+        # -------------------------------------------------
+        if not client_address:
+            errors["client_address"] = [
+                "Client address is required."
+            ]
+
+        # -------------------------------------------------
+        # SOUTH AFRICAN ID NUMBER VALIDATION
+        # -------------------------------------------------
+        id_validation = None
+
+        if not id_number:
+            errors["id_number"] = [
+                "ID number is required."
+            ]
+        else:
+            id_number = str(id_number).strip()
+
+            id_validation = SouthAfricanIDValidator.validate(
+                id_number
+            )
+
+            if not id_validation["valid"]:
+                errors["id_number"] = [
+                    id_validation["message"]
+                ]
+
+        # -------------------------------------------------
+        # DATE OF BIRTH VALIDATION
+        # -------------------------------------------------
+        if (
+            client_address
+            and id_validation
+            and id_validation["valid"]
+        ):
+            client = client_address.client
+            client_dob = client.date_of_birth
+            id_dob = id_validation["dob"]
+
+            if not client_dob:
+                errors["id_number"] = [
+                    "Your date of birth is not available on your profile. "
+                    "Please update your profile before completing verification."
+                ]
+
+            elif client_dob != id_dob:
+                errors["id_number"] = [
+                    "The date of birth on your ID number does not match "
+                    "the date of birth on your profile."
+                ]
+
+        # -------------------------------------------------
+        # EXISTING VERIFICATION
         # -------------------------------------------------
         if client_address:
-            existing = getattr(client_address, "verification_request", None)
+            existing = getattr(
+                client_address,
+                "verification_request",
+                None,
+            )
 
             if existing:
-                if existing.status == "approved":
+                if (
+                    existing.status
+                    == AddressSuperUserVerification.STATUS_APPROVED
+                ):
                     errors["client_address"] = [
                         "This address has already been verified."
                     ]
 
-                elif existing.status == "pending":
-                    errors["client_address"] = [
-                        "Verification request is already pending."
-                    ]
+                # Pending/rejected submissions can be resubmitted.
 
         # -------------------------------------------------
-        # Required file validation (clean DRF style)
+        # REQUIRED FILE VALIDATION
         # -------------------------------------------------
         if not attrs.get("proof_of_residence"):
             errors["proof_of_residence"] = [
@@ -469,18 +557,68 @@ class AddressVerificationCreateSerializer(serializers.ModelSerializer):
                 "ID document is required."
             ]
 
+        if not attrs.get("liveness_video"):
+            errors["liveness_video"] = [
+                "Liveness video is required."
+            ]
+
         # -------------------------------------------------
-        # Raise all errors together (not one-by-one)
+        # RETURN VALIDATION ERRORS
         # -------------------------------------------------
         if errors:
             raise serializers.ValidationError(errors)
 
+        # Store cleaned ID number.
+        attrs["id_number"] = id_number
+
         return attrs
 
     def create(self, validated_data):
+        client_address = validated_data["client_address"]
+
+        existing = getattr(
+            client_address,
+            "verification_request",
+            None,
+        )
+
+        # -------------------------------------------------
+        # EXISTING VERIFICATION
+        # -------------------------------------------------
+        if existing:
+            existing.id_number = validated_data["id_number"]
+
+            existing.proof_of_residence = (
+                validated_data["proof_of_residence"]
+            )
+
+            existing.id_document = (
+                validated_data["id_document"]
+            )
+
+            existing.liveness_video = (
+                validated_data["liveness_video"]
+            )
+
+            existing.status = (
+                AddressSuperUserVerification.STATUS_PENDING
+            )
+
+            existing.reviewed_at = None
+            existing.admin_notes = None
+            existing.submitted_at = timezone.now()
+
+            existing.save()
+
+            return existing
+
+        # -------------------------------------------------
+        # FIRST SUBMISSION
+        # -------------------------------------------------
         return AddressSuperUserVerification.objects.create(
             **validated_data
         )
+        
     
 class ClientLoginSerializer(serializers.Serializer):
 
@@ -619,9 +757,7 @@ class ClientLoginSerializer(serializers.Serializer):
         return data
     
 
-class ClientViewSerializer(serializers.ModelSerializer):
-
-    
+class ClientViewSerializer(serializers.ModelSerializer): 
 
     class Meta:
         model = ClientDetails

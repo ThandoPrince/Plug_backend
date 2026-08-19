@@ -344,7 +344,7 @@ class ClientAddress(models.Model):
     id = models.AutoField(primary_key=True ,db_index=True)
     is_active = models.BooleanField(default=True,db_index=True)
     date_created = models.DateTimeField(auto_now_add=True, null=True,db_index=True)
-    in_request = models.BooleanField (default=False, null=True ,db_index=True )
+    in_request = models.BooleanField (default=False, null=True  )
 
     RESIDENTIAL = "Residential Address"
     VACATION = "Vacation Address"
@@ -452,9 +452,9 @@ def secure_verification_path(instance, filename):
 
     ext = os.path.splitext(filename)[1].lower()
 
-    valid_extensions = ['.pdf', '.jpg', '.jpeg', '.png']
+    valid_extensions = ['.pdf', '.jpg', '.jpeg', '.png', '.mp4']
     if ext not in valid_extensions:
-        raise ValidationError("Unsupported file format. Use PDF, JPG, or PNG.")
+        raise ValidationError("Unsupported file format. Use PDF, JPG, PNG, or MP4.")
 
     random_filename = f"{uuid.uuid4()}{ext}"
 
@@ -495,6 +495,15 @@ class AddressSuperUserVerification(models.Model):
         upload_to=secure_verification_path
     )
 
+    liveness_video = models.FileField(
+        upload_to=secure_verification_path, null=True, blank=True
+    )
+    id_number = models.CharField(
+        max_length=20,
+        blank=False,
+        null=False,
+    )
+
     status = models.CharField(
         max_length=20,
         choices=STATUS_CHOICES,
@@ -511,14 +520,21 @@ class AddressSuperUserVerification(models.Model):
     def clean(self):
         super().clean()
 
-        MAX_SIZE = 5 * 1024 * 1024  # 5MB
+        # Videos are legitimately much bigger than a scanned document,
+        # so this needs its own ceiling rather than sharing the 5MB
+        # limit meant for images/PDFs.
+        MAX_SIZES = {
+            "proof_of_residence": 5 * 1024 * 1024,    # 5MB
+            "id_document": 5 * 1024 * 1024,           # 5MB
+            "liveness_video": 50 * 1024 * 1024,       # 50MB
+        }
 
-        for field_name in ["proof_of_residence", "id_document"]:
+        for field_name, max_size in MAX_SIZES.items():
             file = getattr(self, field_name)
 
-            if file and hasattr(file, "size") and file.size > MAX_SIZE:
+            if file and hasattr(file, "size") and file.size > max_size:
                 raise ValidationError({
-                    field_name: "File size cannot exceed 5MB."
+                    field_name: f"File size cannot exceed {max_size // (1024 * 1024)}MB."
                 })
 
     # --------------------------------------------------
@@ -526,17 +542,59 @@ class AddressSuperUserVerification(models.Model):
     # --------------------------------------------------
     def approve(self):
         """
-        Atomically approves verification and upgrades client role.
+        Approve this verification.
+
+        The physical address is marked verified only on the
+        False -> True transition. Each approved client receives
+        their own superuser status.
         """
 
         with transaction.atomic():
-            self.status = self.STATUS_APPROVED
-            self.reviewed_at = timezone.now()
-            self.save()
 
+            verification = (
+                AddressSuperUserVerification.objects
+                .select_for_update()
+                .get(pk=self.pk)
+            )
+
+            if verification.status == self.STATUS_APPROVED:
+                return
+
+            # -------------------------------------------------
+            # APPROVE THIS VERIFICATION
+            # -------------------------------------------------
+            verification.status = self.STATUS_APPROVED
+            verification.reviewed_at = timezone.now()
+
+            verification.save(
+                update_fields=[
+                    "status",
+                    "reviewed_at",
+                ]
+            )
+
+            # -------------------------------------------------
+            # MARK ADDRESS VERIFIED
+            #
+            # Only a currently-unverified address is updated.
+            # If another client already verified it, this updates
+            # zero rows and does nothing.
+            # -------------------------------------------------
+            Address.objects.filter(
+                pk=verification.client_address.address_id,
+                is_verified=False,
+            ).update(
+                is_verified=True
+            )
+
+            # -------------------------------------------------
+            # MAKE THIS CLIENT A SUPERUSER
+            # -------------------------------------------------
             ClientAddress.objects.filter(
-                pk=self.client_address.pk
-            ).update(is_super_user=True)
+                pk=verification.client_address_id,
+            ).update(
+                is_super_user=True
+            )
 
     def reject(self, note=None):
         """

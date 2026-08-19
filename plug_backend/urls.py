@@ -60,13 +60,14 @@ urlpatterns = [
     path("api/clientsDB/client-logout/", views.client_logout, name="get-my-profile"),
     path("api/clientsDB/client/profile/complete/", views.complete_profile, name="complete-client-profile"), ##used
     path("api/clientsDB/client/add-residential-address/", views.add_residential_address, name="add-residential-address"), ##used
+    path("api/clientsDB/client/a-add-residential-address/", views.a_add_residential_address, name="add-residential-address"), ##used
     path("api/clientsDB/login/", views.client_login, name="client-login"),  ##used
     path(
         "api/client-address/<int:client_address_id>/household-members/",
         views.get_household_members,
         name="get_household_members",
     ),
-    path("clientsDB/address/verify/<int:client_address_id>/", views.submit_address_verification, name="client-address-verification"), ##used
+    path("api/clientsDB/address/verify/<int:client_address_id>/", views.submit_address_verification, name="client-address-verification"), ##used
     path(
     "api/client/reset-password/",
     views.reset_client_password,
@@ -79,6 +80,12 @@ path(
         views.update_client_profile,
         name="update_client_profile",
     ),
+
+    path(
+    "api/clientsDB/addresses/<int:address_id>/deactivate/",
+    views.deactivate_client_address,
+    name="deactivate-client-address",
+),
     
     
 
