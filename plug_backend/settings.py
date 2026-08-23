@@ -133,6 +133,7 @@ AUTH_PASSWORD_VALIDATORS = [
 ]
 
 HMS_APP_ID = get_env("HMS_APP_ID", "")
+OTP_HASH_SECRET = get_env("OTP_HASH_SECRET", required=True)
 HMS_APP_SECRET = get_env("HMS_APP_SECRET", "")
 PROVIDER_HMS_APP_ID = get_env("PROVIDER_HMS_APP_ID", "")
 PROVIDER_HMS_APP_SECRET = get_env("PROVIDER_HMS_APP_SECRET", "")
@@ -167,6 +168,8 @@ REST_FRAMEWORK = {
         "anon": "30/min",
         "user": "100/min",
         "auth": "5/min",
+        "client_otp": "3/minute",
+        "client_registration": "3/minute",
         "register": "3/min",
         "public_read": "30/min",
         "user_read": "60/min",

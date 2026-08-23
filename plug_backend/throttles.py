@@ -1,8 +1,11 @@
-from rest_framework.throttling import UserRateThrottle, AnonRateThrottle
+from rest_framework.throttling import ScopedRateThrottle, UserRateThrottle, AnonRateThrottle
 
 
 class AuthThrottle(AnonRateThrottle):
     scope = "auth"
+
+class ClientOTPThrottle(ScopedRateThrottle):
+    scope = "client_otp"
 
 
 class RegisterThrottle(AnonRateThrottle):
@@ -15,6 +18,9 @@ class PublicReadThrottle(AnonRateThrottle):
 
 class UserReadThrottle(UserRateThrottle):
     scope = "user_read"
+
+class ClientRegistrationThrottle(ScopedRateThrottle):
+    scope = "client_registration"
 
 
 class HeavyReadThrottle(UserRateThrottle):

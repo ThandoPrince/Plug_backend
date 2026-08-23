@@ -41,6 +41,33 @@ class ClientProfileSerializer(serializers.ModelSerializer):
 
         instance.save()
         return instance
+
+
+    
+
+
+class ClientOTPVerifySerializer(serializers.Serializer):
+    request_id = serializers.UUIDField(
+        required=True
+    )
+
+    otp = serializers.CharField(
+        required=True,
+        min_length=6,
+        max_length=6,
+        trim_whitespace=True,
+        write_only=True
+    )
+
+    def validate_otp(self, value):
+        if not value.isdigit():
+            raise serializers.ValidationError(
+                "Invalid OTP."
+            )
+
+        return value
+
+    
     
 
 class ClientProfileBookingSerializer(serializers.ModelSerializer):

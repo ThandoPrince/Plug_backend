@@ -92,7 +92,19 @@ path(
     views.super_user_deactivate_client_address,
     name="super-user-deactivate-client-address",
 ),
-    
+
+    path(
+    "api/client/login/verify-otp/",
+    views.verify_client_login_otp,
+    name="client-login-verify-otp",
+),
+
+    path(
+        "api/client/login/verify-email/",
+        views.verify_client_email,
+        name="client-login-verify-email",
+    ),
+        
     
 
     # Service Providers DB

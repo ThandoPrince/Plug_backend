@@ -113,6 +113,11 @@ class ClientAuth(models.Model):
     blank=True,
     db_index=True
 )
+    email_verified_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        db_index=True
+    )
 
 
     password = models.CharField(max_length=128)
@@ -148,6 +153,89 @@ class ClientAuth(models.Model):
 
     def __str__(self):
         return f"{self.email_address}"
+
+
+
+class ClientOTP(models.Model):
+
+    PURPOSE_CHOICES = [
+        ("login", "Login"),
+        ("email_verification", "Email Verification"),
+    ]
+
+    request_id = models.UUIDField(
+        default=uuid.uuid4,
+        unique=True,
+        editable=False,
+        db_index=True
+    )
+
+    client = models.ForeignKey(
+        ClientAuth,
+        on_delete=models.CASCADE,
+        related_name="otp_requests"
+    )
+
+    purpose = models.CharField(
+        max_length=30,
+        choices=PURPOSE_CHOICES,
+        db_index=True
+    )
+
+    otp_hash = models.CharField(
+        max_length=128
+    )
+
+    expires_at = models.DateTimeField(
+        db_index=True
+    )
+
+    attempts = models.PositiveIntegerField(
+        default=0
+    )
+
+    max_attempts = models.PositiveIntegerField(
+        default=5
+    )
+
+    is_verified = models.BooleanField(
+        default=False,
+        db_index=True
+    )
+
+    is_used = models.BooleanField(
+        default=False,
+        db_index=True
+    )
+
+    created_at = models.DateTimeField(
+        auto_now_add=True,
+        db_index=True
+    )
+
+    verified_at = models.DateTimeField(
+        null=True,
+        blank=True
+    )
+
+    class Meta:
+        indexes = [
+            models.Index(
+                fields=["client", "purpose", "is_verified"]
+            ),
+            models.Index(
+                fields=["expires_at"]
+            ),
+        ]
+
+    def __str__(self):
+        return (
+            f"{self.client.email_address} - "
+            f"{self.purpose} - "
+            f"{self.request_id}"
+        )
+
+
 
 class DeviceToken(models.Model):
     DEVICE_TYPES = (

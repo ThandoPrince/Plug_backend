@@ -605,7 +605,7 @@ def sp_register(request):
         return Response(
             {
                 "success": False,
-                "message": "An account with this email or mobile already exists.",
+                "message": "Invalid email or mobile number provided.",
             },
             status=status.HTTP_409_CONFLICT,
         )

@@ -1,4 +1,5 @@
 import re
+import secrets
 from sqlite3 import IntegrityError
 import requests
 from rest_framework.exceptions import ValidationError
@@ -18,14 +19,16 @@ from api.clientsDB.services.address_verify_service import AIAddressVerificationC
 from api.clientsDB.services.client_history_model_helper import create_client_address_history
 from api.clientsDB.services.client_ip_address_helper import get_client_ip, get_device_info
 from api.clientsDB.services.jwt_client_authentication import ClientJWTAuthentication
+from api.clientsDB.services.otp_service import create_client_otp, create_login_otp, hash_otp
+from api.clientsDB.services.otp_tasks import OTPCooldownError, send_client_login_otp_email, send_client_otp_email
 from api.clientsDB.services.sa_phone_number_helper import normalize_sa_mobile
 from plug_backend.helpers.auth_helpers import get_client_auth, get_client_details
-from plug_backend.throttles import AuthThrottle, ProfileWriteThrottle, RegisterThrottle, UserReadThrottle
+from plug_backend.throttles import AuthThrottle, ClientOTPThrottle, ClientRegistrationThrottle, ProfileWriteThrottle, RegisterThrottle, UserReadThrottle
 from plug_backend.utils.client_jwt_helper import generate_client_tokens
 from django.db.models import Q
 from django.utils import timezone
-from .models.models import ClientAddressHistory, ClientAuth, ClientDetails, Address, ClientAddress, ClientLoginHistory, ClientNotification, ClientRegistrationHistory, DeviceToken 
-from .serializers import AddressClaimSerializer, AddressOnlySerializer, AddressVerificationCreateSerializer, ClientAddressDeactivateSerializer, ClientAddressNoDuplicatesSerializer, AddressSerializer, ClientAddressSerializerr, ClientAddressWriteSerializer, ClientAuthReadSerializer, ClientLoginSerializer, ClientProfileAppUpdateSerializer, ClientProfileSerializer, ClientRegisterSerializer, ClientSavedAddressSerializer, ClientSerializer, ClientAddressSerializer, DefaultAddressSerializer, DeviceTokenWriteSerializer, HouseholdMemberSerializer
+from .models.models import ClientAddressHistory, ClientAuth, ClientDetails, Address, ClientAddress, ClientLoginHistory, ClientNotification, ClientOTP, ClientRegistrationHistory, DeviceToken 
+from .serializers import AddressClaimSerializer, AddressOnlySerializer, AddressVerificationCreateSerializer, ClientAddressDeactivateSerializer, ClientAddressNoDuplicatesSerializer, AddressSerializer, ClientAddressSerializerr, ClientAddressWriteSerializer, ClientAuthReadSerializer, ClientLoginSerializer, ClientOTPVerifySerializer, ClientProfileAppUpdateSerializer, ClientProfileSerializer, ClientRegisterSerializer, ClientSavedAddressSerializer, ClientSerializer, ClientAddressSerializer, DefaultAddressSerializer, DeviceTokenWriteSerializer, HouseholdMemberSerializer
 from django.contrib.auth.hashers import check_password, make_password
 
 
@@ -184,7 +187,7 @@ def reset_client_password(request):
 
     
 @api_view(['POST'])
-@throttle_classes([AuthThrottle])
+@throttle_classes([ClientRegistrationThrottle])
 @permission_classes([AllowAny])
 def register_client(request):
 
@@ -192,127 +195,220 @@ def register_client(request):
     user_agent = get_device_info(request)
 
     try:
-        serializer = ClientRegisterSerializer(data=request.data)
-
-        if serializer.is_valid():
-
-            email = serializer.validated_data['email_address'].lower()
-            mobile = serializer.validated_data["mobile_number"]
-
-            # 🔐 duplicate email check
-            if ClientAuth.objects.filter(email_address=email).exists():
-
-                ClientRegistrationHistory.objects.create(
-                    email=email,
-                    mobile_number=mobile,
-                    successful=False,
-                    ip_address=ip_address,
-                    user_agent=user_agent,
-                    error_message="Email already exists"
-                )
-
-                return Response(
-                    {"error": "A user with this email already exists."},
-                    status=status.HTTP_400_BAD_REQUEST
-                )
-
-            # 🔐 duplicate mobile check
-            if ClientAuth.objects.filter(mobile_number=mobile).exists():
-
-                ClientRegistrationHistory.objects.create(
-                    email=email,
-                    mobile_number=mobile,
-                    successful=False,
-                    ip_address=ip_address,
-                    user_agent=user_agent,
-                    error_message="Mobile already exists"
-                )
-
-                return Response(
-                    {"error": "A user with this mobile number already exists."},
-                    status=status.HTTP_400_BAD_REQUEST
-                )
-
-            try:
-                with transaction.atomic():
-
-                    client_auth = serializer.save()
-
-                    ClientDetails.objects.get_or_create(
-                        client_profile=client_auth
-                    )
-
-                    tokens = generate_client_tokens(client_auth)
-
-                    # 🔐 SUCCESS LOG
-                    ClientRegistrationHistory.objects.create(
-                        email=email,
-                        mobile_number=mobile,
-                        successful=True,
-                        ip_address=ip_address,
-                        user_agent=user_agent,
-                        device_name=request.data.get("device_name")
-                    )
-
-                return Response(
-                    {
-                        "success": True,
-                        "message": "Registration successful.",
-                        "data": {
-                            "id": client_auth.id,
-                            "email": client_auth.email_address,
-                            "mobile_number": client_auth.mobile_number,
-                            "access_token": tokens["access"],
-                            "refresh_token": tokens["refresh"],
-                        }
-                    },
-                    status=status.HTTP_201_CREATED
-                )
-
-            except IntegrityError:
-
-                ClientRegistrationHistory.objects.create(
-                    email=email,
-                    mobile_number=mobile,
-                    successful=False,
-                    ip_address=ip_address,
-                    user_agent=user_agent,
-                    error_message="Integrity error"
-                )
-
-                return Response(
-                    {
-                        "success": False,
-                        "message": "A user with this email or mobile already exists."
-                    },
-                    status=status.HTTP_409_CONFLICT
-                )
-
-            except Exception:
-
-                ClientRegistrationHistory.objects.create(
-                    email=email,
-                    mobile_number=mobile,
-                    successful=False,
-                    ip_address=ip_address,
-                    user_agent=user_agent,
-                    error_message="Server exception"
-                )
-
-                logger.exception("Client registration failed")
-
-                return Response(
-                    {
-                        "success": False,
-                        "message": "A server error occurred. Please try again later."
-                    },
-                    status=status.HTTP_500_INTERNAL_SERVER_ERROR
-                )
-
-        return Response(
-            serializer.errors,
-            status=status.HTTP_400_BAD_REQUEST
+        serializer = ClientRegisterSerializer(
+            data=request.data
         )
+
+        if not serializer.is_valid():
+
+            return Response(
+                {
+                    "success": False,
+                    "errors": serializer.errors
+                },
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        email = (
+            serializer.validated_data["email_address"]
+            .lower()
+            .strip()
+        )
+
+        mobile = serializer.validated_data[
+            "mobile_number"
+        ]
+
+        # --------------------------------------------------
+        # DUPLICATE EMAIL
+        # --------------------------------------------------
+
+        if ClientAuth.objects.filter(
+            email_address=email
+        ).exists():
+
+            ClientRegistrationHistory.objects.create(
+                email=email,
+                mobile_number=mobile,
+                successful=False,
+                ip_address=ip_address,
+                user_agent=user_agent,
+                error_message="Email already exists"
+            )
+
+            return Response(
+                {
+                    "success": False,
+                    "message": (
+                        "A user with this email "
+                        "already exists."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # --------------------------------------------------
+        # DUPLICATE MOBILE
+        # --------------------------------------------------
+
+        if ClientAuth.objects.filter(
+            mobile_number=mobile
+        ).exists():
+
+            ClientRegistrationHistory.objects.create(
+                email=email,
+                mobile_number=mobile,
+                successful=False,
+                ip_address=ip_address,
+                user_agent=user_agent,
+                error_message="Mobile already exists"
+            )
+
+            return Response(
+                {
+                    "success": False,
+                    "message": (
+                        "A user with this mobile "
+                        "number already exists."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # --------------------------------------------------
+        # CREATE ACCOUNT
+        # --------------------------------------------------
+
+        try:
+
+            with transaction.atomic():
+
+                client_auth = serializer.save(
+                    email_address=email
+                )
+
+                ClientDetails.objects.get_or_create(
+                    client_profile=client_auth
+                )
+
+                # --------------------------------------------------
+                # CREATE EMAIL VERIFICATION OTP
+                # --------------------------------------------------
+
+                try:
+                    otp_request, otp = create_client_otp(
+                        client=client_auth,
+                        purpose="email_verification"
+                    )
+                except OTPCooldownError as e:
+                    return Response(
+                        {
+                            "success": False,
+                            "message": f"Please wait {e.retry_after} seconds before requesting another code.",
+                        },
+                        status=status.HTTP_429_TOO_MANY_REQUESTS,
+                    )
+
+                # --------------------------------------------------
+                # REGISTRATION HISTORY
+                #
+                # This means the account was successfully created.
+                # It does NOT mean the email has been verified.
+                # --------------------------------------------------
+
+                ClientRegistrationHistory.objects.create(
+                    email=email,
+                    mobile_number=mobile,
+                    successful=True,
+                    ip_address=ip_address,
+                    user_agent=user_agent,
+                    device_name=request.data.get(
+                        "device_name"
+                    )
+                )
+
+                # --------------------------------------------------
+                # SEND OTP ONLY AFTER COMMIT
+                # --------------------------------------------------
+
+                transaction.on_commit(
+                    lambda: send_client_otp_email.delay(
+                        client_auth.email_address,
+                        otp,
+                        "email_verification",
+                    )
+                )
+
+            return Response(
+                {
+                    "success": True,
+                    "message": (
+                        "Registration successful. "
+                        "A verification code has been "
+                        "sent to your email."
+                    ),
+                    "data": {
+                        "id": client_auth.id,
+                        "email": client_auth.email_address,
+                        "mobile_number": (
+                            client_auth.mobile_number
+                        ),
+                        "requires_email_verification": True,
+                        "otp_request_id": str(
+                            otp_request.request_id
+                        ),
+                    }
+                },
+                status=status.HTTP_201_CREATED
+            )
+
+        except IntegrityError:
+
+            ClientRegistrationHistory.objects.create(
+                email=email,
+                mobile_number=mobile,
+                successful=False,
+                ip_address=ip_address,
+                user_agent=user_agent,
+                error_message="Integrity error"
+            )
+
+            return Response(
+                {
+                    "success": False,
+                    "message": (
+                        "Email is invalid or "
+                        "mobile number is invalid."
+                    )
+                },
+                status=status.HTTP_409_CONFLICT
+            )
+
+        except Exception:
+
+            ClientRegistrationHistory.objects.create(
+                email=email,
+                mobile_number=mobile,
+                successful=False,
+                ip_address=ip_address,
+                user_agent=user_agent,
+                error_message="Server exception"
+            )
+
+            logger.exception(
+                "Client registration failed"
+            )
+
+            return Response(
+                {
+                    "success": False,
+                    "message": (
+                        "A server error occurred. "
+                        "Please try again later."
+                    )
+                },
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
 
     except Exception:
 
@@ -325,14 +421,260 @@ def register_client(request):
             error_message="Unexpected error"
         )
 
-        logger.exception("Unexpected error in register_client")
+        logger.exception(
+            "Unexpected error in register_client"
+        )
 
         return Response(
             {
                 "success": False,
-                "message": "A server error occurred. Please try again later."
+                "message": (
+                    "A server error occurred. "
+                    "Please try again later."
+                )
             },
             status=status.HTTP_500_INTERNAL_SERVER_ERROR
+        )
+    
+
+@api_view(["POST"])
+@throttle_classes([ClientOTPThrottle])
+@permission_classes([AllowAny])
+def verify_client_email(request):
+
+    ip_address = get_client_ip(request)
+    user_agent = get_device_info(request)
+
+    serializer = ClientOTPVerifySerializer(
+        data=request.data
+    )
+
+    if not serializer.is_valid():
+
+        return Response(
+            {
+                "success": False,
+                "errors": serializer.errors,
+            },
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    if otp_request is None:
+        hash_otp("000000")  # burn comparable time to a real verification attempt
+        return Response(
+        {
+            "success": False,
+            "message": "Invalid or expired verification code.",
+        },
+        status=status.HTTP_400_BAD_REQUEST,
+    )
+
+    request_id = serializer.validated_data["request_id"]
+    otp = serializer.validated_data["otp"]
+
+    try:
+
+        with transaction.atomic():
+
+            # Lock the OTP row so two simultaneous
+            # verification requests cannot consume it.
+            otp_request = (
+                ClientOTP.objects
+                .select_for_update()
+                .select_related("client")
+                .filter(
+                    request_id=request_id,
+                    purpose="email_verification",
+                )
+                .first()
+            )
+
+            # Do not reveal whether a request ID exists.
+            if otp_request is None:
+
+                return Response(
+                    {
+                        "success": False,
+                        "message": (
+                            "Invalid or expired verification code."
+                        ),
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            now = timezone.now()
+
+            # --------------------------------------------------
+            # ALREADY USED / VERIFIED
+            # --------------------------------------------------
+
+            if (
+                otp_request.is_used
+                or otp_request.is_verified
+            ):
+
+                return Response(
+                    {
+                        "success": False,
+                        "message": (
+                            "Invalid or expired verification code."
+                        ),
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            # --------------------------------------------------
+            # EXPIRED
+            # --------------------------------------------------
+
+            if now >= otp_request.expires_at:
+
+                return Response(
+                    {
+                        "success": False,
+                        "message": (
+                            "Invalid or expired verification code."
+                        ),
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            # --------------------------------------------------
+            # MAXIMUM ATTEMPTS
+            # --------------------------------------------------
+
+            if (
+                otp_request.attempts
+                >= otp_request.max_attempts
+            ):
+
+                return Response(
+                    {
+                        "success": False,
+                        "message": (
+                            "Too many invalid verification "
+                            "code attempts."
+                        ),
+                    },
+                    status=status.HTTP_429_TOO_MANY_REQUESTS,
+                )
+
+            # --------------------------------------------------
+            # VERIFY OTP
+            # --------------------------------------------------
+
+            submitted_hash = hash_otp(otp)
+
+            otp_valid = secrets.compare_digest(
+                submitted_hash,
+                otp_request.otp_hash,
+            )
+
+            if not otp_valid:
+
+                otp_request.attempts += 1
+
+                otp_request.save(
+                    update_fields=["attempts"]
+                )
+
+                if (
+                    otp_request.attempts
+                    >= otp_request.max_attempts
+                ):
+
+                    return Response(
+                        {
+                            "success": False,
+                            "message": (
+                                "Too many invalid "
+                                "verification code attempts."
+                            ),
+                        },
+                        status=(
+                            status.HTTP_429_TOO_MANY_REQUESTS
+                        ),
+                    )
+
+                return Response(
+                    {
+                        "success": False,
+                        "message": (
+                            "Invalid or expired "
+                            "verification code."
+                        ),
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            # --------------------------------------------------
+            # OTP VALID
+            # --------------------------------------------------
+
+            user = otp_request.client
+
+            # Mark OTP as consumed.
+            otp_request.is_verified = True
+            otp_request.is_used = True
+            otp_request.verified_at = now
+
+            otp_request.save(
+                update_fields=[
+                    "is_verified",
+                    "is_used",
+                    "verified_at",
+                ]
+            )
+
+            # --------------------------------------------------
+            # VERIFY EMAIL
+            # --------------------------------------------------
+
+            user.email_verified_at = now
+
+            user.save(
+                update_fields=[
+                    "email_verified_at",
+                ]
+            )
+
+            # --------------------------------------------------
+            # GENERATE JWT ONLY AFTER EMAIL VERIFICATION
+            # --------------------------------------------------
+
+            tokens = generate_client_tokens(user)
+
+        return Response(
+            {
+                "success": True,
+                "message": "Email verified successfully.",
+                "data": {
+                    "id": user.id,
+                    "email": user.email_address,
+                    "mobile_number": user.mobile_number,
+                    "is_profile_completed": (
+                        user.is_profile_completed
+                    ),
+                    "access_token": tokens["access"],
+                    "refresh_token": tokens["refresh"],
+                },
+            },
+            status=status.HTTP_200_OK,
+        )
+
+    except Exception:
+
+        logger.exception(
+            "Client email verification failed unexpectedly"
+        )
+
+        return Response(
+            {
+                "success": False,
+                "message": (
+                    "Unable to verify your email at this time."
+                ),
+            },
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
         )
     
 
@@ -1261,32 +1603,58 @@ def client_login(request):
 
             user = serializer.validated_data["user"]
 
-            # 🔐 LOG SUCCESSFUL LOGIN
-            ClientLoginHistory.objects.create(
-                client=user,
-                successful=True,
-                identifier=request.data.get("email"),
-                user_agent=user_agent,
-                ip_address=ip_address,
-                device_name=request.data.get("device_name")
+            # -----------------------------------------
+            # PASSWORD AUTHENTICATION SUCCESSFUL
+            # -----------------------------------------
+            #
+            # This is NOT yet a successful login.
+            # OTP verification is still required.
+            #
+
+# In client_login(request), replacing the current otp_request, otp = create_login_otp(client=user) call:
+            try:
+                otp_request, otp = create_login_otp(client=user)
+            except OTPCooldownError as e:
+                return Response(
+                    {
+                        "success": False,
+                        "message": f"Please wait {e.retry_after} seconds before requesting another code.",
+                    },
+                    status=status.HTTP_429_TOO_MANY_REQUESTS,
+                )
+
+            # Only send the email after the OTP transaction
+            # has successfully committed.
+            transaction.on_commit(
+                lambda: send_client_login_otp_email.delay(
+                    user.email_address,
+                    otp,
+                )
             )
 
-            tokens = generate_client_tokens(user)
+            return Response(
+                {
+                    "success": True,
+                    "message": (
+                        "A verification code has been "
+                        "sent to your email."
+                    ),
+                    "data": {
+                        "requires_otp": True,
+                        "otp_request_id": str(
+                            otp_request.request_id
+                        ),
+                    }
+                },
+                status=status.HTTP_200_OK
+            )
 
-            return Response({
-                "success": True,
-                "message": "Login successful",
-                "data": {
-                    "id": user.id,
-                    "is_profile_completed": user.is_profile_completed,
-                    "access_token": tokens["access"],
-                    "refresh_token": tokens["refresh"],
-                }
-            }, status=status.HTTP_200_OK)
+        # -----------------------------------------
+        # PASSWORD AUTHENTICATION FAILED
+        # -----------------------------------------
 
-        # 🔐 LOG FAILED LOGIN
         ClientLoginHistory.objects.create(
-            client=None,  # optional: allow null if you want
+            client=None,
             successful=False,
             identifier=request.data.get("email"),
             user_agent=user_agent,
@@ -1294,28 +1662,298 @@ def client_login(request):
             device_name=request.data.get("device_name")
         )
 
-        return Response({
-            "success": False,
-            "errors": serializer.errors
-        }, status=status.HTTP_400_BAD_REQUEST)
+        return Response(
+            {
+                "success": False,
+                "errors": serializer.errors
+            },
+            status=status.HTTP_400_BAD_REQUEST
+        )
 
     except Exception:
-        logger.exception("Client login failed unexpectedly")
+        logger.exception(
+            "Client login failed unexpectedly"
+        )
 
-        # 🔐 LOG SYSTEM FAILURE
         ClientLoginHistory.objects.create(
             client=None,
             successful=False,
             identifier=request.data.get("email"),
-            user_agent=request.META.get("HTTP_USER_AGENT", ""),
+            user_agent=user_agent,
             ip_address=ip_address,
             device_name=request.data.get("device_name")
         )
 
-        return Response({
+        return Response(
+            {
+                "success": False,
+                "message": (
+                    "Unable to process login at this time."
+                )
+            },
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR
+        )
+
+
+
+
+
+@api_view(["POST"])
+@throttle_classes([ClientOTPThrottle])
+@permission_classes([AllowAny])
+def verify_client_login_otp(request):
+
+    ip_address = get_client_ip(request)
+    user_agent = get_device_info(request)
+
+    serializer = ClientOTPVerifySerializer(
+        data=request.data
+    )
+
+    if not serializer.is_valid():
+
+        return Response(
+            {
+                "success": False,
+                "errors": serializer.errors
+            },
+            status=status.HTTP_400_BAD_REQUEST
+        )
+    if otp_request is None:
+        hash_otp("000000")  # burn comparable time to a real verification attempt
+        return Response(
+        {
             "success": False,
-            "message": "Unable to process login at this time."
-        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+            "message": "Invalid or expired verification code.",
+        },
+        status=status.HTTP_400_BAD_REQUEST,
+    )
+
+    request_id = serializer.validated_data["request_id"]
+    otp = serializer.validated_data["otp"]
+
+    try:
+
+        with transaction.atomic():
+
+            otp_request = (
+                ClientOTP.objects
+                .select_for_update()
+                .select_related("client")
+                .filter(
+                    request_id=request_id,
+                    purpose="login",
+                )
+                .first()
+            )
+
+            # Don't reveal whether the request_id exists.
+            if otp_request is None:
+
+                return Response(
+                    {
+                        "success": False,
+                        "message": (
+                            "Invalid or expired OTP."
+                        )
+                    },
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+            now = timezone.now()
+
+            # -----------------------------------------
+            # OTP ALREADY USED
+            # -----------------------------------------
+
+            if (
+                otp_request.is_used
+                or otp_request.is_verified
+            ):
+
+                return Response(
+                    {
+                        "success": False,
+                        "message": (
+                            "Invalid or expired OTP."
+                        )
+                    },
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+            # -----------------------------------------
+            # OTP EXPIRED
+            # -----------------------------------------
+
+            if now >= otp_request.expires_at:
+
+                return Response(
+                    {
+                        "success": False,
+                        "message": (
+                            "Invalid or expired OTP."
+                        )
+                    },
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+            # -----------------------------------------
+            # TOO MANY ATTEMPTS
+            # -----------------------------------------
+
+            if (
+                otp_request.attempts
+                >= otp_request.max_attempts
+            ):
+
+                return Response(
+                    {
+                        "success": False,
+                        "message": (
+                            "Too many invalid OTP attempts."
+                        )
+                    },
+                    status=status.HTTP_429_TOO_MANY_REQUESTS
+                )
+
+            # -----------------------------------------
+            # CONSTANT-TIME OTP COMPARISON
+            # -----------------------------------------
+
+            submitted_hash = hash_otp(otp)
+
+            otp_valid = secrets.compare_digest(
+                submitted_hash,
+                otp_request.otp_hash
+            )
+
+            if not otp_valid:
+
+                otp_request.attempts += 1
+
+                otp_request.save(
+                    update_fields=["attempts"]
+                )
+
+                if (
+                    otp_request.attempts
+                    >= otp_request.max_attempts
+                ):
+                    return Response(
+                        {
+                            "success": False,
+                            "message": (
+                                "Too many invalid "
+                                "OTP attempts."
+                            )
+                        },
+                        status=(
+                            status.HTTP_429_TOO_MANY_REQUESTS
+                        )
+                    )
+
+                return Response(
+                    {
+                        "success": False,
+                        "message": (
+                            "Invalid or expired OTP."
+                        )
+                    },
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+            # -----------------------------------------
+            # OTP SUCCESSFULLY VERIFIED
+            # -----------------------------------------
+
+            otp_request.is_verified = True
+            otp_request.is_used = True
+            otp_request.verified_at = now
+
+            otp_request.save(
+                update_fields=[
+                    "is_verified",
+                    "is_used",
+                    "verified_at",
+                ]
+            )
+
+            user = otp_request.client
+
+            # -----------------------------------------
+            # UPDATE LOGIN INFORMATION
+            # -----------------------------------------
+
+            user.last_login_at = now
+            user.last_login_ip = ip_address
+
+            user.failed_login_attempts = 0
+
+            user.save(
+                update_fields=[
+                    "last_login_at",
+                    "last_login_ip",
+                    "failed_login_attempts",
+                ]
+            )
+
+            # -----------------------------------------
+            # LOG ACTUAL SUCCESSFUL LOGIN
+            # -----------------------------------------
+
+            ClientLoginHistory.objects.create(
+                client=user,
+                successful=True,
+                identifier=user.email_address,
+                user_agent=user_agent,
+                ip_address=ip_address,
+                device_name=request.data.get(
+                    "device_name"
+                )
+            )
+
+            # -----------------------------------------
+            # JWT IS GENERATED ONLY HERE
+            # -----------------------------------------
+
+            tokens = generate_client_tokens(user)
+
+        return Response(
+            {
+                "success": True,
+                "message": "Login successful.",
+                "data": {
+                    "id": user.id,
+                    "is_profile_completed": (
+                        user.is_profile_completed
+                    ),
+                    "access_token": tokens["access"],
+                    "refresh_token": tokens["refresh"],
+                }
+            },
+            status=status.HTTP_200_OK
+        )
+
+    except Exception:
+
+        logger.exception(
+            "Client login OTP verification failed "
+            "unexpectedly"
+        )
+
+        return Response(
+            {
+                "success": False,
+                "message": (
+                    "Unable to process OTP verification "
+                    "at this time."
+                )
+            },
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR
+        )
+
+
+
 
 
 # @api_view(['GET'])
