@@ -19,8 +19,8 @@ from api.clientsDB.services.address_verify_service import AIAddressVerificationC
 from api.clientsDB.services.client_history_model_helper import create_client_address_history
 from api.clientsDB.services.client_ip_address_helper import get_client_ip, get_device_info
 from api.clientsDB.services.jwt_client_authentication import ClientJWTAuthentication
-from api.clientsDB.services.otp_service import create_client_otp, create_login_otp, hash_otp
-from api.clientsDB.services.otp_tasks import OTPCooldownError, send_client_login_otp_email, send_client_otp_email
+from api.clientsDB.services.otp_service import create_client_otp,  hash_otp
+from api.clientsDB.services.otp_tasks import OTP_EMAIL_VERIFICATION, OTP_LOGIN, OTPCooldownError, send_client_otp_email
 from api.clientsDB.services.sa_phone_number_helper import normalize_sa_mobile
 from plug_backend.helpers.auth_helpers import get_client_auth, get_client_details
 from plug_backend.throttles import AuthThrottle, ClientOTPThrottle, ClientRegistrationThrottle, ProfileWriteThrottle, RegisterThrottle, UserReadThrottle
@@ -297,9 +297,9 @@ def register_client(request):
 
                 try:
                     otp_request, otp = create_client_otp(
-                        client=client_auth,
-                        purpose="email_verification"
-                    )
+    client=client_auth,
+    purpose=OTP_EMAIL_VERIFICATION,
+)
                 except OTPCooldownError as e:
                     return Response(
                         {
@@ -333,10 +333,10 @@ def register_client(request):
 
                 transaction.on_commit(
                     lambda: send_client_otp_email.delay(
-                        client_auth.email_address,
-                        otp,
-                        "email_verification",
-                    )
+        client_auth.email_address,
+        otp,
+        OTP_EMAIL_VERIFICATION,
+    )
                 )
 
             return Response(
@@ -1613,7 +1613,10 @@ def client_login(request):
 
 # In client_login(request), replacing the current otp_request, otp = create_login_otp(client=user) call:
             try:
-                otp_request, otp = create_login_otp(client=user)
+                otp_request, otp = create_client_otp(
+        client=user,
+        purpose=OTP_LOGIN,
+    )
             except OTPCooldownError as e:
                 return Response(
                     {
@@ -1626,10 +1629,11 @@ def client_login(request):
             # Only send the email after the OTP transaction
             # has successfully committed.
             transaction.on_commit(
-                lambda: send_client_login_otp_email.delay(
-                    user.email_address,
-                    otp,
-                )
+                lambda: send_client_otp_email.delay(
+        user.email_address,
+        otp,
+        OTP_LOGIN,
+    )
             )
 
             return Response(

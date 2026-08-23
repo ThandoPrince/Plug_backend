@@ -5,7 +5,7 @@ from datetime import timedelta
 
 from django.db import transaction
 from django.utils import timezone
-from api.clientsDB.models import ClientOTP
+from api.clientsDB.models.models import ClientOTP
 import hmac
 import hashlib
 from django.conf import settings

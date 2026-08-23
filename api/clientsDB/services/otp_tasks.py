@@ -1,12 +1,12 @@
-from datetime import timedelta, timezone
+from datetime import timedelta
 
 from celery import shared_task
 from django.conf import settings
 from django.core.mail import EmailMultiAlternatives
+from django.db import transaction
+from django.utils import timezone
 
 import logging
-
-from django.db import transaction
 
 from api.clientsDB.models.models import ClientOTP
 from api.clientsDB.services.otp_service import generate_otp, hash_otp
@@ -143,32 +143,68 @@ def send_client_otp_email(
 class OTPCooldownError(Exception):
     def __init__(self, retry_after: int):
         self.retry_after = retry_after
-        super().__init__(f"OTP requested too recently, retry after {retry_after}s")
+        super().__init__(
+            f"OTP requested too recently, "
+            f"retry after {retry_after}s"
+        )
+OTP_LOGIN = "login"
+OTP_EMAIL_VERIFICATION = "email_verification"
 
+OTP_PURPOSES = {
+    OTP_LOGIN,
+    OTP_EMAIL_VERIFICATION,
+}
 
 @transaction.atomic
-def create_client_otp(client, purpose, min_resend_interval_seconds=60):
+def create_client_otp(
+    client,
+    purpose,
+    min_resend_interval_seconds=60,
+):
+    if purpose not in OTP_PURPOSES:
+        raise ValueError(
+            "Unsupported OTP purpose."
+        )
+
     now = timezone.now()
 
     recent = (
         ClientOTP.objects
-        .filter(client=client, purpose=purpose)
+        .filter(
+            client=client,
+            purpose=purpose,
+        )
         .order_by("-created_at")
         .first()
     )
 
-    if recent and (now - recent.created_at).total_seconds() < min_resend_interval_seconds:
-        raise OTPCooldownError(
-            retry_after=min_resend_interval_seconds
-            - int((now - recent.created_at).total_seconds())
-        )
+    if recent:
 
+        elapsed = (
+            now - recent.created_at
+        ).total_seconds()
+
+        if elapsed < min_resend_interval_seconds:
+
+            retry_after = (
+                min_resend_interval_seconds
+                - int(elapsed)
+            )
+
+            raise OTPCooldownError(
+                retry_after=retry_after
+            )
+
+    # Invalidate previous active OTPs
+    # for this exact purpose.
     ClientOTP.objects.filter(
         client=client,
         purpose=purpose,
         is_verified=False,
         is_used=False,
-    ).update(is_used=True)
+    ).update(
+        is_used=True
+    )
 
     otp = generate_otp()
 
@@ -176,7 +212,9 @@ def create_client_otp(client, purpose, min_resend_interval_seconds=60):
         client=client,
         purpose=purpose,
         otp_hash=hash_otp(otp),
-        expires_at=now + timedelta(minutes=5),
+        expires_at=(
+            now + timedelta(minutes=5)
+        ),
         attempts=0,
         max_attempts=5,
     )
