@@ -86,6 +86,12 @@ path(
     views.deactivate_client_address,
     name="deactivate-client-address",
 ),
+
+path(
+    "api/clientsDB/super-user/addresses/<int:address_id>/deactivate/",
+    views.super_user_deactivate_client_address,
+    name="super-user-deactivate-client-address",
+),
     
     
 

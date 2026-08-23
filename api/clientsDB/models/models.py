@@ -108,7 +108,11 @@ class ClientAuth(models.Model):
     )
     mfa_enabled = models.BooleanField(default=False)
     mfa_secret = models.CharField(max_length=32, null=True, blank=True)
-    last_login_at = models.DateTimeField(auto_now=True, null=True,db_index=True)
+    last_login_at = models.DateTimeField(
+    null=True,
+    blank=True,
+    db_index=True
+)
 
 
     password = models.CharField(max_length=128)
@@ -340,11 +344,15 @@ class ClientSession(models.Model):
 
 
 
+
+
+
 class ClientAddress(models.Model):
     id = models.AutoField(primary_key=True ,db_index=True)
     is_active = models.BooleanField(default=True,db_index=True)
     date_created = models.DateTimeField(auto_now_add=True, null=True,db_index=True)
     in_request = models.BooleanField (default=False, null=True  )
+    is_activatable = models.BooleanField(default=True,db_index=True)
 
     RESIDENTIAL = "Residential Address"
     VACATION = "Vacation Address"
@@ -389,9 +397,9 @@ class ClientAddress(models.Model):
         ]
 
         indexes = [
-            models.Index(fields=["id","client", "address", "is_active","is_default"]),
+            models.Index(fields=["id","client", "address", "is_active","is_default","is_activatable"]),
              models.Index(fields=["id","is_default"]),
-             models.Index(fields=["id","in_request"]),
+             models.Index(fields=["id","is_activatable"]),
            
     ]
 
@@ -465,6 +473,83 @@ def secure_verification_path(instance, filename):
         f"client_{client_id}",
         random_filename
     )
+
+
+
+
+class ClientAddressHistory(models.Model):
+    ACTION_CREATED = "created"
+    ACTION_ACTIVATED = "activated"
+    ACTION_DEACTIVATED = "deactivated"
+    ACTION_REACTIVATED = "reactivated"
+    ACTION_SUPER_USER_ASSIGNED = "super_user_assigned"
+    ACTION_SUPER_USER_REMOVED = "super_user_removed"
+    ACTION_OWNER_ASSIGNED = "owner_assigned"
+    ACTION_OWNER_REMOVED = "owner_removed"
+    ACTION_ADMIN_ASSIGNED = "admin_assigned"
+    ACTION_ADMIN_REMOVED = "admin_removed"
+
+    ACTION_CHOICES = [
+        (ACTION_CREATED, "Created"),
+        (ACTION_ACTIVATED, "Activated"),
+        (ACTION_DEACTIVATED, "Deactivated"),
+        (ACTION_REACTIVATED, "Reactivated"),
+        (ACTION_SUPER_USER_ASSIGNED, "Super User Assigned"),
+        (ACTION_SUPER_USER_REMOVED, "Super User Removed"),
+        (ACTION_OWNER_ASSIGNED, "Owner Assigned"),
+        (ACTION_OWNER_REMOVED, "Owner Removed"),
+        (ACTION_ADMIN_ASSIGNED, "Administrator Assigned"),
+        (ACTION_ADMIN_REMOVED, "Administrator Removed"),
+    ]
+
+    client_address = models.ForeignKey(
+        "ClientAddress",
+        on_delete=models.CASCADE,
+        related_name="history",
+        db_index=True,
+    )
+
+    performed_by = models.ForeignKey(
+        "ClientDetails",
+        on_delete=models.PROTECT,
+        related_name="client_address_actions",
+        null=True,
+        blank=True,
+        db_index=True,
+    )
+
+    action = models.CharField(
+        max_length=100,
+        choices=ACTION_CHOICES,
+        db_index=True,
+    )
+
+    reason = models.TextField(
+        null=True,
+        blank=True,
+    )
+
+    metadata = models.JSONField(
+        null=True,
+        blank=True,
+    )
+
+    date_created = models.DateTimeField(
+        auto_now_add=True,
+        db_index=True,
+    )
+
+    class Meta:
+        ordering = ["-date_created"]
+
+    def __str__(self):
+        return (
+            f"{self.client_address_id} - "
+            f"{self.action} - "
+            f"{self.date_created}"
+        )
+
+
 
 
 class AddressSuperUserVerification(models.Model):

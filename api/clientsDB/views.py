@@ -15,6 +15,7 @@ from rest_framework.permissions import AllowAny
 from rest_framework.permissions import IsAuthenticated
 from django.db import transaction
 from api.clientsDB.services.address_verify_service import AIAddressVerificationClient
+from api.clientsDB.services.client_history_model_helper import create_client_address_history
 from api.clientsDB.services.client_ip_address_helper import get_client_ip, get_device_info
 from api.clientsDB.services.jwt_client_authentication import ClientJWTAuthentication
 from api.clientsDB.services.sa_phone_number_helper import normalize_sa_mobile
@@ -23,7 +24,7 @@ from plug_backend.throttles import AuthThrottle, ProfileWriteThrottle, RegisterT
 from plug_backend.utils.client_jwt_helper import generate_client_tokens
 from django.db.models import Q
 from django.utils import timezone
-from .models.models import ClientAuth, ClientDetails, Address, ClientAddress, ClientLoginHistory, ClientNotification, ClientRegistrationHistory, DeviceToken 
+from .models.models import ClientAddressHistory, ClientAuth, ClientDetails, Address, ClientAddress, ClientLoginHistory, ClientNotification, ClientRegistrationHistory, DeviceToken 
 from .serializers import AddressClaimSerializer, AddressOnlySerializer, AddressVerificationCreateSerializer, ClientAddressDeactivateSerializer, ClientAddressNoDuplicatesSerializer, AddressSerializer, ClientAddressSerializerr, ClientAddressWriteSerializer, ClientAuthReadSerializer, ClientLoginSerializer, ClientProfileAppUpdateSerializer, ClientProfileSerializer, ClientRegisterSerializer, ClientSavedAddressSerializer, ClientSerializer, ClientAddressSerializer, DefaultAddressSerializer, DeviceTokenWriteSerializer, HouseholdMemberSerializer
 from django.contrib.auth.hashers import check_password, make_password
 
@@ -374,27 +375,17 @@ def get_my_profile(request):
         )
     
 
-
-
-
-
-
 def _user_has_access(user, address_obj):
     """
     RLS rule:
-    User must be linked to this address OR be super user on it.
+    Only a user who is an active super user on this address
+    may view the household members.
     """
     return ClientAddress.objects.filter(
         client__client_profile=user,
         address=address_obj.address,
         is_active=True,
-    ).filter(
-        # allow normal members OR super users
-        is_super_user=True
-    ).exists() or ClientAddress.objects.filter(
-        client__client_profile=user,
-        address=address_obj.address,
-        is_active=True,
+        is_super_user=True,
     ).exists()
 
 
@@ -420,7 +411,6 @@ def get_household_members(request, client_address_id):
             status=status.HTTP_404_NOT_FOUND,
         )
 
-  
     if not _user_has_access(request.user, selected):
         return Response(
             {
@@ -438,6 +428,9 @@ def get_household_members(request, client_address_id):
         .filter(
             address=selected.address,
             is_active=True,
+        )
+        .exclude(
+            client__client_profile=request.user,
         )
         .order_by(
             "-is_owner",
@@ -748,6 +741,135 @@ def add_residential_address(request):
             },
             status=status.HTTP_500_INTERNAL_SERVER_ERROR
         )
+
+
+@api_view(["POST"])
+@throttle_classes([ProfileWriteThrottle])
+@authentication_classes([ClientJWTAuthentication])
+@permission_classes([IsAuthenticated])
+def super_user_deactivate_client_address(request, address_id):
+
+    try:
+        # ==========================================
+        # GET AUTHENTICATED CLIENT
+        # ==========================================
+        super_user = get_object_or_404(
+            ClientDetails,
+            client_profile=request.user
+        )
+
+        # ==========================================
+        # GET TARGET CLIENT ADDRESS
+        # ==========================================
+        client_address = get_object_or_404(
+            ClientAddress.objects.select_related(
+                "client",
+                "address",
+            ),
+            id=address_id,
+        )
+
+        # ==========================================
+        # VERIFY SUPER USER ACCESS
+        # ==========================================
+        has_super_user_access = ClientAddress.objects.filter(
+            client=super_user,
+            address=client_address.address,
+            is_active=True,
+            is_super_user=True,
+        ).exists()
+
+        if not has_super_user_access:
+            return Response(
+                {
+                    "success": False,
+                    "message": (
+                        "You do not have super-user permission "
+                        "for this address."
+                    ),
+                },
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+       
+
+        # ==========================================
+        # CHECK CURRENT STATUS
+        # ==========================================
+        if not client_address.is_active:
+            return Response(
+                {
+                    "success": False,
+                    "message": "This household member is already inactive.",
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # ==========================================
+        # DEACTIVATE + HISTORY
+        # ==========================================
+        with transaction.atomic():
+
+            client_address.is_active = False
+            client_address.is_activatable = False
+
+            client_address.save(
+                update_fields=[
+                    "is_active",
+                    "is_activatable",
+                ]
+            )
+
+            history = create_client_address_history(
+                client_address=client_address,
+                action=ClientAddressHistory.ACTION_DEACTIVATED,
+                performed_by=super_user,
+                reason="Deactivated by super user.",
+                metadata={
+                    "performed_by_role": "super_user",
+                    "previous_is_active": True,
+                    "new_is_active": False,
+                    "previous_is_activatable": True,
+                    "new_is_activatable": False,
+                },
+            )
+
+        # ==========================================
+        # RESPONSE
+        # ==========================================
+        return Response(
+            {
+                "success": True,
+                "message": (
+                    "Household member deactivated successfully."
+                ),
+                "data": {
+                    "client_address": ClientAddressSerializerr(
+                        client_address
+                    ).data,
+                    "history_id": history.id,
+                },
+            },
+            status=status.HTTP_200_OK,
+        )
+
+    except Exception:
+        logger.exception(
+            "Error deactivating household member by super user"
+        )
+
+        return Response(
+            {
+                "success": False,
+                "message": (
+                    "Unable to deactivate household member "
+                    "at this time."
+                ),
+            },
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
+
+    
 
 @api_view(["POST"])
 @throttle_classes([ProfileWriteThrottle])
