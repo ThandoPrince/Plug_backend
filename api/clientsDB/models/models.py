@@ -127,6 +127,7 @@ class ClientAuth(models.Model):
         ("in-address", "In-Address"),
         ("completed", "Completed"),
         ("in-kyc", "In-KYC"),
+        ("in-email-verification", "In-Email Verification"),
         ("is_blocked", "Is-Blocked"),
     ]
     total_failed_login_attempts = models.PositiveIntegerField(
@@ -136,7 +137,7 @@ class ClientAuth(models.Model):
     is_profile_completed = models.CharField(
         default="in-details",
         choices=Profile_CHOICES,
-        max_length=20,db_index=True
+        max_length=50,db_index=True
     )
     class Meta:
         indexes = [

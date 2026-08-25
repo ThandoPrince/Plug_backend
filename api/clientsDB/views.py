@@ -3,7 +3,7 @@ import secrets
 from sqlite3 import IntegrityError
 import requests
 from rest_framework.exceptions import ValidationError
-from rest_framework_simplejwt.tokens import RefreshToken
+from rest_framework_simplejwt.tokens import AccessToken, RefreshToken
 from rest_framework_simplejwt.exceptions import TokenError
 from django.http import JsonResponse
 from django.shortcuts import get_object_or_404
@@ -18,9 +18,12 @@ from django.db import transaction
 from api.clientsDB.services.address_verify_service import AIAddressVerificationClient
 from api.clientsDB.services.client_history_model_helper import create_client_address_history
 from api.clientsDB.services.client_ip_address_helper import get_client_ip, get_device_info
+from api.clientsDB.services.client_login_token import  generate_email_login_tokenn
+from api.clientsDB.services.client_otp_token import generate_email_verification_token
 from api.clientsDB.services.jwt_client_authentication import ClientJWTAuthentication
 from api.clientsDB.services.otp_service import create_client_otp,  hash_otp
-from api.clientsDB.services.otp_tasks import OTP_EMAIL_VERIFICATION, OTP_LOGIN, OTPCooldownError, send_client_otp_email
+from api.clientsDB.services.otp_tasks import OTP_EMAIL_VERIFICATION, OTP_LOGIN, OTP_PASSWORD_RESET, OTPCooldownError, send_client_otp_email
+from api.clientsDB.services.password_reset_token import generate_password_reset_token
 from api.clientsDB.services.sa_phone_number_helper import normalize_sa_mobile
 from plug_backend.helpers.auth_helpers import get_client_auth, get_client_details
 from plug_backend.throttles import AuthThrottle, ClientOTPThrottle, ClientRegistrationThrottle, ProfileWriteThrottle, RegisterThrottle, UserReadThrottle
@@ -32,24 +35,17 @@ from .serializers import AddressClaimSerializer, AddressOnlySerializer, AddressV
 from django.contrib.auth.hashers import check_password, make_password
 
 
+
+
+
 @api_view(["POST"])
 @permission_classes([AllowAny])
 @throttle_classes([AuthThrottle])
-def reset_client_password(request):
+def request_client_password_reset(request):
 
     try:
         email = request.data.get("email")
         mobile_number = request.data.get("mobile_number")
-        new_password = request.data.get("new_password")
-
-        # ------------------------
-        # Basic validation
-        # ------------------------
-        if not new_password:
-            return Response(
-                {"error": "new_password is required"},
-                status=status.HTTP_400_BAD_REQUEST
-            )
 
         if not email and not mobile_number:
             return Response(
@@ -57,52 +53,20 @@ def reset_client_password(request):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        # ------------------------
-        # Normalize inputs
-        # ------------------------
         if email:
             email = email.strip().lower()
 
         if mobile_number:
             mobile_number = normalize_sa_mobile(mobile_number)
-
             if not mobile_number:
                 return Response(
                     {"error": "Invalid mobile number format"},
                     status=status.HTTP_400_BAD_REQUEST
                 )
 
-        # ------------------------
-        # Password complexity rules
-        # ------------------------
-        errors = []
-
-        if len(new_password) < 8:
-            errors.append("Password must be at least 8 characters.")
-
-        if not re.search(r'[A-Z]', new_password):
-            errors.append("Password must contain at least one uppercase letter.")
-
-        if not re.search(r'[a-z]', new_password):
-            errors.append("Password must contain at least one lowercase letter.")
-
-        if not re.search(r'\d', new_password):
-            errors.append("Password must contain at least one digit.")
-
-        if errors:
-            return Response(
-                {"error": errors},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-
-        # ------------------------
-        # Safe lookup (strict)
-        # ------------------------
         query = Q()
-
         if email:
             query |= Q(email_address__iexact=email)
-
         if mobile_number:
             query |= Q(mobile_number=mobile_number)
 
@@ -121,9 +85,6 @@ def reset_client_password(request):
                 status=status.HTTP_409_CONFLICT
             )
 
-        # ------------------------
-        # BLOCK: account locked
-        # ------------------------
         if (
             client.account_locked_until and
             client.account_locked_until > timezone.now()
@@ -132,57 +93,237 @@ def reset_client_password(request):
                 (client.account_locked_until - timezone.now())
                 .total_seconds() / 60
             )
-
             return Response(
                 {
                     "error": [
-                        f"Account is temporarily locked. Try again in {remaining_minutes} minute(s)."
+                        f"Account is temporarily locked. Try again later."
                     ]
                 },
                 status=status.HTTP_403_FORBIDDEN
             )
 
-        # ------------------------
-        # Prevent password reuse
-        # ------------------------
-        if check_password(new_password, client.password):
+        try:
+            otp_request, otp = create_client_otp(
+                client=client,
+                purpose=OTP_PASSWORD_RESET,
+            )
+
+        except OTPCooldownError as e:
             return Response(
                 {
-                    "error": [
-                        "New password cannot be the same as the old password."
-                    ]
+                    "success": False,
+                    "message": (
+                        f"Please wait {e.retry_after} seconds "
+                        "before requesting another code."
+                    ),
                 },
+                status=status.HTTP_429_TOO_MANY_REQUESTS,
+            )
+
+        verification_token = generate_password_reset_token(client, otp_request)
+
+        transaction.on_commit(
+            lambda: send_client_otp_email.delay(
+                client.email_address,
+                otp,
+                OTP_PASSWORD_RESET,
+            )
+        )
+
+        return Response(
+            {
+                "success": True,
+                "message": "A verification code has been sent to your email.",
+                "data": {
+                    "otp_request_id": str(otp_request.request_id),
+                    "verification_token": verification_token,
+                },
+            },
+            status=status.HTTP_200_OK,
+        )
+
+    except Exception:
+        logger.exception("Unexpected error in request_client_password_reset")
+        return Response(
+            {"error": "Unable to process request at this time."},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR
+        )
+
+
+    
+
+@api_view(["POST"])
+@throttle_classes([ClientOTPThrottle])
+@authentication_classes([])
+@permission_classes([AllowAny])
+def reset_client_password(request):
+
+    try:
+        new_password = request.data.get("new_password")
+        otp = request.data.get("otp")
+
+        if not new_password:
+            return Response(
+                {"error": "new_password is required"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        if not otp:
+            return Response(
+                {"error": "otp is required"},
                 status=status.HTTP_400_BAD_REQUEST
             )
 
         # ------------------------
-        # Update password
+        # Password complexity rules
         # ------------------------
-        client.password = make_password(new_password)
+        errors = []
 
-        client.failed_login_attempts = 0
-        client.account_locked_until = None
+        if len(new_password) < 8:
+            errors.append("Password must be at least 8 characters.")
+        if not re.search(r'[A-Z]', new_password):
+            errors.append("Password must contain at least one uppercase letter.")
+        if not re.search(r'[a-z]', new_password):
+            errors.append("Password must contain at least one lowercase letter.")
+        if not re.search(r'\d', new_password):
+            errors.append("Password must contain at least one digit.")
 
-        client.save(update_fields=[
-            "password",
-            "failed_login_attempts",
-            "account_locked_until"
-        ])
+        if errors:
+            return Response({"error": errors}, status=status.HTTP_400_BAD_REQUEST)
+
+        # --------------------------------------------------
+        # EXTRACT + VALIDATE VERIFICATION TOKEN FROM HEADER
+        # --------------------------------------------------
+        auth_header = request.headers.get("Authorization", "")
+
+        if not auth_header.startswith("Bearer "):
+            hash_otp("000000")
+            return Response(INVALID_OR_EXPIRED, status=status.HTTP_400_BAD_REQUEST)
+
+        raw_verification_token = auth_header[len("Bearer "):].strip()
+
+        try:
+            validated_token = AccessToken(raw_verification_token)
+
+        except TokenError:
+            hash_otp("000000")
+            return Response(INVALID_OR_EXPIRED, status=status.HTTP_400_BAD_REQUEST)
+
+        if validated_token.get("purpose") != "password_reset":
+            hash_otp("000000")
+            return Response(INVALID_OR_EXPIRED, status=status.HTTP_400_BAD_REQUEST)
+
+        token_client_id = validated_token.get("client_id")
+        token_request_id = validated_token.get("request_id")
+
+        if not token_client_id or not token_request_id:
+            hash_otp("000000")
+            return Response(INVALID_OR_EXPIRED, status=status.HTTP_400_BAD_REQUEST)
+
+        with transaction.atomic():
+
+            otp_request = (
+                ClientOTP.objects
+                .select_for_update()
+                .select_related("client")
+                .filter(
+                    request_id=token_request_id,
+                    client_id=token_client_id,
+                    purpose="password_reset",
+                )
+                .first()
+            )
+
+            if otp_request is None:
+                hash_otp("000000")
+                return Response(INVALID_OR_EXPIRED, status=status.HTTP_400_BAD_REQUEST)
+
+            client = otp_request.client
+            now = timezone.now()
+
+            if client.account_locked_until and client.account_locked_until > now:
+                remaining_minutes = int(
+                    (client.account_locked_until - now).total_seconds() / 60
+                )
+                return Response(
+                    {
+                        "error": [
+                            f"Account is temporarily locked. Try again later"
+                        ]
+                    },
+                    status=status.HTTP_403_FORBIDDEN
+                )
+
+            if otp_request.is_used or otp_request.is_verified:
+                hash_otp("000000")
+                return Response(INVALID_OR_EXPIRED, status=status.HTTP_400_BAD_REQUEST)
+
+            if now >= otp_request.expires_at:
+                hash_otp("000000")
+                return Response(INVALID_OR_EXPIRED, status=status.HTTP_400_BAD_REQUEST)
+
+            if otp_request.attempts >= otp_request.max_attempts:
+                hash_otp("000000")
+                return Response(
+                    {"success": False, "message": "Too many invalid OTP attempts."},
+                    status=status.HTTP_429_TOO_MANY_REQUESTS
+                )
+
+            submitted_hash = hash_otp(otp)
+            otp_valid = secrets.compare_digest(submitted_hash, otp_request.otp_hash)
+
+            if not otp_valid:
+                otp_request.attempts += 1
+                otp_request.save(update_fields=["attempts"])
+
+                if otp_request.attempts >= otp_request.max_attempts:
+                    return Response(
+                        {"success": False, "message": "Too many invalid OTP attempts."},
+                        status=status.HTTP_429_TOO_MANY_REQUESTS
+                    )
+
+                return Response(INVALID_OR_EXPIRED, status=status.HTTP_400_BAD_REQUEST)
+
+            # Defense in depth: confirm the OTP row's client actually
+            # matches the token's claimed client_id.
+            if str(client.id) != str(token_client_id):
+                logger.error(
+                    "Password reset OTP client mismatch: token=%s otp_row=%s",
+                    token_client_id, client.id,
+                )
+                return Response(INVALID_OR_EXPIRED, status=status.HTTP_400_BAD_REQUEST)
+
+            # Prevent password reuse
+            if check_password(new_password, client.password):
+                return Response(
+                    {"error": ["New password cannot be the same as the old password."]},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+            otp_request.is_verified = True
+            otp_request.is_used = True
+            otp_request.verified_at = now
+            otp_request.save(update_fields=["is_verified", "is_used", "verified_at"])
+
+            client.password = make_password(new_password)
+            client.failed_login_attempts = 0
+            client.account_locked_until = None
+            client.save(update_fields=[
+                "password", "failed_login_attempts", "account_locked_until"
+            ])
 
         return Response(
-            {"message": "Password reset successfully"},
+            {"success": True, "message": "Password reset successfully"},
             status=status.HTTP_200_OK
         )
 
     except Exception:
         logger.exception("Unexpected error in reset_client_password")
-
         return Response(
-            {
-                "error": "Unable to reset password at this time."
-            },
+            {"error": "Unable to reset password at this time."},
             status=status.HTTP_500_INTERNAL_SERVER_ERROR
         )
+    
 
 
     
@@ -268,8 +409,7 @@ def register_client(request):
                 {
                     "success": False,
                     "message": (
-                        "A user with this mobile "
-                        "number already exists."
+                        "Invalid mobile number."
                     )
                 },
                 status=status.HTTP_400_BAD_REQUEST
@@ -284,8 +424,9 @@ def register_client(request):
             with transaction.atomic():
 
                 client_auth = serializer.save(
-                    email_address=email
-                )
+        email_address=email,
+        is_profile_completed="in-email-verification",
+    )
 
                 ClientDetails.objects.get_or_create(
                     client_profile=client_auth
@@ -308,6 +449,7 @@ def register_client(request):
                         },
                         status=status.HTTP_429_TOO_MANY_REQUESTS,
                     )
+                verification_token = generate_email_verification_token(client_auth, otp_request)
 
                 # --------------------------------------------------
                 # REGISTRATION HISTORY
@@ -349,14 +491,12 @@ def register_client(request):
                     ),
                     "data": {
                         "id": client_auth.id,
-                        "email": client_auth.email_address,
-                        "mobile_number": (
-                            client_auth.mobile_number
-                        ),
+                       
                         "requires_email_verification": True,
                         "otp_request_id": str(
                             otp_request.request_id
                         ),
+                        "verification_token": verification_token,
                     }
                 },
                 status=status.HTTP_201_CREATED
@@ -437,19 +577,30 @@ def register_client(request):
         )
     
 
+INVALID_OR_EXPIRED = {
+    "success": False,
+    "message": "Invalid or expired verification code.",
+}
+
 @api_view(["POST"])
 @throttle_classes([ClientOTPThrottle])
+@authentication_classes([]) 
 @permission_classes([AllowAny])
 def verify_client_email(request):
 
+
+
     ip_address = get_client_ip(request)
     user_agent = get_device_info(request)
+
+
 
     serializer = ClientOTPVerifySerializer(
         data=request.data
     )
 
     if not serializer.is_valid():
+
 
         return Response(
             {
@@ -458,48 +609,97 @@ def verify_client_email(request):
             },
             status=status.HTTP_400_BAD_REQUEST,
         )
-    if otp_request is None:
-        hash_otp("000000")  # burn comparable time to a real verification attempt
-        return Response(
-        {
-            "success": False,
-            "message": "Invalid or expired verification code.",
-        },
-        status=status.HTTP_400_BAD_REQUEST,
-    )
 
-    request_id = serializer.validated_data["request_id"]
     otp = serializer.validated_data["otp"]
+
+
+
+    # --------------------------------------------------
+    # EXTRACT + VALIDATE VERIFICATION TOKEN FROM HEADER
+    # --------------------------------------------------
+
+    auth_header = request.headers.get("Authorization", "")
+
+
+
+    if not auth_header.startswith("Bearer "):
+
+
+        hash_otp("000000")
+        return Response(
+            INVALID_OR_EXPIRED,
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    raw_verification_token = auth_header[len("Bearer "):].strip()
+
+  
+
+    try:
+        validated_token = AccessToken(raw_verification_token)
+
+
+    except TokenError as e:
+
+
+        hash_otp("000000")
+        return Response(
+            INVALID_OR_EXPIRED,
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    if validated_token.get("purpose") != "email_verification":
+
+
+        hash_otp("000000")
+        return Response(
+            INVALID_OR_EXPIRED,
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    token_client_id = validated_token.get("client_id")
+    token_id = validated_token.get("request_id")
+
+
+
+    if not token_client_id or not token_id:
+
+
+        hash_otp("000000")
+        return Response(
+            INVALID_OR_EXPIRED,
+            status=status.HTTP_400_BAD_REQUEST,
+        )
 
     try:
 
+     
+
         with transaction.atomic():
 
-            # Lock the OTP row so two simultaneous
-            # verification requests cannot consume it.
+      
+
             otp_request = (
                 ClientOTP.objects
                 .select_for_update()
                 .select_related("client")
                 .filter(
-                    request_id=request_id,
+                    request_id=token_id,
+                    client_id=token_client_id,
                     purpose="email_verification",
                 )
                 .first()
             )
 
-            # Do not reveal whether a request ID exists.
             if otp_request is None:
+               
 
                 return Response(
-                    {
-                        "success": False,
-                        "message": (
-                            "Invalid or expired verification code."
-                        ),
-                    },
+                    INVALID_OR_EXPIRED,
                     status=status.HTTP_400_BAD_REQUEST,
                 )
+
+
 
             now = timezone.now()
 
@@ -512,13 +712,9 @@ def verify_client_email(request):
                 or otp_request.is_verified
             ):
 
+
                 return Response(
-                    {
-                        "success": False,
-                        "message": (
-                            "Invalid or expired verification code."
-                        ),
-                    },
+                    INVALID_OR_EXPIRED,
                     status=status.HTTP_400_BAD_REQUEST,
                 )
 
@@ -528,13 +724,9 @@ def verify_client_email(request):
 
             if now >= otp_request.expires_at:
 
+
                 return Response(
-                    {
-                        "success": False,
-                        "message": (
-                            "Invalid or expired verification code."
-                        ),
-                    },
+                    INVALID_OR_EXPIRED,
                     status=status.HTTP_400_BAD_REQUEST,
                 )
 
@@ -547,6 +739,7 @@ def verify_client_email(request):
                 >= otp_request.max_attempts
             ):
 
+
                 return Response(
                     {
                         "success": False,
@@ -555,23 +748,30 @@ def verify_client_email(request):
                             "code attempts."
                         ),
                     },
-                    status=status.HTTP_429_TOO_MANY_REQUESTS,
+                    status=status.HTTP_400_BAD_REQUEST,
                 )
 
             # --------------------------------------------------
             # VERIFY OTP
             # --------------------------------------------------
 
+
             submitted_hash = hash_otp(otp)
+
+      
 
             otp_valid = secrets.compare_digest(
                 submitted_hash,
                 otp_request.otp_hash,
             )
 
+    
+
             if not otp_valid:
 
                 otp_request.attempts += 1
+
+   
 
                 otp_request.save(
                     update_fields=["attempts"]
@@ -582,6 +782,7 @@ def verify_client_email(request):
                     >= otp_request.max_attempts
                 ):
 
+
                     return Response(
                         {
                             "success": False,
@@ -590,19 +791,11 @@ def verify_client_email(request):
                                 "verification code attempts."
                             ),
                         },
-                        status=(
-                            status.HTTP_429_TOO_MANY_REQUESTS
-                        ),
+                        status=status.HTTP_400_BAD_REQUEST,
                     )
 
                 return Response(
-                    {
-                        "success": False,
-                        "message": (
-                            "Invalid or expired "
-                            "verification code."
-                        ),
-                    },
+                    INVALID_OR_EXPIRED,
                     status=status.HTTP_400_BAD_REQUEST,
                 )
 
@@ -610,9 +803,12 @@ def verify_client_email(request):
             # OTP VALID
             # --------------------------------------------------
 
+
+
             user = otp_request.client
 
-            # Mark OTP as consumed.
+
+
             otp_request.is_verified = True
             otp_request.is_used = True
             otp_request.verified_at = now
@@ -625,23 +821,22 @@ def verify_client_email(request):
                 ]
             )
 
-            # --------------------------------------------------
-            # VERIFY EMAIL
-            # --------------------------------------------------
+     
 
             user.email_verified_at = now
+            user.is_profile_completed = "in-details"
 
             user.save(
                 update_fields=[
                     "email_verified_at",
+                    "is_profile_completed"
                 ]
             )
 
-            # --------------------------------------------------
-            # GENERATE JWT ONLY AFTER EMAIL VERIFICATION
-            # --------------------------------------------------
+      
 
             tokens = generate_client_tokens(user)
+
 
         return Response(
             {
@@ -649,8 +844,7 @@ def verify_client_email(request):
                 "message": "Email verified successfully.",
                 "data": {
                     "id": user.id,
-                    "email": user.email_address,
-                    "mobile_number": user.mobile_number,
+
                     "is_profile_completed": (
                         user.is_profile_completed
                     ),
@@ -661,7 +855,9 @@ def verify_client_email(request):
             status=status.HTTP_200_OK,
         )
 
-    except Exception:
+    except Exception as e:
+
+
 
         logger.exception(
             "Client email verification failed unexpectedly"
@@ -676,7 +872,61 @@ def verify_client_email(request):
             },
             status=status.HTTP_500_INTERNAL_SERVER_ERROR,
         )
-    
+
+
+
+@api_view(["POST"])
+@authentication_classes([])
+@throttle_classes([ClientOTPThrottle])
+@permission_classes([AllowAny])
+def resend_client_otp(request):
+
+    print("\n========== RESEND CLIENT OTP ==========")
+
+    ip_address = get_client_ip(request)
+    user_agent = get_device_info(request)
+
+    auth_header = request.headers.get("Authorization", "")
+
+    if not auth_header.startswith("Bearer "):
+        return Response(
+            INVALID_OR_EXPIRED,
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    raw_verification_token = auth_header[len("Bearer "):].strip()
+
+    try:
+        # Note: AccessToken() only validates the JWT's own signature/exp,
+        # not the OTP row's expires_at — this is fine to decode even if
+        # the OTP itself already expired, as long as the JWT hasn't.
+        validated_token = AccessToken(raw_verification_token)
+    except TokenError as e:
+        print("[RESEND] FAILED: TokenError:", str(e))
+        return Response(
+            INVALID_OR_EXPIRED,
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    if validated_token.get("purpose") != "email_verification":
+        return Response(
+            INVALID_OR_EXPIRED,
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    token_client_id = validated_token.get("client_id")
+
+    if not token_client_id:
+        return Response(
+            INVALID_OR_EXPIRED,
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    try:
+        client_auth = ClientAuth.objects.get(id=token_client_id)
+    except ClientAuth.DoesNotExist:
+        return
+
 
 
 @api_view(['GET'])
@@ -1585,7 +1835,7 @@ def register_device_token(request):
     
 
 
-@api_view(['POST'])
+@api_view(["POST"])
 @throttle_classes([AuthThrottle])
 @permission_classes([AllowAny])
 def client_login(request):
@@ -1596,82 +1846,99 @@ def client_login(request):
     try:
         serializer = ClientLoginSerializer(
             data=request.data,
-            context={"request": request}
+            context={"request": request},
         )
 
-        if serializer.is_valid():
+        if not serializer.is_valid():
 
-            user = serializer.validated_data["user"]
-
-            # -----------------------------------------
-            # PASSWORD AUTHENTICATION SUCCESSFUL
-            # -----------------------------------------
-            #
-            # This is NOT yet a successful login.
-            # OTP verification is still required.
-            #
-
-# In client_login(request), replacing the current otp_request, otp = create_login_otp(client=user) call:
-            try:
-                otp_request, otp = create_client_otp(
-        client=user,
-        purpose=OTP_LOGIN,
-    )
-            except OTPCooldownError as e:
-                return Response(
-                    {
-                        "success": False,
-                        "message": f"Please wait {e.retry_after} seconds before requesting another code.",
-                    },
-                    status=status.HTTP_429_TOO_MANY_REQUESTS,
-                )
-
-            # Only send the email after the OTP transaction
-            # has successfully committed.
-            transaction.on_commit(
-                lambda: send_client_otp_email.delay(
-        user.email_address,
-        otp,
-        OTP_LOGIN,
-    )
+            ClientLoginHistory.objects.create(
+                client=None,
+                successful=False,
+                identifier=request.data.get("identifier"),
+                user_agent=user_agent,
+                ip_address=ip_address,
+                device_name=request.data.get("device_name"),
             )
 
             return Response(
                 {
-                    "success": True,
-                    "message": (
-                        "A verification code has been "
-                        "sent to your email."
-                    ),
-                    "data": {
-                        "requires_otp": True,
-                        "otp_request_id": str(
-                            otp_request.request_id
-                        ),
-                    }
+                    "success": False,
+                    "errors": serializer.errors,
                 },
-                status=status.HTTP_200_OK
+                status=status.HTTP_400_BAD_REQUEST,
             )
 
-        # -----------------------------------------
-        # PASSWORD AUTHENTICATION FAILED
-        # -----------------------------------------
+        # =========================================
+        # PASSWORD AUTHENTICATION SUCCESSFUL
+        # =========================================
 
-        ClientLoginHistory.objects.create(
-            client=None,
-            successful=False,
-            identifier=request.data.get("email"),
-            user_agent=user_agent,
-            ip_address=ip_address,
-            device_name=request.data.get("device_name")
+        user = serializer.validated_data["user"]
+
+        # Password is correct, but this is NOT
+        # yet a completed login.
+        #
+        # The client must complete OTP verification.
+
+        try:
+            otp_request, otp = create_client_otp(
+                client=user,
+                purpose=OTP_LOGIN,
+            )
+
+        except OTPCooldownError as e:
+            return Response(
+                {
+                    "success": False,
+                    "message": (
+                        f"Please wait {e.retry_after} seconds "
+                        "before requesting another code."
+                    ),
+                },
+                status=status.HTTP_429_TOO_MANY_REQUESTS,
+            )
+
+        # =========================================
+        # VERIFICATION SESSION
+        # =========================================
+
+        verification_token = generate_email_login_tokenn(
+            user,
+            otp_request,
         )
+
+        # =========================================
+        # SEND OTP AFTER TRANSACTION COMMIT
+        # =========================================
+
+        transaction.on_commit(
+            lambda: send_client_otp_email.delay(
+                user.email_address,
+                otp,
+                OTP_LOGIN,
+            )
+        )
+
+        # =========================================
+        # OTP PENDING RESPONSE
+        # =========================================
 
         return Response(
             {
-                "success": False,
-                "errors": serializer.errors
+                "success": True,
+                "message": (
+                    "A verification code has been "
+                    "sent to your email."
+                ),
+                "data": {
+                    "id": user.id,
+                    "requires_email_verification": True,
+                    "otp_request_id": str(
+                        otp_request.request_id
+                    ),
+                    "verification_token": verification_token,
+                },
             },
-            status=status.HTTP_400_BAD_REQUEST
+            status=status.HTTP_200_OK,
         )
 
     except Exception:
@@ -1682,10 +1949,10 @@ def client_login(request):
         ClientLoginHistory.objects.create(
             client=None,
             successful=False,
-            identifier=request.data.get("email"),
+            identifier=request.data.get("identifier"),
             user_agent=user_agent,
             ip_address=ip_address,
-            device_name=request.data.get("device_name")
+            device_name=request.data.get("device_name"),
         )
 
         return Response(
@@ -1693,17 +1960,19 @@ def client_login(request):
                 "success": False,
                 "message": (
                     "Unable to process login at this time."
-                )
+                ),
             },
-            status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
         )
 
 
 
+    
 
 
 @api_view(["POST"])
 @throttle_classes([ClientOTPThrottle])
+@authentication_classes([])
 @permission_classes([AllowAny])
 def verify_client_login_otp(request):
 
@@ -1723,18 +1992,60 @@ def verify_client_login_otp(request):
             },
             status=status.HTTP_400_BAD_REQUEST
         )
-    if otp_request is None:
-        hash_otp("000000")  # burn comparable time to a real verification attempt
-        return Response(
-        {
-            "success": False,
-            "message": "Invalid or expired verification code.",
-        },
-        status=status.HTTP_400_BAD_REQUEST,
-    )
 
-    request_id = serializer.validated_data["request_id"]
     otp = serializer.validated_data["otp"]
+
+    # --------------------------------------------------
+    # EXTRACT + VALIDATE VERIFICATION TOKEN FROM HEADER
+    # --------------------------------------------------
+    # This is the piece that was missing: the OTP was previously looked
+    # up with no reference at all to who the caller is, so any "login"
+    # OTP row could be matched against any caller. The token below is
+    # the one issued at the password step, scoped to purpose="login"
+    # plus a specific client_id/request_id, exactly like email
+    # verification already does.
+
+    auth_header = request.headers.get("Authorization", "")
+
+    if not auth_header.startswith("Bearer "):
+
+        hash_otp("000000")
+        return Response(
+            INVALID_OR_EXPIRED,
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    raw_verification_token = auth_header[len("Bearer "):].strip()
+
+    try:
+        validated_token = AccessToken(raw_verification_token)
+
+    except TokenError:
+
+        hash_otp("000000")
+        return Response(
+            INVALID_OR_EXPIRED,
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    if validated_token.get("purpose") != "login":
+
+        hash_otp("000000")
+        return Response(
+            INVALID_OR_EXPIRED,
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    token_client_id = validated_token.get("client_id")
+    token_request_id = validated_token.get("request_id")
+
+    if not token_client_id or not token_request_id:
+
+        hash_otp("000000")
+        return Response(
+            INVALID_OR_EXPIRED,
+            status=status.HTTP_400_BAD_REQUEST,
+        )
 
     try:
 
@@ -1745,7 +2056,8 @@ def verify_client_login_otp(request):
                 .select_for_update()
                 .select_related("client")
                 .filter(
-                    request_id=request_id,
+                    request_id=token_request_id,
+                    client_id=token_client_id,
                     purpose="login",
                 )
                 .first()
@@ -1754,13 +2066,9 @@ def verify_client_login_otp(request):
             # Don't reveal whether the request_id exists.
             if otp_request is None:
 
+                hash_otp("000000")
                 return Response(
-                    {
-                        "success": False,
-                        "message": (
-                            "Invalid or expired OTP."
-                        )
-                    },
+                    INVALID_OR_EXPIRED,
                     status=status.HTTP_400_BAD_REQUEST
                 )
 
@@ -1775,13 +2083,9 @@ def verify_client_login_otp(request):
                 or otp_request.is_verified
             ):
 
+                hash_otp("000000")
                 return Response(
-                    {
-                        "success": False,
-                        "message": (
-                            "Invalid or expired OTP."
-                        )
-                    },
+                    INVALID_OR_EXPIRED,
                     status=status.HTTP_400_BAD_REQUEST
                 )
 
@@ -1791,13 +2095,9 @@ def verify_client_login_otp(request):
 
             if now >= otp_request.expires_at:
 
+                hash_otp("000000")
                 return Response(
-                    {
-                        "success": False,
-                        "message": (
-                            "Invalid or expired OTP."
-                        )
-                    },
+                    INVALID_OR_EXPIRED,
                     status=status.HTTP_400_BAD_REQUEST
                 )
 
@@ -1810,6 +2110,7 @@ def verify_client_login_otp(request):
                 >= otp_request.max_attempts
             ):
 
+                hash_otp("000000")
                 return Response(
                     {
                         "success": False,
@@ -1857,12 +2158,7 @@ def verify_client_login_otp(request):
                     )
 
                 return Response(
-                    {
-                        "success": False,
-                        "message": (
-                            "Invalid or expired OTP."
-                        )
-                    },
+                    INVALID_OR_EXPIRED,
                     status=status.HTTP_400_BAD_REQUEST
                 )
 
@@ -1883,6 +2179,22 @@ def verify_client_login_otp(request):
             )
 
             user = otp_request.client
+
+            # Defense in depth: even though the token above was already
+            # scoped to token_client_id, confirm the OTP row's client
+            # actually matches it before we issue real session tokens.
+            if str(user.id) != str(token_client_id):
+
+                logger.error(
+                    "Login OTP client mismatch: token=%s otp_row=%s",
+                    token_client_id,
+                    user.id,
+                )
+
+                return Response(
+                    INVALID_OR_EXPIRED,
+                    status=status.HTTP_400_BAD_REQUEST
+                )
 
             # -----------------------------------------
             # UPDATE LOGIN INFORMATION

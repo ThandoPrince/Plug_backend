@@ -17,6 +17,9 @@ def get_env(name: str, default: str | None = None, required: bool = False) -> st
         raise ValueError(f"Missing required environment variable: {name}")
     return value
 
+SECRET_KEY = get_env("DJANGO_SECRET_KEY", required=True)
+DEBUG = get_env("DJANGO_DEBUG", "False").lower() == "true"
+
 SIMPLE_JWT = {
     "ACCESS_TOKEN_LIFETIME": timedelta(minutes=15),
     "REFRESH_TOKEN_LIFETIME": timedelta(days=30),
@@ -25,11 +28,22 @@ SIMPLE_JWT = {
 }
 
 
+EMAIL_BACKEND = get_env(
+    "DJANGO_EMAIL_BACKEND",
+    "django.core.mail.backends.smtp.EmailBackend"
+)
+
+EMAIL_HOST = get_env("EMAIL_HOST", required=not DEBUG)
+EMAIL_PORT = int(get_env("EMAIL_PORT", "587"))
+EMAIL_USE_TLS = get_env("EMAIL_USE_TLS", "True").lower() == "true"
+EMAIL_USE_SSL = get_env("EMAIL_USE_SSL", "False").lower() == "true"
+EMAIL_HOST_USER = get_env("EMAIL_HOST_USER", required=not DEBUG)
+EMAIL_HOST_PASSWORD = get_env("EMAIL_HOST_PASSWORD", required=not DEBUG)
+DEFAULT_FROM_EMAIL = get_env("DEFAULT_FROM_EMAIL", EMAIL_HOST_USER)
+
+EMAIL_TIMEOUT = 10
 
 
-
-SECRET_KEY = get_env("DJANGO_SECRET_KEY", required=True)
-DEBUG = get_env("DJANGO_DEBUG", "False").lower() == "true"
 AI_API_KEY = get_env("AI_API_KEY")
 AI_KYC_API_URL = get_env("AI_KYC_API_URL")
 GOOGLE_MAPS_API_KEY = os.getenv("GOOGLE_MAPS_API_KEY")
@@ -124,6 +138,8 @@ DATABASES = {
         ssl_require=False,
     )
 }
+
+
 
 AUTH_PASSWORD_VALIDATORS = [
     {"NAME": "django.contrib.auth.password_validation.UserAttributeSimilarityValidator"},

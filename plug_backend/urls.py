@@ -98,6 +98,7 @@ path(
     views.verify_client_login_otp,
     name="client-login-verify-otp",
 ),
+path("api/client/login/resend-otp/", views.resend_client_otp, name="resend_client_otp"),
 
     path(
         "api/client/login/verify-email/",

@@ -47,9 +47,7 @@ class ClientProfileSerializer(serializers.ModelSerializer):
 
 
 class ClientOTPVerifySerializer(serializers.Serializer):
-    request_id = serializers.UUIDField(
-        required=True
-    )
+    
 
     otp = serializers.CharField(
         required=True,

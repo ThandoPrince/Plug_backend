@@ -149,10 +149,12 @@ class OTPCooldownError(Exception):
         )
 OTP_LOGIN = "login"
 OTP_EMAIL_VERIFICATION = "email_verification"
+OTP_PASSWORD_RESET = "password_reset"
 
 OTP_PURPOSES = {
     OTP_LOGIN,
     OTP_EMAIL_VERIFICATION,
+    OTP_PASSWORD_RESET,
 }
 
 @transaction.atomic
