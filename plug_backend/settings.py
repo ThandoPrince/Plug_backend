@@ -28,10 +28,10 @@ SIMPLE_JWT = {
 }
 
 
-EMAIL_BACKEND = get_env(
-    "DJANGO_EMAIL_BACKEND",
-    "django.core.mail.backends.smtp.EmailBackend"
-)
+EMAIL_BACKEND = "anymail.backends.resend.EmailBackend"
+ANYMAIL = {
+    "RESEND_API_KEY": get_env("RESEND_API_KEY", required=not DEBUG),
+}
 
 EMAIL_HOST = get_env("EMAIL_HOST", required=not DEBUG)
 EMAIL_PORT = int(get_env("EMAIL_PORT", "587"))
@@ -39,7 +39,7 @@ EMAIL_USE_TLS = get_env("EMAIL_USE_TLS", "True").lower() == "true"
 EMAIL_USE_SSL = get_env("EMAIL_USE_SSL", "False").lower() == "true"
 EMAIL_HOST_USER = get_env("EMAIL_HOST_USER", required=not DEBUG)
 EMAIL_HOST_PASSWORD = get_env("EMAIL_HOST_PASSWORD", required=not DEBUG)
-DEFAULT_FROM_EMAIL = get_env("DEFAULT_FROM_EMAIL", EMAIL_HOST_USER)
+DEFAULT_FROM_EMAIL = get_env("DEFAULT_FROM_EMAIL", "onboarding@resend.dev")
 
 EMAIL_TIMEOUT = 10
 
@@ -84,6 +84,7 @@ INSTALLED_APPS = [
     "django.contrib.messages",
     "django.contrib.staticfiles",
     "rest_framework.authtoken",
+    "anymail",
     "api.clientsDB",
     "api.serviceProvidersDB",
     "api.bookings",
