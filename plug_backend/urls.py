@@ -99,6 +99,8 @@ path(
     name="client-login-verify-otp",
 ),
 path("api/client/login/resend-otp/", views.resend_client_otp, name="resend_client_otp"),
+path("api/client/login/resend-login-otp/", views.resend_client_login_otp, name="resend_login_client_otp"),
+path("api/client/login/password-reset-otp/", views.request_client_password_reset, name="reset_pass_client_otp"),
 
     path(
         "api/client/login/verify-email/",

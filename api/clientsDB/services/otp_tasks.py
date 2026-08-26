@@ -14,8 +14,9 @@ from api.clientsDB.services.otp_service import generate_otp, hash_otp
 logger = logging.getLogger(__name__)
 
 
-OTP_LOGIN = "login"
-OTP_EMAIL_VERIFICATION = "email_verification"
+
+
+
 
 
 @shared_task(
@@ -40,7 +41,46 @@ def send_client_otp_email(
     - OTP should only exist for the lifetime of this task.
     """
 
-    if purpose == OTP_LOGIN:
+    if purpose == OTP_PASSWORD_RESET:
+        subject = "Reset your Plug password"
+  
+
+        text_content = (
+            f"Your Plug password reset code is: {otp}\n\n"
+            "Enter this code in the Plug app to reset your password.\n\n"
+            "This code expires in 5 minutes.\n\n"
+            "If you did not request a password reset, "
+            "you can safely ignore this email — your password "
+            "will not be changed."
+        )
+
+        html_content = f"""
+        <html>
+            <body>
+                <h2>Reset Your Plug Password</h2>
+
+                <p>
+                    Use the verification code below to
+                    reset your password:
+                </p>
+
+                <h1>{otp}</h1>
+
+                <p>
+                    This code expires in <strong>5 minutes</strong>.
+                </p>
+
+                <p>
+                    If you did not request a password reset,
+                    you can safely ignore this email — your
+                    password will not be changed.
+                </p>
+            </body>
+        </html>
+        """
+
+
+    elif purpose == OTP_LOGIN:
 
         subject = "Your Plug login verification code"
 

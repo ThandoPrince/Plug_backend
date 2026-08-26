@@ -336,6 +336,47 @@ def register_client(request):
     user_agent = get_device_info(request)
 
     try:
+        # --------------------------------------------------
+        # NORMALIZE INPUT
+        # --------------------------------------------------
+
+        email = (
+            request.data.get("email_address", "")
+            .lower()
+            .strip()
+        )
+
+        mobile = request.data.get("mobile_number")
+
+        # --------------------------------------------------
+        # DUPLICATE EMAIL
+        # --------------------------------------------------
+
+        if email and ClientAuth.objects.filter(
+            email_address=email
+        ).exists():
+
+            ClientRegistrationHistory.objects.create(
+                email=email,
+                mobile_number=mobile,
+                successful=False,
+                ip_address=ip_address,
+                user_agent=user_agent,
+                error_message="Email already exists"
+            )
+
+            return Response(
+                {
+                    "success": False,
+                    "message": "Invalid email address."
+                },
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # --------------------------------------------------
+        # SERIALIZER VALIDATION
+        # --------------------------------------------------
+
         serializer = ClientRegisterSerializer(
             data=request.data
         )
@@ -350,6 +391,7 @@ def register_client(request):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
+        # Use serializer's validated/normalized values
         email = (
             serializer.validated_data["email_address"]
             .lower()
@@ -362,6 +404,10 @@ def register_client(request):
 
         # --------------------------------------------------
         # DUPLICATE EMAIL
+        # --------------------------------------------------
+        # Keep this check because of race conditions where
+        # another request creates the account between the
+        # first check and serializer.save().
         # --------------------------------------------------
 
         if ClientAuth.objects.filter(
@@ -380,10 +426,7 @@ def register_client(request):
             return Response(
                 {
                     "success": False,
-                    "message": (
-                        "A user with this email "
-                        "already exists."
-                    )
+                    "message": "Invalid email address."
                 },
                 status=status.HTTP_400_BAD_REQUEST
             )
@@ -582,13 +625,16 @@ INVALID_OR_EXPIRED = {
     "message": "Invalid or expired verification code.",
 }
 
+INVALID_OR_EXPIRED_RESET = {
+    "success": False,
+    "message": "Invalid or expired verification code. Please go back to login.",
+}
+
 @api_view(["POST"])
 @throttle_classes([ClientOTPThrottle])
 @authentication_classes([]) 
 @permission_classes([AllowAny])
 def verify_client_email(request):
-
-
 
     ip_address = get_client_ip(request)
     user_agent = get_device_info(request)
@@ -881,51 +927,307 @@ def verify_client_email(request):
 @permission_classes([AllowAny])
 def resend_client_otp(request):
 
-    print("\n========== RESEND CLIENT OTP ==========")
+    ip_address = get_client_ip(request)
+    user_agent = get_device_info(request)
+
+    try:
+        # --------------------------------------------------
+        # EXTRACT + VALIDATE VERIFICATION TOKEN FROM HEADER
+        # --------------------------------------------------
+
+        auth_header = request.headers.get("Authorization", "")
+
+        if not auth_header.startswith("Bearer "):
+            return Response(
+                INVALID_OR_EXPIRED,
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        raw_verification_token = auth_header[len("Bearer "):].strip()
+
+        try:
+            # Note: AccessToken() only validates the JWT's own signature/exp,
+            # not the OTP row's expires_at — this is fine to decode even if
+            # the OTP itself already expired, as long as the JWT hasn't.
+            validated_token = AccessToken(raw_verification_token)
+        except TokenError:
+            return Response(
+                INVALID_OR_EXPIRED,
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if validated_token.get("purpose") != "email_verification":
+            return Response(
+                INVALID_OR_EXPIRED,
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        token_client_id = validated_token.get("client_id")
+
+        if not token_client_id:
+            return Response(
+                INVALID_OR_EXPIRED_RESET,
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            client_auth = ClientAuth.objects.get(id=token_client_id)
+        except ClientAuth.DoesNotExist:
+            return Response(
+                INVALID_OR_EXPIRED_RESET,
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # --------------------------------------------------
+        # DON'T RESEND IF ALREADY VERIFIED / COMPLETED
+        # --------------------------------------------------
+        # A stale-but-still-valid JWT shouldn't be able to spam new OTPs
+        # for an account that already finished email verification.
+
+        if client_auth.is_profile_completed != "in-email-verification":
+            return Response(
+                INVALID_OR_EXPIRED_RESET,
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # --------------------------------------------------
+        # CREATE + SEND NEW OTP
+        # --------------------------------------------------
+
+        try:
+            with transaction.atomic():
+
+                try:
+                    otp_request, otp = create_client_otp(
+                        client=client_auth,
+                        purpose=OTP_EMAIL_VERIFICATION,
+                    )
+                except OTPCooldownError as e:
+                    return Response(
+                        {
+                            "success": False,
+                            "message": (
+                                f"Please wait {e.retry_after} seconds "
+                                "before requesting another code."
+                            ),
+                        },
+                        status=status.HTTP_429_TOO_MANY_REQUESTS,
+                    )
+
+                verification_token = generate_email_verification_token(
+                    client_auth, otp_request
+                )
+
+                transaction.on_commit(
+                    lambda: send_client_otp_email.delay(
+                        client_auth.email_address,
+                        otp,
+                        OTP_EMAIL_VERIFICATION,
+                    )
+                )
+
+            return Response(
+                {
+                    "success": True,
+                    "message": (
+                        "A new verification code has been sent "
+                        "to your email."
+                    ),
+                    "data": {
+                        "id": client_auth.id,
+                        "requires_email_verification": True,
+                        "otp_request_id": str(otp_request.request_id),
+                        "verification_token": verification_token,
+                    },
+                },
+                status=status.HTTP_200_OK,
+            )
+
+        except Exception:
+            logger.exception(
+                "Resend client OTP failed for client_id=%s",
+                token_client_id,
+            )
+            return Response(
+                {
+                    "success": False,
+                    "message": (
+                        "A server error occurred. "
+                        "Please try again later."
+                    ),
+                },
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+    except Exception:
+        logger.exception("Unexpected error in resend_client_otp")
+        return Response(
+            {
+                "success": False,
+                "message": (
+                    "A server error occurred. "
+                    "Please try again later."
+                ),
+            },
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
+
+
+
+
+
+@api_view(["POST"])
+@authentication_classes([])
+@throttle_classes([ClientOTPThrottle])
+@permission_classes([AllowAny])
+def resend_client_login_otp(request):
 
     ip_address = get_client_ip(request)
     user_agent = get_device_info(request)
 
-    auth_header = request.headers.get("Authorization", "")
-
-    if not auth_header.startswith("Bearer "):
-        return Response(
-            INVALID_OR_EXPIRED,
-            status=status.HTTP_400_BAD_REQUEST,
-        )
-
-    raw_verification_token = auth_header[len("Bearer "):].strip()
-
     try:
-        # Note: AccessToken() only validates the JWT's own signature/exp,
-        # not the OTP row's expires_at — this is fine to decode even if
-        # the OTP itself already expired, as long as the JWT hasn't.
-        validated_token = AccessToken(raw_verification_token)
-    except TokenError as e:
-        print("[RESEND] FAILED: TokenError:", str(e))
+        # --------------------------------------------------
+        # EXTRACT + VALIDATE VERIFICATION TOKEN FROM HEADER
+        # --------------------------------------------------
+
+        auth_header = request.headers.get("Authorization", "")
+
+        if not auth_header.startswith("Bearer "):
+            return Response(
+                INVALID_OR_EXPIRED,
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        raw_verification_token = auth_header[len("Bearer "):].strip()
+
+        try:
+            # Note: AccessToken() only validates the JWT's own signature/exp,
+            # not the OTP row's expires_at — this is fine to decode even if
+            # the OTP itself already expired, as long as the JWT hasn't.
+            validated_token = AccessToken(raw_verification_token)
+        except TokenError:
+            return Response(
+                INVALID_OR_EXPIRED,
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if validated_token.get("purpose") != "login":
+            return Response(
+                INVALID_OR_EXPIRED,
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        token_client_id = validated_token.get("client_id")
+
+        if not token_client_id:
+            return Response(
+                INVALID_OR_EXPIRED_RESET,
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            client_auth = ClientAuth.objects.get(id=token_client_id)
+        except ClientAuth.DoesNotExist:
+            return Response(
+                INVALID_OR_EXPIRED_RESET,
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # --------------------------------------------------
+        # DON'T RESEND IF ALREADY VERIFIED / COMPLETED
+        # --------------------------------------------------
+        # A stale-but-still-valid JWT shouldn't be able to spam new OTPs
+        # for an account that already finished email verification.
+
+        if client_auth.is_profile_completed == "is_blocked":
+            return Response(
+                INVALID_OR_EXPIRED_RESET,
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # --------------------------------------------------
+        # CREATE + SEND NEW OTP
+        # --------------------------------------------------
+
+        try:
+            with transaction.atomic():
+
+                try:
+                    otp_request, otp = create_client_otp(
+                        client=client_auth,
+                        purpose=OTP_LOGIN,
+                    )
+                except OTPCooldownError as e:
+                    return Response(
+                        {
+                            "success": False,
+                            "message": (
+                                f"Please wait {e.retry_after} seconds "
+                                "before requesting another code."
+                            ),
+                        },
+                        status=status.HTTP_429_TOO_MANY_REQUESTS,
+                    )
+
+                verification_token = generate_email_login_tokenn(
+                    client_auth, otp_request
+                )
+
+                transaction.on_commit(
+                    lambda: send_client_otp_email.delay(
+                        client_auth.email_address,
+                        otp,
+                        OTP_LOGIN,
+                    )
+                )
+
+            return Response(
+                {
+                    "success": True,
+                    "message": (
+                        "A new verification code has been sent "
+                        "to your email."
+                    ),
+                    "data": {
+                        "id": client_auth.id,
+                        "requires_email_verification": True,
+                        "otp_request_id": str(otp_request.request_id),
+                        "verification_token": verification_token,
+                    },
+                },
+                status=status.HTTP_200_OK,
+            )
+
+        except Exception:
+            logger.exception(
+                "Resend client OTP failed for client_id=%s",
+                token_client_id,
+            )
+            return Response(
+                {
+                    "success": False,
+                    "message": (
+                        "A server error occurred. "
+                        "Please try again later."
+                    ),
+                },
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+    except Exception:
+        logger.exception("Unexpected error in resend_client_otp")
         return Response(
-            INVALID_OR_EXPIRED,
-            status=status.HTTP_400_BAD_REQUEST,
+            {
+                "success": False,
+                "message": (
+                    "A server error occurred. "
+                    "Please try again later."
+                ),
+            },
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
         )
 
-    if validated_token.get("purpose") != "email_verification":
-        return Response(
-            INVALID_OR_EXPIRED,
-            status=status.HTTP_400_BAD_REQUEST,
-        )
 
-    token_client_id = validated_token.get("client_id")
-
-    if not token_client_id:
-        return Response(
-            INVALID_OR_EXPIRED,
-            status=status.HTTP_400_BAD_REQUEST,
-        )
-
-    try:
-        client_auth = ClientAuth.objects.get(id=token_client_id)
-    except ClientAuth.DoesNotExist:
-        return
 
 
 
@@ -1874,6 +2176,51 @@ def client_login(request):
 
         user = serializer.validated_data["user"]
 
+        if user.is_profile_completed == "in-email-verification":
+            try:
+                otp_request, otp = create_client_otp(
+                    client=user,
+                    purpose=OTP_EMAIL_VERIFICATION,
+                )
+            except OTPCooldownError as e:
+                return Response(
+                    {
+                        "success": False,
+                        "message": (
+                            f"Please wait {e.retry_after} seconds "
+                            "before requesting another code."
+                        ),
+                    },
+                    status=status.HTTP_429_TOO_MANY_REQUESTS,
+                )
+
+            verification_token = generate_email_verification_token(user, otp_request)
+
+            transaction.on_commit(
+                lambda: send_client_otp_email.delay(
+                    user.email_address,
+                    otp,
+                    OTP_EMAIL_VERIFICATION,
+                )
+            )
+
+            return Response(   # <-- this was missing
+                {
+                    "success": True,
+                    "message": (
+                        "Please verify your email to complete registration. "
+                        "A verification code has been sent to your email."
+                    ),
+                    "data": {
+                        "id": user.id,
+                        "is_profile_completed": user.is_profile_completed,
+                        "requires_email_verification": True,
+                        "otp_request_id": str(otp_request.request_id),
+                        "verification_token": verification_token,
+                    },
+                },
+                status=status.HTTP_200_OK,
+            )
         # Password is correct, but this is NOT
         # yet a completed login.
         #
@@ -1931,6 +2278,7 @@ def client_login(request):
                 ),
                 "data": {
                     "id": user.id,
+                    "is_profile_completed": user.is_profile_completed,
                     "requires_email_verification": True,
                     "otp_request_id": str(
                         otp_request.request_id

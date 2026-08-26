@@ -11,5 +11,5 @@ def generate_email_login_tokenn(client, otp_request):
     token["client_id"] = client.id
     token["purpose"] = "login"
     token["request_id"] = str(otp_request.request_id)
-    token.set_exp(lifetime=timedelta(minutes=6))
+    token.set_exp(lifetime=timedelta(minutes=15))
     return str(token)
