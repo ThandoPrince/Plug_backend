@@ -107,10 +107,12 @@ path("api/client/login/password-reset-otp/", views.request_client_password_reset
         views.verify_client_email,
         name="client-login-verify-email",
     ),
+
+
         
     
 
-    # Service Providers DB
+    # Service Providers DBB
     path('api/sp_profile/register/', sp_views.sp_register, name='sp_profile_register'),##used
     path('api/sp_login/', sp_views.sp_login, name='sp_login'), ##used
     path(
