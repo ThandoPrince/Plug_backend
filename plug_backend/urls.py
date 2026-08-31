@@ -19,7 +19,7 @@ def api_root(request):
     })
 
 urlpatterns = [
-    path('admin/', admin.site.urls),
+    # path('admin/', admin.site.urls),
 
   
     path('api/', api_root, name='api-root'),
@@ -231,7 +231,12 @@ path(
     path('api/service_provider/services/<int:provider_id>/',sp_views.get_provider_services,name='get_provider_services_by_email'),
     path('api/serviceProvider/cost/<int:cost_id>/images/',sp_views.upload_service_images,name='upload_service_images'),
     path('api/providers/toggle-active/',sp_views.toggle_provider_active,name='toggle-provider-active'), ##used
-    path('api/sp/register/device-token/', sp_views.register_device_token, name='register-device-token'), ##used
+    path('api/sp/register/device-token/', sp_views.register_device_token, name='sp-register-device-token'), ##used
+
+    path('api/sp/verify/login-otp/', sp_views.verify_sp_login_otp, name='sp-verify-login-otp'), ##used
+    path('api/sp/verify/email-otp/', sp_views.verify_sp_email, name='sp-verify-email-otp'), ##used
+
+
     
     
 

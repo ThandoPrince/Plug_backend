@@ -1,9 +1,10 @@
-from datetime import timezone
+from django.utils import timezone
 from decimal import Decimal, InvalidOperation
 import json
 import os
+import secrets
 import time
-from rest_framework_simplejwt.tokens import RefreshToken
+from rest_framework_simplejwt.tokens import AccessToken, RefreshToken
 from tokenize import TokenError
 from unittest import result
 from django.db import DatabaseError, transaction, OperationalError
@@ -25,19 +26,25 @@ from rest_framework.permissions import AllowAny, IsAuthenticated
 from api.bookings.models import OrderService
 from api.bookings.utils.choices import ACTIVE_ORDER_STATUSES
 from api.clientsDB.models.models import ClientAddress, ClientDetails, DeviceToken
+from api.clientsDB.serializers import ClientOTPVerifySerializer
 from api.clientsDB.services.client_ip_address_helper import get_client_ip, get_device_info
 from api.clientsDB.services.jwt_client_authentication import ClientJWTAuthentication
 
+from api.clientsDB.services.otp_service import hash_otp
+from api.clientsDB.services.otp_tasks import OTP_EMAIL_VERIFICATION, OTP_LOGIN, OTPCooldownError
 from api.serviceProvidersDB.services.affidavit_hash_calcultor import calculate_sha256
 from api.serviceProvidersDB.services.affidavit_verification_service import AIKYCClient
 from api.serviceProvidersDB.services.kyc_verification_service import KYCService
+from api.serviceProvidersDB.services.otp_utils import create_sp_otp
 from api.serviceProvidersDB.services.service_validator import validate_service_submission
 from api.serviceProvidersDB.services.sp_jwt_authentication import SPJWTAuthentication
+from api.serviceProvidersDB.services.sp_otp_service import generate_sp_email_verification_token, generate_sp_login_token
+from api.serviceProvidersDB.services.sp_otp_task import send_sp_otp_email
 from plug_backend import settings
 from plug_backend.helpers.auth_helpers import get_service_provider, get_sp_profile
-from plug_backend.throttles import AuthThrottle, HeavyReadThrottle, LiveLocationReadThrottle, LiveLocationWriteThrottle, ProfileWriteThrottle, RegisterThrottle, UploadThrottle, UserReadThrottle
+from plug_backend.throttles import AuthThrottle, ClientOTPThrottle, HeavyReadThrottle, LiveLocationReadThrottle, LiveLocationWriteThrottle, ProfileWriteThrottle, RegisterThrottle, UploadThrottle, UserReadThrottle
 from plug_backend.utils.sp_jwt_helper import generate_sp_tokens
-from .models import CostOfService, CostOfServiceImage, ProviderLoginHistory, ProviderQualification, ProviderRegistrationHistory, ProviderService, ProviderServiceAffidavit, ProviderServiceHistory, SPLiveLocation, SPLocationHistory, SPProfile, ServiceGroup, Service, ServiceProvider, Address
+from .models import SPOTP, CostOfService, CostOfServiceImage, ProviderLoginHistory, ProviderQualification, ProviderRegistrationHistory, ProviderService, ProviderServiceAffidavit, ProviderServiceHistory, SPLiveLocation, SPLocationHistory, SPProfile, ServiceGroup, Service, ServiceProvider, Address
 from .serializers import (
     ClientSPProfileReadSerializer,
     ClientServiceProviderReadSerializer,
@@ -93,59 +100,72 @@ def sp_login(request):
             context={"request": request},
         )
 
-        if serializer.is_valid():
-            sp = serializer.validated_data["user"]
-
-            # Successful login
+        if not serializer.is_valid():
             ProviderLoginHistory.objects.create(
-                service_provider=sp,
-                successful=True,
+                service_provider=None,
+                successful=False,
                 identifier=identifier,
                 user_agent=user_agent,
                 ip_address=ip_address,
                 device_name=device_name,
-                # event_type defaults to "login"
             )
-
-            tokens = generate_sp_tokens(sp)
 
             return Response(
-                {
-                    "success": True,
-                    "message": "Login successful",
-                    "data": {
-                        "id": sp.id,
-                        "is_profile_completed": sp.is_profile_completed,
-                        "access_token": tokens["access"],
-                        "refresh_token": tokens["refresh"],
-                    },
-                },
-                status=status.HTTP_200_OK,
+                {"success": False, "errors": serializer.errors},
+                status=status.HTTP_400_BAD_REQUEST,
             )
 
-        # Failed login
-        ProviderLoginHistory.objects.create(
-            service_provider=None,
-            successful=False,
-            identifier=identifier,
-            user_agent=user_agent,
-            ip_address=ip_address,
-            device_name=device_name,
-            # event_type defaults to "login"
+        # =========================================
+        # PASSWORD AUTHENTICATION SUCCESSFUL
+        # =========================================
+
+        sp = serializer.validated_data["user"]
+
+        # Password is correct, but this is NOT yet a completed
+        # login — the provider must complete OTP verification.
+
+        try:
+            otp_request, otp = create_sp_otp(
+                service_provider=sp,
+                purpose=OTP_LOGIN,
+            )
+        except OTPCooldownError as e:
+            return Response(
+                {
+                    "success": False,
+                    "message": f"Please wait {e.retry_after} seconds before requesting another code.",
+                },
+                status=status.HTTP_429_TOO_MANY_REQUESTS,
+            )
+
+        verification_token = generate_sp_login_token(sp, otp_request)
+
+        transaction.on_commit(
+            lambda: send_sp_otp_email.delay(
+                sp.email_address,
+                otp,
+                OTP_LOGIN,
+            )
         )
 
         return Response(
             {
-                "success": False,
-                "errors": serializer.errors,
+                "success": True,
+                "message": "A verification code has been sent to your email.",
+                "data": {
+                    "id": sp.id,
+                    "is_profile_completed": sp.is_profile_completed,
+                    "requires_email_verification": True,
+                    "otp_request_id": str(otp_request.request_id),
+                    "verification_token": verification_token,
+                },
             },
-            status=status.HTTP_400_BAD_REQUEST,
+            status=status.HTTP_200_OK,
         )
 
     except Exception:
         logger.exception("SP login failed unexpectedly")
 
-        # System failure during login
         ProviderLoginHistory.objects.create(
             service_provider=None,
             successful=False,
@@ -153,17 +173,160 @@ def sp_login(request):
             user_agent=user_agent,
             ip_address=ip_address,
             device_name=device_name,
-            # event_type defaults to "login"
         )
 
         return Response(
-            {
-                "success": False,
-                "message": "Unable to process login at this time.",
-            },
+            {"success": False, "message": "Unable to process login at this time."},
             status=status.HTTP_500_INTERNAL_SERVER_ERROR,
         )
-    
+
+
+
+@api_view(["POST"])
+@throttle_classes([ClientOTPThrottle])
+@authentication_classes([])
+@permission_classes([AllowAny])
+def verify_sp_login_otp(request):
+
+    ip_address = get_client_ip(request)
+    user_agent = get_device_info(request)
+
+    serializer = ClientOTPVerifySerializer(data=request.data)
+
+    if not serializer.is_valid():
+        return Response(
+            {"success": False, "errors": serializer.errors},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    otp = serializer.validated_data["otp"]
+
+    auth_header = request.headers.get("Authorization", "")
+
+    if not auth_header.startswith("Bearer "):
+        hash_otp("000000")
+        return Response(SP_INVALID_OR_EXPIRED, status=status.HTTP_400_BAD_REQUEST)
+
+    raw_verification_token = auth_header[len("Bearer "):].strip()
+
+    try:
+        validated_token = AccessToken(raw_verification_token)
+    except TokenError:
+        hash_otp("000000")
+        return Response(SP_INVALID_OR_EXPIRED, status=status.HTTP_400_BAD_REQUEST)
+
+    if validated_token.get("purpose") != "login":
+        hash_otp("000000")
+        return Response(SP_INVALID_OR_EXPIRED, status=status.HTTP_400_BAD_REQUEST)
+
+    token_sp_id = validated_token.get("sp_id")
+    token_request_id = validated_token.get("request_id")
+
+    if not token_sp_id or not token_request_id:
+        hash_otp("000000")
+        return Response(SP_INVALID_OR_EXPIRED, status=status.HTTP_400_BAD_REQUEST)
+
+    try:
+        with transaction.atomic():
+
+            otp_request = (
+                SPOTP.objects
+                .select_for_update()
+                .select_related("service_provider")
+                .filter(
+                    request_id=token_request_id,
+                    service_provider_id=token_sp_id,
+                    purpose="login",
+                )
+                .first()
+            )
+
+            if otp_request is None:
+                hash_otp("000000")
+                return Response(SP_INVALID_OR_EXPIRED, status=status.HTTP_400_BAD_REQUEST)
+
+            now = timezone.now()
+
+            if otp_request.is_used or otp_request.is_verified:
+                hash_otp("000000")
+                return Response(SP_INVALID_OR_EXPIRED, status=status.HTTP_400_BAD_REQUEST)
+
+            if now >= otp_request.expires_at:
+                hash_otp("000000")
+                return Response(SP_INVALID_OR_EXPIRED, status=status.HTTP_400_BAD_REQUEST)
+
+            if otp_request.attempts >= otp_request.max_attempts:
+                hash_otp("000000")
+                return Response(
+                    {"success": False, "message": "Too many invalid OTP attempts."},
+                    status=status.HTTP_429_TOO_MANY_REQUESTS,
+                )
+
+            submitted_hash = hash_otp(otp)
+            otp_valid = secrets.compare_digest(submitted_hash, otp_request.otp_hash)
+
+            if not otp_valid:
+                otp_request.attempts += 1
+                otp_request.save(update_fields=["attempts"])
+
+                if otp_request.attempts >= otp_request.max_attempts:
+                    return Response(
+                        {"success": False, "message": "Too many invalid OTP attempts."},
+                        status=status.HTTP_429_TOO_MANY_REQUESTS,
+                    )
+
+                return Response(SP_INVALID_OR_EXPIRED, status=status.HTTP_400_BAD_REQUEST)
+
+            otp_request.is_verified = True
+            otp_request.is_used = True
+            otp_request.verified_at = now
+            otp_request.save(update_fields=["is_verified", "is_used", "verified_at"])
+
+            sp = otp_request.service_provider
+
+            if str(sp.id) != str(token_sp_id):
+                logger.error(
+                    "Login OTP SP mismatch: token=%s otp_row=%s",
+                    token_sp_id, sp.id,
+                )
+                return Response(SP_INVALID_OR_EXPIRED, status=status.HTTP_400_BAD_REQUEST)
+
+            sp.last_login_at = now
+            sp.last_login_ip = ip_address
+            sp.failed_login_attempts = 0
+            sp.save(update_fields=["last_login_at", "last_login_ip", "failed_login_attempts"])
+
+            ProviderLoginHistory.objects.create(
+                service_provider=sp,
+                successful=True,
+                identifier=sp.email_address,
+                user_agent=user_agent,
+                ip_address=ip_address,
+                device_name=request.data.get("device_name"),
+            )
+
+            tokens = generate_sp_tokens(sp)
+
+        return Response(
+            {
+                "success": True,
+                "message": "Login successful.",
+                "data": {
+                    "id": sp.id,
+                    "is_profile_completed": sp.is_profile_completed,
+                    "access_token": tokens["access"],
+                    "refresh_token": tokens["refresh"],
+                },
+            },
+            status=status.HTTP_200_OK,
+        )
+
+    except Exception:
+        logger.exception("SP login OTP verification failed unexpectedly")
+        return Response(
+            {"success": False, "message": "Unable to process OTP verification at this time."},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )    
 
 
 
@@ -517,7 +680,13 @@ def sp_add_address_document(request):
 
                 
 
-@api_view(["POST"])
+SP_INVALID_OR_EXPIRED = {
+    "success": False,
+    "message": "Invalid or expired verification code.",
+}
+
+
+@api_view(['POST'])
 @permission_classes([AllowAny])
 @throttle_classes([RegisterThrottle])
 def sp_register(request):
@@ -555,10 +724,26 @@ def sp_register(request):
         with transaction.atomic():
 
             sp_profile = serializer.save(
-                is_profile_completed="in-details"
+                is_profile_completed="in-email-verification",
             )
 
-            tokens = generate_sp_tokens(sp_profile)
+            try:
+                otp_request, otp = create_sp_otp(
+                    service_provider=sp_profile,
+                    purpose=OTP_EMAIL_VERIFICATION,
+                )
+            except OTPCooldownError as e:
+                return Response(
+                    {
+                        "success": False,
+                        "message": f"Please wait {e.retry_after} seconds before requesting another code.",
+                    },
+                    status=status.HTTP_429_TOO_MANY_REQUESTS,
+                )
+
+            verification_token = generate_sp_email_verification_token(
+                sp_profile, otp_request
+            )
 
             ProviderRegistrationHistory.objects.create(
                 email=sp_profile.email_address,
@@ -569,15 +754,27 @@ def sp_register(request):
                 device_name=user_agent,
             )
 
+            transaction.on_commit(
+                lambda: send_sp_otp_email.delay(
+                    sp_profile.email_address,
+                    otp,
+                    OTP_EMAIL_VERIFICATION,
+                )
+            )
+
         return Response(
             {
                 "success": True,
-                "message": "Service Provider registered successfully.",
+                "message": (
+                    "Registration successful. "
+                    "A verification code has been sent to your email."
+                ),
                 "data": {
                     "id": sp_profile.id,
-                    "profile_status": sp_profile.is_profile_completed,
-                    "access_token": tokens["access"],
-                    "refresh_token": tokens["refresh"],
+                    "is_profile_completed": sp_profile.is_profile_completed,
+                    "requires_email_verification": True,
+                    "otp_request_id": str(otp_request.request_id),
+                    "verification_token": verification_token,
                 },
             },
             status=status.HTTP_201_CREATED,
@@ -597,9 +794,7 @@ def sp_register(request):
 
         logger.warning(
             "Duplicate registration attempt. Email=%s Mobile=%s IP=%s",
-            email,
-            mobile,
-            ip_address,
+            email, mobile, ip_address,
         )
 
         return Response(
@@ -624,9 +819,7 @@ def sp_register(request):
 
         logger.exception(
             "SP Registration failed. Email=%s Mobile=%s IP=%s",
-            email,
-            mobile,
-            ip_address,
+            email, mobile, ip_address,
         )
 
         return Response(
@@ -634,6 +827,141 @@ def sp_register(request):
                 "success": False,
                 "message": "A server error occurred. Please try again later.",
             },
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
+
+
+
+@api_view(["POST"])
+@throttle_classes([ClientOTPThrottle])
+@authentication_classes([])
+@permission_classes([AllowAny])
+def verify_sp_email(request):
+
+    ip_address = get_client_ip(request)
+    user_agent = get_device_info(request)
+
+    serializer = ClientOTPVerifySerializer(data=request.data)
+
+    if not serializer.is_valid():
+        return Response(
+            {"success": False, "errors": serializer.errors},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    otp = serializer.validated_data["otp"]
+
+    auth_header = request.headers.get("Authorization", "")
+
+    if not auth_header.startswith("Bearer "):
+        hash_otp("000000")
+        return Response(SP_INVALID_OR_EXPIRED, status=status.HTTP_400_BAD_REQUEST)
+
+    raw_verification_token = auth_header[len("Bearer "):].strip()
+
+    try:
+        validated_token = AccessToken(raw_verification_token)
+    except TokenError:
+        hash_otp("000000")
+        return Response(SP_INVALID_OR_EXPIRED, status=status.HTTP_400_BAD_REQUEST)
+
+    if validated_token.get("purpose") != "email_verification":
+        hash_otp("000000")
+        return Response(SP_INVALID_OR_EXPIRED, status=status.HTTP_400_BAD_REQUEST)
+
+    token_sp_id = validated_token.get("sp_id")
+    token_id = validated_token.get("request_id")
+
+    if not token_sp_id or not token_id:
+        hash_otp("000000")
+        return Response(SP_INVALID_OR_EXPIRED, status=status.HTTP_400_BAD_REQUEST)
+
+    try:
+        with transaction.atomic():
+
+            otp_request = (
+                SPOTP.objects
+                .select_for_update()
+                .select_related("service_provider")
+                .filter(
+                    request_id=token_id,
+                    service_provider_id=token_sp_id,
+                    purpose="email_verification",
+                )
+                .first()
+            )
+
+            if otp_request is None:
+                return Response(SP_INVALID_OR_EXPIRED, status=status.HTTP_400_BAD_REQUEST)
+
+            now = timezone.now()
+
+            if otp_request.is_used or otp_request.is_verified:
+                return Response(SP_INVALID_OR_EXPIRED, status=status.HTTP_400_BAD_REQUEST)
+
+            if now >= otp_request.expires_at:
+                return Response(SP_INVALID_OR_EXPIRED, status=status.HTTP_400_BAD_REQUEST)
+
+            if otp_request.attempts >= otp_request.max_attempts:
+                return Response(
+                    {"success": False, "message": "Too many invalid verification code attempts."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            submitted_hash = hash_otp(otp)
+            otp_valid = secrets.compare_digest(submitted_hash, otp_request.otp_hash)
+
+            if not otp_valid:
+                otp_request.attempts += 1
+                otp_request.save(update_fields=["attempts"])
+
+                if otp_request.attempts >= otp_request.max_attempts:
+                    return Response(
+                        {"success": False, "message": "Too many invalid verification code attempts."},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+
+                return Response(SP_INVALID_OR_EXPIRED, status=status.HTTP_400_BAD_REQUEST)
+
+            sp = otp_request.service_provider
+
+            # Defense in depth, matching the client flow.
+            if str(sp.id) != str(token_sp_id):
+                logger.error(
+                    "SP email verification mismatch: token=%s otp_row=%s",
+                    token_sp_id, sp.id,
+                )
+                return Response(SP_INVALID_OR_EXPIRED, status=status.HTTP_400_BAD_REQUEST)
+
+            otp_request.is_verified = True
+            otp_request.is_used = True
+            otp_request.verified_at = now
+            otp_request.save(update_fields=["is_verified", "is_used", "verified_at"])
+
+            sp.email_verified_at = now
+            sp.is_profile_completed = "in-details"
+            sp.save(update_fields=["email_verified_at", "is_profile_completed"])
+
+            tokens = generate_sp_tokens(sp)
+
+        return Response(
+            {
+                "success": True,
+                "message": "Email verified successfully.",
+                "data": {
+                    "id": sp.id,
+                    "is_profile_completed": sp.is_profile_completed,
+                    "access_token": tokens["access"],
+                    "refresh_token": tokens["refresh"],
+                },
+            },
+            status=status.HTTP_200_OK,
+        )
+
+    except Exception:
+        logger.exception("SP email verification failed unexpectedly")
+        return Response(
+            {"success": False, "message": "Unable to verify your email at this time."},
             status=status.HTTP_500_INTERNAL_SERVER_ERROR,
         )
     

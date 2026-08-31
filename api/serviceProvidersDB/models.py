@@ -1,3 +1,5 @@
+import uuid
+
 from django.conf import settings
 from django.db import models
 from django.forms import ValidationError
@@ -188,7 +190,7 @@ class SPProfile(models.Model):
         ("in-address", "In-Address"),
         ("in-services", "In-Services"),
         ("in-cost", "In-Cost"),
-        ("in_verification", "In-Verification"),
+        ("in-email-verification", "In-Verification"),
         ("completed", "Completed"),
     ]
     mfa_enabled = models.BooleanField(default=False)
@@ -200,6 +202,11 @@ class SPProfile(models.Model):
     null=True,
     blank=True
 )
+    email_verified_at = models.DateTimeField(
+            null=True,
+            blank=True,
+            db_index=True
+        )
     updated_at = models.DateField(auto_created=True,null=True, blank=True)
     date_created = models.DateField(null=True,blank=True,auto_created=True)
 
@@ -212,7 +219,7 @@ class SPProfile(models.Model):
     null=True,
     blank=True
 )
-    is_profile_completed = models.CharField(default="in-details", choices=Profile_CHOICES, max_length= 20, db_index=True)
+    is_profile_completed = models.CharField(default="in-details", choices=Profile_CHOICES, max_length= 50, db_index=True)
     is_active = models.BooleanField(default=True, db_index=True)
     class Meta:
         db_table = 'sp_profiles'
@@ -233,6 +240,64 @@ class SPProfile(models.Model):
 
     def __str__(self):
         return f"SPProfile: {self.email_address}"
+
+
+
+
+class SPOTP(models.Model):
+
+    PURPOSE_CHOICES = [
+        ("login", "Login"),
+        ("email_verification", "Email Verification"),
+    ]
+
+    request_id = models.UUIDField(
+        default=uuid.uuid4,
+        unique=True,
+        editable=False,
+        db_index=True
+    )
+
+    service_provider = models.ForeignKey(
+        SPProfile,
+        on_delete=models.CASCADE,
+        related_name="otp_requests"
+    )
+
+    purpose = models.CharField(
+        max_length=30,
+        choices=PURPOSE_CHOICES,
+        db_index=True
+    )
+
+    otp_hash = models.CharField(max_length=128)
+
+    expires_at = models.DateTimeField(db_index=True)
+
+    attempts = models.PositiveIntegerField(default=0)
+    max_attempts = models.PositiveIntegerField(default=5)
+
+    is_verified = models.BooleanField(default=False, db_index=True)
+    is_used = models.BooleanField(default=False, db_index=True)
+
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+    verified_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=["service_provider", "purpose", "is_verified"]),
+            models.Index(fields=["expires_at"]),
+        ]
+
+    def __str__(self):
+        return (
+            f"{self.service_provider.email_address} - "
+            f"{self.purpose} - "
+            f"{self.request_id}"
+        )
+
+
+    
     
 class ProviderLoginHistory(models.Model):
 

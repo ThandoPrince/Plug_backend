@@ -20,6 +20,7 @@ from api.clientsDB.services.client_history_model_helper import create_client_add
 from api.clientsDB.services.client_ip_address_helper import get_client_ip, get_device_info
 from api.clientsDB.services.client_login_token import  generate_email_login_tokenn
 from api.clientsDB.services.client_otp_token import generate_email_verification_token
+from api.clientsDB.services.email_mask_helper import mask_email
 from api.clientsDB.services.jwt_client_authentication import ClientJWTAuthentication
 from api.clientsDB.services.otp_service import create_client_otp,  hash_otp
 from api.clientsDB.services.otp_tasks import OTP_EMAIL_VERIFICATION, OTP_LOGIN, OTP_PASSWORD_RESET, OTPCooldownError, send_client_otp_email
@@ -524,6 +525,7 @@ def register_client(request):
     )
                 )
 
+
             return Response(
                 {
                     "success": True,
@@ -534,16 +536,23 @@ def register_client(request):
                     ),
                     "data": {
                         "id": client_auth.id,
-                       
+
+                        
+                        "email": mask_email(client_auth.email_address),
+
                         "requires_email_verification": True,
+
                         "otp_request_id": str(
                             otp_request.request_id
                         ),
+
                         "verification_token": verification_token,
                     }
                 },
                 status=status.HTTP_201_CREATED
             )
+
+
 
         except IntegrityError:
 
@@ -2214,6 +2223,7 @@ def client_login(request):
                     "data": {
                         "id": user.id,
                         "is_profile_completed": user.is_profile_completed,
+                        "email": mask_email(user.email_address),
                         "requires_email_verification": True,
                         "otp_request_id": str(otp_request.request_id),
                         "verification_token": verification_token,
