@@ -39,7 +39,8 @@ EMAIL_USE_TLS = get_env("EMAIL_USE_TLS", "True").lower() == "true"
 EMAIL_USE_SSL = get_env("EMAIL_USE_SSL", "False").lower() == "true"
 EMAIL_HOST_USER = get_env("EMAIL_HOST_USER", required=not DEBUG)
 EMAIL_HOST_PASSWORD = get_env("EMAIL_HOST_PASSWORD", required=not DEBUG)
-DEFAULT_FROM_EMAIL = get_env("DEFAULT_FROM_EMAIL", "onboarding@resend.dev")
+DEFAULT_FROM_EMAIL = get_env("DEFAULT_FROM_EMAIL", "support@plugprovider.co.za")
+CLOUDFLARE_ORIGIN_SECRET = get_env("CLOUDFLARE_ORIGIN_SECRET", required=not DEBUG)
 
 EMAIL_TIMEOUT = 10
 
