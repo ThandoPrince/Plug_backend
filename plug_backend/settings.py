@@ -52,7 +52,7 @@ ALLOWED_HOSTS = [
     host.strip()
     for host in get_env(
         "DJANGO_ALLOWED_HOSTS",
-        "localhost,127.0.0.1,web-production-7dfca.up.railway.app,10.0.2.2"
+        "localhost,127.0.0.1,api.plugprovider.co.za,api.plugprovider.co.za,www.api.plugprovider.co.za"
     ).split(",")
     if host.strip()
 ]
@@ -61,7 +61,7 @@ CSRF_TRUSTED_ORIGINS = [
     origin.strip()
     for origin in get_env(
         "DJANGO_CSRF_TRUSTED_ORIGINS",
-        "http://127.0.0.1,http://localhost,https://web-production-7dfca.up.railway.app"
+        "http://127.0.0.1,http://localhost,https://api.plugprovider.co.za,https://www.api.plugprovider.co.za"
     ).split(",")
     if origin.strip()
 ]
@@ -137,7 +137,7 @@ DATABASES = {
             f"{get_env('DB_NAME', 'plug_db')}"
         ),
         conn_max_age=0,
-        ssl_require=False,
+        ssl_require=True,
     )
 }
 
@@ -230,6 +230,10 @@ else:
             },
         }
     }
+
+SECURE_SSL_REDIRECT = not DEBUG
+SECURE_HSTS_SECONDS = 31536000 if not DEBUG else 0
+SECURE_CONTENT_TYPE_NOSNIFF = True
 
 SESSION_GEOFENCE_RADIUS_METERS = int(get_env("SESSION_GEOFENCE_RADIUS_METERS", "45"))
 SESSION_GEOFENCE_GRACE_SECONDS = int(get_env("SESSION_GEOFENCE_GRACE_SECONDS", "120"))
