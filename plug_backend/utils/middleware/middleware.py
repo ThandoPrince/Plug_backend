@@ -1,10 +1,13 @@
+import hmac
 import ipaddress
+import logging
 
 from django.http import HttpResponseForbidden
 
+logger = logging.getLogger(__name__)
 
 # Cloudflare's published IP ranges.
-# Keep these updated if Cloudflare changes their ranges.
+# Kept as a defense-in-depth secondary check — not the primary gate anymore.
 CLOUDFLARE_IP_RANGES = [
     # IPv4
     "173.245.48.0/20",
@@ -33,7 +36,6 @@ CLOUDFLARE_IP_RANGES = [
     "2c0f:f248::/32",
 ]
 
-
 CLOUDFLARE_NETWORKS = [
     ipaddress.ip_network(network)
     for network in CLOUDFLARE_IP_RANGES
@@ -52,12 +54,19 @@ def is_cloudflare_ip(ip: str) -> bool:
 class CloudflareOnlyMiddleware:
     """
     Production:
-        Only allow requests whose actual TCP source IP belongs
-        to Cloudflare.
+        Only allow requests carrying the shared secret header that
+        Cloudflare injects via a Transform Rule at the edge. This is
+        the primary check because on platforms like Railway, the TCP
+        connection to Django is made by Railway's own proxy layer, not
+        directly by Cloudflare — so REMOTE_ADDR never reflects
+        Cloudflare's edge IP, making IP-based verification unreliable
+        here.
 
     Local development:
         Allow localhost/private development traffic when DEBUG=True.
     """
+
+    HEADER_NAME = "HTTP_X_ORIGIN_AUTH"
 
     def __init__(self, get_response):
         self.get_response = get_response
@@ -69,9 +78,19 @@ class CloudflareOnlyMiddleware:
         if settings.DEBUG:
             return self.get_response(request)
 
-        remote_ip = request.META.get("REMOTE_ADDR", "")
+        provided_secret = request.META.get(self.HEADER_NAME, "")
+        expected_secret = settings.CLOUDFLARE_ORIGIN_SECRET
 
-        if not is_cloudflare_ip(remote_ip):
+        if not provided_secret or not hmac.compare_digest(
+            provided_secret, expected_secret
+        ):
+            logger.warning(
+                "CloudflareOnlyMiddleware: blocked request without valid "
+                "origin secret. REMOTE_ADDR=%s CF-Ray=%s path=%s",
+                request.META.get("REMOTE_ADDR", ""),
+                request.META.get("HTTP_CF_RAY", ""),
+                request.path,
+            )
             return HttpResponseForbidden(
                 "Direct access to this origin is not allowed."
             )
