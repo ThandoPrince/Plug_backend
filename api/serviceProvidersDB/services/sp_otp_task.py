@@ -1,9 +1,15 @@
+import logging
 from celery import shared_task
-from django.core.mail import EmailMultiAlternatives
-from psycopg import logger
 from django.conf import settings
+from django.core.mail import EmailMultiAlternatives
 
-from api.clientsDB.services.otp_tasks import OTP_EMAIL_VERIFICATION, OTP_LOGIN
+from api.clientsDB.services.otp_tasks import (
+    OTP_EMAIL_VERIFICATION,
+    OTP_LOGIN,
+    OTP_PASSWORD_RESET,
+)
+
+logger = logging.getLogger(__name__)
 
 
 @shared_task(
@@ -24,16 +30,13 @@ def send_sp_otp_email(self, email_address, otp, purpose):
     """
 
     if purpose == OTP_LOGIN:
-
         subject = "Your Plug provider login verification code"
-
         text_content = (
             f"Your Plug provider login verification code is: {otp}\n\n"
             "This code expires in 5 minutes.\n\n"
             "If you did not attempt to log in to your "
             "Plug provider account, you can safely ignore this email."
         )
-
         html_content = f"""
         <html>
             <body>
@@ -50,9 +53,7 @@ def send_sp_otp_email(self, email_address, otp, purpose):
         """
 
     elif purpose == OTP_EMAIL_VERIFICATION:
-
         subject = "Verify your Plug provider email address"
-
         text_content = (
             f"Your Plug provider email verification code is: {otp}\n\n"
             "Enter this code in the Plug app to verify "
@@ -61,7 +62,6 @@ def send_sp_otp_email(self, email_address, otp, purpose):
             "If you did not create a Plug provider account, "
             "you can safely ignore this email."
         )
-
         html_content = f"""
         <html>
             <body>
@@ -77,8 +77,39 @@ def send_sp_otp_email(self, email_address, otp, purpose):
         </html>
         """
 
+    elif purpose == OTP_PASSWORD_RESET:
+        subject = "Reset your Plug provider password"
+        text_content = (
+            f"Your Plug provider password reset code is: {otp}\n\n"
+            "Enter this code in the Plug app to reset your password.\n\n"
+            "This code expires in 5 minutes.\n\n"
+            "If you did not request a password reset, "
+            "you can safely ignore this email — your password "
+            "will not be changed."
+        )
+        html_content = f"""
+        <html>
+            <body>
+                <h2>Reset Your Plug Provider Password</h2>
+                <p>
+                    Use the verification code below to
+                    reset your password:
+                </p>
+                <h1>{otp}</h1>
+                <p>
+                    This code expires in <strong>5 minutes</strong>.
+                </p>
+                <p>
+                    If you did not request a password reset,
+                    you can safely ignore this email — your
+                    password will not be changed.
+                </p>
+            </body>
+        </html>
+        """
+
     else:
-        raise ValueError("Unsupported OTP purpose.")
+        raise ValueError(f"Unsupported OTP purpose: {purpose}")
 
     email = EmailMultiAlternatives(
         subject=subject,

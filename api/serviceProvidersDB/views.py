@@ -1,3 +1,5 @@
+import re
+from django.contrib.auth.hashers import check_password, make_password
 from django.utils import timezone
 from decimal import Decimal, InvalidOperation
 import json
@@ -31,9 +33,11 @@ from api.clientsDB.services.client_ip_address_helper import get_client_ip, get_d
 from api.clientsDB.services.jwt_client_authentication import ClientJWTAuthentication
 
 from api.clientsDB.services.otp_service import hash_otp
-from api.clientsDB.services.otp_tasks import OTP_EMAIL_VERIFICATION, OTP_LOGIN, OTPCooldownError
+from api.clientsDB.services.otp_tasks import OTP_EMAIL_VERIFICATION, OTP_LOGIN, OTP_PASSWORD_RESET, OTPCooldownError
+from api.clientsDB.services.sa_phone_number_helper import normalize_sa_mobile
 from api.serviceProvidersDB.services.affidavit_hash_calcultor import calculate_sha256
 from api.serviceProvidersDB.services.affidavit_verification_service import AIKYCClient
+from api.serviceProvidersDB.services.generate_sp_password_reset_token import generate_sp_password_reset_token
 from api.serviceProvidersDB.services.kyc_verification_service import KYCService
 from api.serviceProvidersDB.services.otp_utils import create_sp_otp
 from api.serviceProvidersDB.services.service_validator import validate_service_submission
@@ -965,6 +969,408 @@ def verify_sp_email(request):
             status=status.HTTP_500_INTERNAL_SERVER_ERROR,
         )
     
+
+
+SP_PASSWORD_RESET_INVALID_OR_EXPIRED = {
+    "success": False,
+    "message": "Invalid or expired verification code.",
+}
+
+
+@api_view(["POST"])
+@throttle_classes([ClientOTPThrottle])
+@authentication_classes([])
+@permission_classes([AllowAny])
+def reset_sp_password(request):
+
+    try:
+        new_password = request.data.get("new_password")
+        otp = request.data.get("otp")
+
+        if not new_password:
+            return Response(
+                {"error": "new_password is required"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        if not otp:
+            return Response(
+                {"error": "otp is required"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # ------------------------
+        # Password complexity rules
+        # (same as client, plus a required special character)
+        # ------------------------
+        errors = []
+
+        if len(new_password) < 8:
+            errors.append("Password must be at least 8 characters.")
+        if not re.search(r'[A-Z]', new_password):
+            errors.append("Password must contain at least one uppercase letter.")
+        if not re.search(r'[a-z]', new_password):
+            errors.append("Password must contain at least one lowercase letter.")
+        if not re.search(r'\d', new_password):
+            errors.append("Password must contain at least one digit.")
+        if not re.search(r'[^\w\s]', new_password):
+            errors.append("Password must contain at least one special character.")
+
+        if errors:
+            return Response({"error": errors}, status=status.HTTP_400_BAD_REQUEST)
+
+        # --------------------------------------------------
+        # EXTRACT + VALIDATE VERIFICATION TOKEN FROM HEADER
+        # --------------------------------------------------
+        auth_header = request.headers.get("Authorization", "")
+
+        if not auth_header.startswith("Bearer "):
+            hash_otp("000000")
+            return Response(SP_PASSWORD_RESET_INVALID_OR_EXPIRED, status=status.HTTP_400_BAD_REQUEST)
+
+        raw_verification_token = auth_header[len("Bearer "):].strip()
+
+        try:
+            validated_token = AccessToken(raw_verification_token)
+
+        except TokenError:
+            hash_otp("000000")
+            return Response(SP_PASSWORD_RESET_INVALID_OR_EXPIRED, status=status.HTTP_400_BAD_REQUEST)
+
+        if validated_token.get("purpose") != "password_reset":
+            hash_otp("000000")
+            return Response(SP_PASSWORD_RESET_INVALID_OR_EXPIRED, status=status.HTTP_400_BAD_REQUEST)
+
+        token_sp_id = validated_token.get("sp_id")
+        token_request_id = validated_token.get("request_id")
+
+        if not token_sp_id or not token_request_id:
+            hash_otp("000000")
+            return Response(SP_PASSWORD_RESET_INVALID_OR_EXPIRED, status=status.HTTP_400_BAD_REQUEST)
+
+        with transaction.atomic():
+
+            otp_request = (
+                SPOTP.objects
+                .select_for_update()
+                .select_related("service_provider")
+                .filter(
+                    request_id=token_request_id,
+                    service_provider_id=token_sp_id,
+                    purpose="password_reset",
+                )
+                .first()
+            )
+
+            if otp_request is None:
+                hash_otp("000000")
+                return Response(SP_PASSWORD_RESET_INVALID_OR_EXPIRED, status=status.HTTP_400_BAD_REQUEST)
+
+            sp = otp_request.service_provider
+            now = timezone.now()
+
+            if sp.account_locked_until and sp.account_locked_until > now:
+                return Response(
+                    {
+                        "error": [
+                            "Account is temporarily locked. Try again later."
+                        ]
+                    },
+                    status=status.HTTP_403_FORBIDDEN
+                )
+
+            if otp_request.is_used or otp_request.is_verified:
+                hash_otp("000000")
+                return Response(SP_PASSWORD_RESET_INVALID_OR_EXPIRED, status=status.HTTP_400_BAD_REQUEST)
+
+            if now >= otp_request.expires_at:
+                hash_otp("000000")
+                return Response(SP_PASSWORD_RESET_INVALID_OR_EXPIRED, status=status.HTTP_400_BAD_REQUEST)
+
+            if otp_request.attempts >= otp_request.max_attempts:
+                hash_otp("000000")
+                return Response(
+                    {"success": False, "message": "Too many invalid OTP attempts."},
+                    status=status.HTTP_429_TOO_MANY_REQUESTS
+                )
+
+            submitted_hash = hash_otp(otp)
+            otp_valid = secrets.compare_digest(submitted_hash, otp_request.otp_hash)
+
+            if not otp_valid:
+                otp_request.attempts += 1
+                otp_request.save(update_fields=["attempts"])
+
+                if otp_request.attempts >= otp_request.max_attempts:
+                    return Response(
+                        {"success": False, "message": "Too many invalid OTP attempts."},
+                        status=status.HTTP_429_TOO_MANY_REQUESTS
+                    )
+
+                return Response(SP_PASSWORD_RESET_INVALID_OR_EXPIRED, status=status.HTTP_400_BAD_REQUEST)
+
+            # Defense in depth: confirm the OTP row's SP actually
+            # matches the token's claimed sp_id.
+            if str(sp.id) != str(token_sp_id):
+                logger.error(
+                    "SP password reset OTP mismatch: token=%s otp_row=%s",
+                    token_sp_id, sp.id,
+                )
+                return Response(SP_PASSWORD_RESET_INVALID_OR_EXPIRED, status=status.HTTP_400_BAD_REQUEST)
+
+            # Prevent password reuse
+            if check_password(new_password, sp.password):
+                return Response(
+                    {"error": ["New password cannot be the same as the old password."]},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+            otp_request.is_verified = True
+            otp_request.is_used = True
+            otp_request.verified_at = now
+            otp_request.save(update_fields=["is_verified", "is_used", "verified_at"])
+
+            sp.password = make_password(new_password)
+            sp.failed_login_attempts = 0
+            sp.account_locked_until = None
+            sp.save(update_fields=[
+                "password", "failed_login_attempts", "account_locked_until"
+            ])
+
+        return Response(
+            {"success": True, "message": "Password reset successfully"},
+            status=status.HTTP_200_OK
+        )
+
+    except Exception:
+        logger.exception("Unexpected error in reset_sp_password")
+        return Response(
+            {"error": "Unable to reset password at this time."},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR
+        )
+
+
+@api_view(["POST"])
+@permission_classes([AllowAny])
+@throttle_classes([AuthThrottle])
+def request_sp_password_reset(request):
+
+    try:
+        email = request.data.get("email")
+        mobile_number = request.data.get("mobile_number")
+
+        if not email and not mobile_number:
+            return Response(
+                {"error": "Provide email or mobile_number"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        if email:
+            email = email.strip().lower()
+
+        if mobile_number:
+            mobile_number = normalize_sa_mobile(mobile_number)
+            if not mobile_number:
+                return Response(
+                    {"error": "Invalid mobile number format"},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+        query = Q()
+        if email:
+            query |= Q(email_address__iexact=email)
+        if mobile_number:
+            query |= Q(mobile_number=mobile_number)
+
+        try:
+            sp = SPProfile.objects.get(query)
+
+        except SPProfile.DoesNotExist:
+            return Response(
+                {"error": "Service provider not found"},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+        except SPProfile.MultipleObjectsReturned:
+            return Response(
+                {"error": "Multiple accounts found. Contact support."},
+                status=status.HTTP_409_CONFLICT
+            )
+
+        if (
+            sp.account_locked_until and
+            sp.account_locked_until > timezone.now()
+        ):
+            return Response(
+                {
+                    "error": [
+                        "Account is temporarily locked. Try again later."
+                    ]
+                },
+                status=status.HTTP_403_FORBIDDEN
+            )
+
+        try:
+            otp_request, otp = create_sp_otp(
+                service_provider=sp,
+                purpose=OTP_PASSWORD_RESET,
+            )
+
+        except OTPCooldownError as e:
+            return Response(
+                {
+                    "success": False,
+                    "message": (
+                        f"Please wait {e.retry_after} seconds "
+                        "before requesting another code."
+                    ),
+                },
+                status=status.HTTP_429_TOO_MANY_REQUESTS,
+            )
+
+        verification_token = generate_sp_password_reset_token(sp, otp_request)
+
+        transaction.on_commit(
+            lambda: send_sp_otp_email.delay(
+                sp.email_address,
+                otp,
+                OTP_PASSWORD_RESET,
+            )
+        )
+
+        return Response(
+            {
+                "success": True,
+                "message": "A verification code has been sent to your email.",
+                "data": {
+                    "otp_request_id": str(otp_request.request_id),
+                    "verification_token": verification_token,
+                },
+            },
+            status=status.HTTP_200_OK,
+        )
+
+    except Exception:
+        logger.exception("Unexpected error in request_sp_password_reset")
+        return Response(
+            {"error": "Unable to process request at this time."},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR
+        )
+
+
+
+
+@api_view(["POST"])
+@throttle_classes([ClientOTPThrottle])
+@authentication_classes([])
+@permission_classes([AllowAny])
+def resend_sp_otp(request):
+
+    auth_header = request.headers.get("Authorization", "")
+
+    if not auth_header.startswith("Bearer "):
+        return Response(SP_INVALID_OR_EXPIRED, status=status.HTTP_400_BAD_REQUEST)
+
+    raw_verification_token = auth_header[len("Bearer "):].strip()
+
+    try:
+        validated_token = AccessToken(raw_verification_token)
+    except TokenError:
+        return Response(SP_INVALID_OR_EXPIRED, status=status.HTTP_400_BAD_REQUEST)
+
+    purpose = validated_token.get("purpose")
+
+    if purpose not in ("login", "email_verification"):
+        return Response(SP_INVALID_OR_EXPIRED, status=status.HTTP_400_BAD_REQUEST)
+
+    token_sp_id = validated_token.get("sp_id")
+    token_request_id = validated_token.get("request_id")
+
+    if not token_sp_id or not token_request_id:
+        return Response(SP_INVALID_OR_EXPIRED, status=status.HTTP_400_BAD_REQUEST)
+
+    try:
+        sp = SPProfile.objects.filter(id=token_sp_id).first()
+
+        if sp is None:
+            return Response(SP_INVALID_OR_EXPIRED, status=status.HTTP_400_BAD_REQUEST)
+
+        # -----------------------------------------------------
+        # Confirm the original OTP challenge this token was
+        # issued for still exists and hasn't already been
+        # completed. Without this check, a token from a login
+        # that already succeeded (or an email that's already
+        # verified) could be replayed indefinitely to spam
+        # new codes for that same sp/purpose.
+        # -----------------------------------------------------
+
+        original = (
+            SPOTP.objects
+            .filter(
+                request_id=token_request_id,
+                service_provider_id=token_sp_id,
+                purpose=purpose,
+            )
+            .first()
+        )
+
+        if original is None:
+            return Response(SP_INVALID_OR_EXPIRED, status=status.HTTP_400_BAD_REQUEST)
+
+        if original.is_verified:
+            return Response(SP_INVALID_OR_EXPIRED, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            otp_request, otp = create_sp_otp(
+                service_provider=sp,
+                purpose=purpose,
+            )
+        except OTPCooldownError as e:
+            return Response(
+                {
+                    "success": False,
+                    "message": f"Please wait {e.retry_after} seconds before requesting another code.",
+                },
+                status=status.HTTP_429_TOO_MANY_REQUESTS,
+            )
+
+        if purpose == "login":
+            verification_token = generate_sp_login_token(sp, otp_request)
+        else:
+            verification_token = generate_sp_email_verification_token(sp, otp_request)
+
+        transaction.on_commit(
+            lambda: send_sp_otp_email.delay(
+                sp.email_address,
+                otp,
+                purpose,
+            )
+        )
+
+        return Response(
+            {
+                "success": True,
+                "message": "A new verification code has been sent to your email.",
+                "data": {
+                    "id": sp.id,
+                    "is_profile_completed": sp.is_profile_completed,
+                    "requires_email_verification": True,
+                    "otp_request_id": str(otp_request.request_id),
+                    "verification_token": verification_token,
+                },
+            },
+            status=status.HTTP_200_OK,
+        )
+
+    except Exception:
+        logger.exception("SP OTP resend failed unexpectedly")
+        return Response(
+            {
+                "success": False,
+                "message": "Unable to resend verification code at this time.",
+            },
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
     
 @api_view(['POST'])
 @throttle_classes([RegisterThrottle])

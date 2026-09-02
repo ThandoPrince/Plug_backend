@@ -140,7 +140,8 @@ path(
     "api/provider/logout/",
     sp_views.provider_logout,
     name="provider-logout",
-), 
+), path('api/sp/password-reset/request/', sp_views.request_sp_password_reset, name='sp-request-password-reset'),
+path('api/sp/password-reset/confirm/', sp_views.reset_sp_password, name='sp-reset-password'),
 
     path(
         "api/provider-services/<int:service_id>/qualifications/",
@@ -232,6 +233,7 @@ path(
     path('api/serviceProvider/cost/<int:cost_id>/images/',sp_views.upload_service_images,name='upload_service_images'),
     path('api/providers/toggle-active/',sp_views.toggle_provider_active,name='toggle-provider-active'), ##used
     path('api/sp/register/device-token/', sp_views.register_device_token, name='sp-register-device-token'), ##used
+    path('api/sp/otp/resend/', sp_views.resend_sp_otp, name='sp-resend-otp'), ##used
 
     path('api/sp/verify/login-otp/', sp_views.verify_sp_login_otp, name='sp-verify-login-otp'), ##used
     path('api/sp/verify/email-otp/', sp_views.verify_sp_email, name='sp-verify-email-otp'), ##used
