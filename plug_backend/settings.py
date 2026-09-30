@@ -138,7 +138,7 @@ DATABASES = {
             f"{get_env('DB_NAME', 'plug_db')}"
         ),
         conn_max_age=0,
-        ssl_require=True,
+        ssl_require=not DEBUG,
     )
 }
 
@@ -198,6 +198,7 @@ REST_FRAMEWORK = {
         "upload": "10/min",
         "profile_write": "20/min",
         "booking_like_write": "15/min",
+        "account_delete": "3/day",
     },
     "DEFAULT_AUTHENTICATION_CLASSES": (
         "rest_framework_simplejwt.authentication.JWTAuthentication",
@@ -248,6 +249,10 @@ CELERY_RESULT_BACKEND = get_env("REDIS_URL", "redis://127.0.0.1:6379/0")
 CELERY_ACCEPT_CONTENT = ["json"]
 
 CELERY_TASK_SERIALIZER = "json"
+CELERY_TASK_IGNORE_RESULT = True          # you almost certainly never call .get()
+CELERY_BROKER_POOL_LIMIT = 2
+CELERY_WORKER_PREFETCH_MULTIPLIER = 1
+CELERY_BROKER_CONNECTION_RETRY_ON_STARTUP = True
 
 CELERY_RESULT_SERIALIZER = "json"
 

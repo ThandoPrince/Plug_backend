@@ -1,10 +1,12 @@
 from datetime import timedelta
+from decimal import Decimal
 import json
 import logging
 from types import SimpleNamespace
 from django.conf import settings
 from django.utils import timezone
 from django.shortcuts import get_object_or_404
+from psycopg import logger
 from rest_framework.decorators import api_view, authentication_classes, permission_classes, throttle_classes
 from rest_framework.response import Response
 from rest_framework import status
@@ -14,7 +16,7 @@ from api.bookings.events.event_base import EventBus
 from api.bookings.events.negotiation_events import NegotiationRoundCreatedEvent
 from api.bookings.events.order_events import NegotiationCreatedEvent, OrderAcceptedEvent, OrderCancelledEvent, OrderCreatedEvent, OrderRescheduledEvent, ProviderDeclinedInvitationEvent, ProviderOrderCancelledEvent
 from api.bookings.events.websoket_event_emitters.shipment_event_emitters import push_session_completed, push_session_created, push_shipment_status_update
-from api.bookings.events.ws_events import notify_provider_booking_update
+from api.bookings.events.ws_events import notify_client_booking, notify_client_negotiation_round, notify_client_negotiation_status_changed, notify_client_shipment_status, notify_provider_booking_update
 from api.bookings.services.calculate_distance_meters import calculate_distance_meters
 from api.bookings.services.order_status_service import OrderStatusService
 from api.bookings.services.shipment_transition_function import InvalidShipmentTransition, transition_shipment
@@ -204,7 +206,7 @@ def provider_order_service_detail(request, pk):
 def negotiation_list(request):
     """List negotiations belonging to the authenticated provider."""
 
-    provider = get_provider_profile(request)
+    provider = get_sp_profile(request)
 
     negotiations = (
         Negotiation.objects
@@ -418,6 +420,33 @@ def provider_accept_negotiation(request, negotiation_id):
                 {"detail": "No provider assigned to this negotiation."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
+        final_price = (
+            negotiation.provider_response_price
+            or negotiation.proposed_price
+        )
+
+        if final_price is None:
+            return Response(
+                {"detail": "No valid negotiation price is available."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if order.proposal_price is not None:
+            min_allowed = (
+                order.proposal_price * MIN_OFFER_RATIO
+            ).quantize(Decimal("0.01"))
+
+            if final_price < min_allowed:
+                return Response(
+                    {
+                        "error": (
+                           
+                            f"proposed price. Minimum allowed is R{min_allowed}."
+                        ),
+                        "minimum_allowed": str(min_allowed),
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
 
         with transaction.atomic():
 
@@ -439,21 +468,28 @@ def provider_accept_negotiation(request, negotiation_id):
             order.invited_providers.clear()
 
             transaction.on_commit(
-    lambda: (
-        EventBus.emit(
-            OrderAcceptedEvent({
-                "order": order,
-                "negotiation": negotiation,
-                "provider_service": provider_service,
-            })
-        ),
-        
-        notify_provider_booking_update(
-            provider_id=provider.sp_profile.id,
-            payload=OrderServiceReadSerializer(order).data,
-        ),
-    )
-)
+                lambda: (
+                    EventBus.emit(
+                        OrderAcceptedEvent({
+                            "order": order,
+                            "negotiation": negotiation,
+                            "provider_service": provider_service,
+                        })
+                    ),
+
+                    notify_provider_booking_update(
+                        provider_id=provider.sp_profile.id,
+                        payload=OrderServiceReadSerializer(order).data,
+                    ),
+
+                    _send_status_changed(negotiation, order),
+
+                    notify_client_booking(
+                        client_id=order.client.client_profile.id,
+                        payload=OrderServiceReadSerializer(order).data,
+                    ),
+                )
+            )
 
         return Response(
             {
@@ -485,6 +521,35 @@ def provider_accept_negotiation(request, negotiation_id):
             {"error": "An unexpected error occurred while accepting the negotiation."},
             status=status.HTTP_500_INTERNAL_SERVER_ERROR,
         )
+
+##websocket heper
+
+def _send_status_changed(negotiation, order):
+    channel_layer = get_channel_layer()
+
+    status_payload = {
+        "negotiation_id": negotiation.negotiation_id,
+        "status": negotiation.status,
+        "final_price": str(order.final_price),
+        "order_id": order.order_id,
+    }
+
+    async_to_sync(channel_layer.group_send)(
+        f"negotiation_{negotiation.negotiation_id}",
+        build_negotiation_event(
+            "negotiation_status_changed",
+            negotiation.negotiation_id,
+            status_payload,
+        ),
+    )
+
+    async_to_sync(channel_layer.group_send)(
+        f"client_{order.client.client_profile.id}",
+        {
+            "type": "negotiation_status_changed",
+            "data": status_payload,
+        },
+    )
 
 
 
@@ -804,7 +869,7 @@ def remove_from_invited_providers(request, order_id):
         },
         status=status.HTTP_200_OK,
     )
-
+MIN_OFFER_RATIO = Decimal("0.60") 
 
 @api_view(['POST'])
 @authentication_classes([SPJWTAuthentication])
@@ -835,6 +900,20 @@ def provider_start_round(request, negotiation_id):
     serializer.is_valid(raise_exception=True)
     offered_price = serializer.validated_data['offered_price']
     message = serializer.validated_data.get('message', '')
+
+    if order.proposal_price is not None:
+        min_allowed = (order.proposal_price * MIN_OFFER_RATIO).quantize(Decimal("0.01"))
+
+        if offered_price < min_allowed:
+            return Response(
+                {
+                    "error": (         
+                        f"proposed price. Minimum allowed is R{min_allowed}."
+                    ),
+                    "minimum_allowed": str(min_allowed),
+                },
+                status=status.HTTP_400_BAD_REQUEST
+            )
 
     with transaction.atomic():
         # Prevent exceeding the allowed number of rounds
@@ -867,14 +946,39 @@ def provider_start_round(request, negotiation_id):
 )
         channel_layer = get_channel_layer()
 
+        round_payload = {
+            "negotiation_id": negotiation.negotiation_id,
+            "round": NegotiationRoundReadSerializer(new_round).data,
+        }
+
+        # Sheet-open listeners: NegotiationConsumer forwards the raw event
+        # as-is, so it needs the full envelope (type/negotiation_id/timestamp/data).
         async_to_sync(channel_layer.group_send)(
-        f"negotiation_{negotiation.negotiation_id}",
-        build_negotiation_event(
-        "negotiation_round_created",
-        negotiation.negotiation_id,
-        NegotiationRoundReadSerializer(new_round).data
-    )
-)
+            f"negotiation_{negotiation.negotiation_id}",
+            build_negotiation_event(
+                "negotiation_round_created",
+                negotiation.negotiation_id,
+                round_payload,
+            ),
+        )
+
+        # Client's personal feed: ClientOrderConsumer only forwards
+        # event["data"], so send the same round_payload as "data" directly.
+        async_to_sync(channel_layer.group_send)(
+            f"client_{order.client.client_profile.id}",
+            {
+                "type": "negotiation_round_created",
+                "data": round_payload,
+            },
+        )
+        notify_client_negotiation_round(
+            client_id=order.client.client_profile.id,
+            payload=build_negotiation_event(
+                "negotiation_round_created",
+                negotiation.negotiation_id,
+                NegotiationRoundReadSerializer(new_round).data
+            )["data"],
+        )
     
 
         # Let signals handle:
@@ -884,6 +988,13 @@ def provider_start_round(request, negotiation_id):
 
     read_serializer = NegotiationRoundReadSerializer(new_round)
     return Response(read_serializer.data, status=status.HTTP_201_CREATED)
+
+
+
+from django.core.cache import cache
+
+PRICE_PATCH_COOLDOWN_SECONDS = 300  # 5 minutes
+
 
 @api_view(['PATCH'])
 @authentication_classes([ClientJWTAuthentication])
@@ -905,6 +1016,25 @@ def patch_order_final_price(request, order_id):
             status=status.HTTP_403_FORBIDDEN
         )
 
+    # ---------------- RATE LIMIT (5 MIN PER ORDER) ----------------
+    cooldown_key = f"order_final_price_patch:{order_id}"
+    last_patched = cache.get(cooldown_key)
+
+    if last_patched is not None:
+        retry_after = (
+            PRICE_PATCH_COOLDOWN_SECONDS
+            - (timezone.now() - last_patched).total_seconds()
+        )
+
+        if retry_after > 0:
+            return Response(
+                {
+                    "detail": "You can only update the price once every 5 minutes.",
+                    "retry_after_seconds": int(retry_after),
+                },
+                status=status.HTTP_429_TOO_MANY_REQUESTS
+            )
+
     serializer = OrderFinalPricePatchSerializer(
         order,
         data=request.data,
@@ -917,16 +1047,44 @@ def patch_order_final_price(request, order_id):
             status=status.HTTP_400_BAD_REQUEST
         )
 
+    # ---------------- FINAL PRICE FLOOR ----------------
+    new_final_price = serializer.validated_data.get("final_price")
+
+    if new_final_price is not None and order.final_price is not None:
+        min_allowed = (
+            order.final_price * Decimal("0.33")
+        ).quantize(Decimal("0.01"))
+
+        if new_final_price < min_allowed:
+            return Response(
+                {
+                    "error": (
+                       
+                        f"Minimum allowed is R{min_allowed}."
+                    ),
+                    "minimum_allowed": str(min_allowed),
+                },
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
     serializer.save()
-    EventBus.emit(
-    SimpleNamespace(
-        name="order.final_price_updated",
-        payload={
-            "order": order,
-            "final_price": serializer.data.get("final_price"),
-        }
+
+    # Only set the cooldown on a successful patch
+    cache.set(
+        cooldown_key,
+        timezone.now(),
+        timeout=PRICE_PATCH_COOLDOWN_SECONDS
     )
-)
+
+    EventBus.emit(
+        SimpleNamespace(
+            name="order.final_price_updated",
+            payload={
+                "order": order,
+                "final_price": serializer.data.get("final_price"),
+            }
+        )
+    )
 
     return Response(
         {
@@ -985,9 +1143,26 @@ def client_start_round(request, negotiation_id):
         offered_price = serializer.validated_data['offered_price']
         message = serializer.validated_data.get('message', '')
 
+        # 💰 Enforce minimum allowed offer
+        if order.proposal_price is not None:
+            min_allowed = (
+                order.proposal_price * MIN_OFFER_RATIO
+            ).quantize(Decimal("0.01"))
+
+            if offered_price < min_allowed:
+                return Response(
+                    {
+                        "error": (
+                            f"proposed price. Minimum allowed is R{min_allowed}."
+                        ),
+                        "minimum_allowed": str(min_allowed),
+                    },
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
         with transaction.atomic():
 
-            # ❌ round limit check
+  
             if negotiation.round_count >= negotiation.max_rounds:
                 return Response(
                     {"detail": "Maximum negotiation rounds reached."},
@@ -1003,16 +1178,11 @@ def client_start_round(request, negotiation_id):
             )
 
             EventBus.emit(
-    NegotiationCreatedEvent({
-        "negotiation": negotiation,
-        "round": new_round,
-    })
-)
-
-      
-        
-
-        # ✅ response
+                NegotiationCreatedEvent({
+                    "negotiation": negotiation,
+                    "round": new_round,
+                })
+            )
         return Response(
             NegotiationRoundReadSerializer(new_round).data,
             status=status.HTTP_201_CREATED
@@ -1031,6 +1201,8 @@ def client_start_round(request, negotiation_id):
             {"detail": "Unexpected server error."},
             status=status.HTTP_500_INTERNAL_SERVER_ERROR
         )
+
+    
     
 @api_view(['GET'])
 @throttle_classes([HeavyReadThrottle])
@@ -1241,12 +1413,12 @@ def change_shipment_status(request, shipment_id):
 
     shipment = get_object_or_404(
         Shipment.objects.select_related(
-            "service_ordered__order__provider_for_service"
+            "service_ordered__order__provider_for_service",
+            "service_ordered__order__client__client_profile",
         ),
         shipment_id=shipment_id,
         service_ordered__order__provider_for_service__provider__sp_profile=provider,
     )
-
 
     if not new_status:
         return Response(
@@ -1265,10 +1437,23 @@ def change_shipment_status(request, shipment_id):
     except InvalidShipmentTransition as e:
         return Response({"error": str(e)}, status=400)
 
+    order = shipment.service_ordered.order
+
+    notify_client_shipment_status(
+        client_id=order.client.client_profile.id,
+        payload={
+            "shipment_id": shipment.shipment_id,
+            "order_id": order.order_id,
+            "status": shipment.shipment_status,
+        },
+    )
+
     return Response(
         ShipmentReadSerializer(shipment).data,
         status=status.HTTP_200_OK
     )
+
+
 
 @api_view(["GET"])
 @authentication_classes([ClientJWTAuthentication])

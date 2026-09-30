@@ -19,7 +19,7 @@ def api_root(request):
     })
 
 urlpatterns = [
-    # path('admin/', admin.site.urls),
+    path('admin/', admin.site.urls),
 
   
     path('api/', api_root, name='api-root'),
@@ -40,7 +40,7 @@ urlpatterns = [
 
     path(
         "api/client/token/refresh/",
-        TokenRefreshView.as_view(),
+        views.client_token_refresh,
         name="client_token_refresh",
     ),
     # path('api/clientsDB/addresses/', views.address_list, name='address-list'),
@@ -101,12 +101,21 @@ path(
 path("api/client/login/resend-otp/", views.resend_client_otp, name="resend_client_otp"),
 path("api/client/login/resend-login-otp/", views.resend_client_login_otp, name="resend_login_client_otp"),
 path("api/client/login/password-reset-otp/", views.request_client_password_reset, name="reset_pass_client_otp"),
+path("api/client/request-password-reset-otp/", views.request_password_reset_otp, name="client-auth-reset-otp-request"),
+path("api/client/reset-password-with-otp/",    views.reset_password_with_otp,    name="client-auth-reset-with-otp"),
+path("api/client/delete-account/",    views.delete_client_account,    name="client-auth-reset-with-otp"),
 
     path(
         "api/client/login/verify-email/",
         views.verify_client_email,
         name="client-login-verify-email",
     ),
+
+    path(
+            "api/client/change-password/",
+            views.change_password,
+            name="client-change-password",
+        ),
 
 
         
@@ -190,6 +199,11 @@ path('api/service_providerDB/sps_by_live_location/',
     "api/provider-qualifications/<int:provider_service_id>/",
     sp_views.get_provider_qualifications,
     name="get_provider_qualification",
+),
+path(
+    "api/client/provider-qualifications/<int:provider_id>/<int:service_id>/",
+    views.get_provider_qualifications_client,
+    name="client_get_provider_qualification",
 ),
 
 path(

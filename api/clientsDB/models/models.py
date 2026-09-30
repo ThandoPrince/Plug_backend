@@ -94,6 +94,7 @@ class ClientAuth(models.Model):
         null=True,
         blank=True,db_index=True
     )
+    deleted_at = models.DateTimeField(null=True, blank=True, db_index=True)
 
     mobile_number = models.CharField(
         max_length=60,
@@ -118,6 +119,7 @@ class ClientAuth(models.Model):
         blank=True,
         db_index=True
     )
+    session_version = models.PositiveIntegerField(default=0)
 
 
     password = models.CharField(max_length=128)
@@ -129,20 +131,25 @@ class ClientAuth(models.Model):
         ("in-kyc", "In-KYC"),
         ("in-email-verification", "In-Email Verification"),
         ("is_blocked", "Is-Blocked"),
+     
     ]
     total_failed_login_attempts = models.PositiveIntegerField(
         default=0,db_index=True
     )
+    password_changed_at = models.DateTimeField(null=True, blank=True, db_index=True)
 
     is_profile_completed = models.CharField(
         default="in-details",
         choices=Profile_CHOICES,
         max_length=50,db_index=True
     )
+    is_active = models.BooleanField(default=True,db_index=True)
     class Meta:
         indexes = [
             models.Index(fields=["id"]),
-           
+            
+            models.Index(fields=["is_active"]),
+
     ]
 
     @property

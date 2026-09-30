@@ -34,7 +34,6 @@ class ClientBaseAppConsumer(AsyncWebsocketConsumer):
 
         try:
             user, role = await sync_to_async(authenticate_ws_token)(token)
-
         except Exception:
             logger.exception("Client websocket authentication failed.")
             await self.close(code=4003)
@@ -44,10 +43,16 @@ class ClientBaseAppConsumer(AsyncWebsocketConsumer):
             await self.close(code=4003)
             return
 
-        # Optional: verify URL user_id matches authenticated user
+        # Mandatory — never optional. The URL segment is not a source of
+        # authorization by itself; it must match the authenticated identity.
         url_user_id = self.scope["url_route"]["kwargs"].get("user_id")
 
-        if url_user_id is not None and int(url_user_id) != user.id:
+        try:
+            matches = url_user_id is not None and int(url_user_id) == user.id
+        except (TypeError, ValueError):
+            matches = False
+
+        if not matches:
             await self.close(code=4003)
             return
 
@@ -58,11 +63,7 @@ class ClientBaseAppConsumer(AsyncWebsocketConsumer):
         self.user_id = user.id
         self.group_name = f"{self.group_prefix}_{self.user_id}"
 
-        await self.channel_layer.group_add(
-            self.group_name,
-            self.channel_name,
-        )
-
+        await self.channel_layer.group_add(self.group_name, self.channel_name)
         await self.accept()
 
         await self.send_json({

@@ -1,7 +1,9 @@
 import re
 import secrets
 from sqlite3 import IntegrityError
+
 import requests
+from django.core.exceptions import ValidationError as DjangoValidationError
 from rest_framework.exceptions import ValidationError
 from rest_framework_simplejwt.tokens import AccessToken, RefreshToken
 from rest_framework_simplejwt.exceptions import TokenError
@@ -15,6 +17,7 @@ from rest_framework.parsers import MultiPartParser, FormParser
 from rest_framework.permissions import AllowAny
 from rest_framework.permissions import IsAuthenticated
 from django.db import transaction
+from api.bookings.models import Negotiation, OrderService, Session, Shipment
 from api.clientsDB.services.address_verify_service import AIAddressVerificationClient
 from api.clientsDB.services.client_history_model_helper import create_client_address_history
 from api.clientsDB.services.client_ip_address_helper import get_client_ip, get_device_info
@@ -23,16 +26,18 @@ from api.clientsDB.services.client_otp_token import generate_email_verification_
 from api.clientsDB.services.email_mask_helper import mask_email
 from api.clientsDB.services.jwt_client_authentication import ClientJWTAuthentication
 from api.clientsDB.services.otp_service import create_client_otp,  hash_otp
-from api.clientsDB.services.otp_tasks import OTP_EMAIL_VERIFICATION, OTP_LOGIN, OTP_PASSWORD_RESET, OTPCooldownError, send_client_otp_email
+from api.clientsDB.services.otp_tasks import OTP_EMAIL_VERIFICATION, OTP_LOGIN, OTP_PASSWORD_RESET, OTPCooldownError, send_account_deleted_email, send_client_otp_email, send_password_changed_email
 from api.clientsDB.services.password_reset_token import generate_password_reset_token
 from api.clientsDB.services.sa_phone_number_helper import normalize_sa_mobile
+from api.serviceProvidersDB.models import ProviderQualification, ProviderService
+from api.serviceProvidersDB.serializers import ChangePasswordSerializer, ProviderQualificationReadSerializer
 from plug_backend.helpers.auth_helpers import get_client_auth, get_client_details
-from plug_backend.throttles import AuthThrottle, ClientOTPThrottle, ClientRegistrationThrottle, ProfileWriteThrottle, RegisterThrottle, UserReadThrottle
+from plug_backend.throttles import AccountDeleteThrottle, AuthThrottle, ClientOTPThrottle, ClientRegistrationThrottle, ProfileWriteThrottle, RegisterThrottle, UserReadThrottle
 from plug_backend.utils.client_jwt_helper import generate_client_tokens
 from django.db.models import Q
 from django.utils import timezone
 from .models.models import ClientAddressHistory, ClientAuth, ClientDetails, Address, ClientAddress, ClientLoginHistory, ClientNotification, ClientOTP, ClientRegistrationHistory, DeviceToken 
-from .serializers import AddressClaimSerializer, AddressOnlySerializer, AddressVerificationCreateSerializer, ClientAddressDeactivateSerializer, ClientAddressNoDuplicatesSerializer, AddressSerializer, ClientAddressSerializerr, ClientAddressWriteSerializer, ClientAuthReadSerializer, ClientLoginSerializer, ClientOTPVerifySerializer, ClientProfileAppUpdateSerializer, ClientProfileSerializer, ClientRegisterSerializer, ClientSavedAddressSerializer, ClientSerializer, ClientAddressSerializer, DefaultAddressSerializer, DeviceTokenWriteSerializer, HouseholdMemberSerializer
+from .serializers import AddressClaimSerializer, AddressOnlySerializer, AddressVerificationCreateSerializer, ClientAddressDeactivateSerializer, ClientAddressNoDuplicatesSerializer, AddressSerializer, ClientAddressSerializerr, ClientAddressWriteSerializer, ClientAuthReadSerializer, ClientLoginSerializer, ClientOTPVerifySerializer, ClientProfileAppUpdateSerializer, ClientProfileSerializer, ClientRegisterSerializer, ClientSavedAddressSerializer, ClientSerializer, ClientAddressSerializer, DefaultAddressSerializer, DeleteAccountSerializer, DeviceTokenWriteSerializer, HouseholdMemberSerializer, ResetPasswordWithOTPSerializer
 from django.contrib.auth.hashers import check_password, make_password
 
 
@@ -71,16 +76,26 @@ def request_client_password_reset(request):
         if mobile_number:
             query |= Q(mobile_number=mobile_number)
 
+        # Generic response used whenever we must not reveal whether an
+        # account exists. Deliberately excludes otp_request_id /
+        # verification_token — there's nothing to verify if we never
+        # actually created a challenge.
+        GENERIC_SENT_RESPONSE = {
+            "success": True,
+            "message": "If an account exists, a verification code has been sent.",
+        }
+
         try:
             client = ClientAuth.objects.get(query)
 
         except ClientAuth.DoesNotExist:
-            return Response(
-                {"error": "Client not found"},
-                status=status.HTTP_404_NOT_FOUND
-            )
+            # Don't reveal that this account doesn't exist — same shape
+            # as the success path below.
+            return Response(GENERIC_SENT_RESPONSE, status=status.HTTP_200_OK)
 
         except ClientAuth.MultipleObjectsReturned:
+            # This is a data-integrity problem on our side, not
+            # per-caller information — fine to keep specific.
             return Response(
                 {"error": "Multiple accounts found. Contact support."},
                 status=status.HTTP_409_CONFLICT
@@ -90,18 +105,10 @@ def request_client_password_reset(request):
             client.account_locked_until and
             client.account_locked_until > timezone.now()
         ):
-            remaining_minutes = int(
-                (client.account_locked_until - timezone.now())
-                .total_seconds() / 60
-            )
-            return Response(
-                {
-                    "error": [
-                        f"Account is temporarily locked. Try again later."
-                    ]
-                },
-                status=status.HTTP_403_FORBIDDEN
-            )
+            # Also collapse this into the generic response. Revealing
+            # "account locked" still confirms the account exists, just
+            # via a different status code than 404 — same leak, different door.
+            return Response(GENERIC_SENT_RESPONSE, status=status.HTTP_200_OK)
 
         try:
             otp_request, otp = create_client_otp(
@@ -109,17 +116,12 @@ def request_client_password_reset(request):
                 purpose=OTP_PASSWORD_RESET,
             )
 
-        except OTPCooldownError as e:
-            return Response(
-                {
-                    "success": False,
-                    "message": (
-                        f"Please wait {e.retry_after} seconds "
-                        "before requesting another code."
-                    ),
-                },
-                status=status.HTTP_429_TOO_MANY_REQUESTS,
-            )
+        except OTPCooldownError:
+            # Also collapse into the generic response — a cooldown message
+            # (implying "you already requested one recently") still confirms
+            # the account exists. The real OTP is still on its way to their
+            # inbox from the earlier request, so this is safe to hide.
+            return Response(GENERIC_SENT_RESPONSE, status=status.HTTP_200_OK)
 
         verification_token = generate_password_reset_token(client, otp_request)
 
@@ -150,6 +152,401 @@ def request_client_password_reset(request):
             status=status.HTTP_500_INTERNAL_SERVER_ERROR
         )
 
+    
+
+def password_complexity_errors(password: str) -> list:
+    errors = []
+    if len(password) < 8:
+        errors.append("Password must be at least 8 characters.")
+    if len(password) > 128:
+        errors.append("Password cannot exceed 128 characters.")
+    if not re.search(r"[A-Z]", password):
+        errors.append("Password must contain at least one uppercase letter.")
+    if not re.search(r"[a-z]", password):
+        errors.append("Password must contain at least one lowercase letter.")
+    if not re.search(r"\d", password):
+        errors.append("Password must contain at least one digit.")
+    return errors
+ 
+ 
+def _mask_email(email: str) -> str:
+    try:
+        local, domain = email.split("@", 1)
+    except ValueError:
+        return "your email"
+    return f"{local[:1]}***@{domain}"
+
+
+
+
+BLOCKING_SHIPMENT_STATUSES = {"in_transit", "arrived"}
+TERMINAL_ORDER_STATUSES = {
+    "cancelled",
+    "declined",
+    "rejected",
+    "completed",
+}
+
+@api_view(["POST"])
+@authentication_classes([ClientJWTAuthentication])
+@permission_classes([IsAuthenticated])
+@throttle_classes([AccountDeleteThrottle])  
+def delete_client_account(request):
+    with transaction.atomic():
+        client = ClientAuth.objects.select_for_update().get(pk=request.user.pk)
+
+        serializer = DeleteAccountSerializer(
+            data=request.data, context={"client": client}
+        )
+        serializer.is_valid(raise_exception=True)
+
+        client_details = ClientDetails.objects.filter(
+            client_profile=client
+        ).select_for_update().first()
+
+        # ---------------- BLOCKING CHECKS ----------------
+        # ASSUMPTION: OrderService.client points to ClientDetails.
+        # Confirm the real FK name/path before relying on this.
+        active_orders = OrderService.objects.filter(
+            client=client_details
+        ).exclude(status__in=TERMINAL_ORDER_STATUSES)  # confirm exact values
+
+        blocked_session = Session.objects.filter(
+            shipment__service_ordered__order__client=client_details,
+            session_status="in_session",
+        ).exists()
+
+        blocked_shipment = Shipment.objects.filter(
+            service_ordered__order__client=client_details,
+            shipment_status__in=BLOCKING_SHIPMENT_STATUSES,
+        ).exists()
+
+        if blocked_session or blocked_shipment:
+            return Response(
+                {
+                    "error": (
+                        "You can't delete your account while a booking is "
+                        "in progress. Please wait for the current session "
+                        "to finish. Or cancel bookings that are in transit or have arrived."
+                    )
+                },
+                status=status.HTTP_409_CONFLICT,
+            )
+
+        # ---------------- CANCEL ACTIVE ORDERS ----------------
+        for order in active_orders:
+            order.invited_providers.clear()
+
+            Negotiation.objects.filter(
+                service_order=order
+            ).exclude(
+                status__in=["accepted", "rejected", "canceled", "expired"]
+            ).update(status="canceled")
+
+            # Delete uploaded order photos + files
+            for pic in order.service_pictures.all():
+                if pic.image:
+                    pic.image.delete(save=False)
+            order.service_pictures.all().delete()
+
+            order.status = "cancelled"  # confirm exact terminal string
+            order.save(update_fields=["status"])
+
+        # ---------------- ADDRESSES ----------------
+        client_addresses = ClientAddress.objects.filter(
+            client=client_details, is_active=True
+        )
+        for ca in client_addresses:
+            ClientAddressHistory.objects.create(
+                client_address=ca,
+                performed_by=client_details,
+                action=ClientAddressHistory.ACTION_DEACTIVATED,
+                reason="Account deletion",
+            )
+            # Delete sensitive verification files tied to this address
+            verification = getattr(ca, "verification_request", None)
+            if verification:
+                for f in (
+                    verification.proof_of_residence,
+                    verification.id_document,
+                    verification.liveness_video,
+                ):
+                    if f:
+                        f.delete(save=False)
+
+        client_addresses.update(is_active=False, is_default=False)
+
+        # ---------------- ANONYMIZE CLIENT DETAILS ----------------
+        if client_details:
+            if client_details.client_pp and client_details.client_pp.name != "default.jpg":
+                client_details.client_pp.delete(save=False)
+
+            client_details.first_name = None
+            client_details.last_name = None
+            client_details.date_of_birth = None
+            client_details.client_pp = "default.jpg"
+            client_details.is_active = False
+            client_details.save(update_fields=[
+                "first_name", "last_name", "date_of_birth",
+                "client_pp", "is_active",
+            ])
+
+        # ---------------- ANONYMIZE + LOCK CLIENT AUTH ----------------
+        original_email = client.email_address
+
+        client.email_address = f"deleted-{client.id}@deleted.invalid"
+        client.mobile_number = None  # unique=True, null allowed — frees the number
+        client.is_active = False
+        client.mfa_enabled = False
+        client.mfa_secret = None
+        client.password = make_password(secrets.token_urlsafe(48))  # unusable
+        client.session_version += 1  # kills every existing token everywhere
+        client.deleted_at = timezone.now()
+        client.save(update_fields=[
+            "email_address", "mobile_number", "is_active",
+            "mfa_enabled", "mfa_secret", "password",
+            "session_version", "deleted_at",
+        ])
+
+        transaction.on_commit(
+            lambda: send_account_deleted_email.delay(original_email)
+        )
+
+    return Response(
+        {"message": "Your account has been deleted."},
+        status=status.HTTP_200_OK,
+    )
+ 
+ 
+# ---------------------------------------------------------------------------
+# Step 1: request a code
+# ---------------------------------------------------------------------------
+@api_view(["POST"])
+@authentication_classes([ClientJWTAuthentication])
+@permission_classes([IsAuthenticated])
+@throttle_classes([AuthThrottle])
+def request_password_reset_otp(request):
+    client = request.user
+ 
+    if client.account_locked_until and client.account_locked_until > timezone.now():
+        return Response(
+            {"error": "Account is temporarily locked. Try again later."},
+            status=status.HTTP_403_FORBIDDEN,
+        )
+ 
+    # ADAPT: only if ClientAuth tracks it.
+    # if not client.email_verified:
+    #     return Response({"error": "Email address is not verified."}, status=400)
+ 
+    try:
+        with transaction.atomic():
+            otp_request, otp = create_client_otp(
+                client=client,
+                purpose=OTP_PASSWORD_RESET,
+            )
+            email_address = client.email_address
+            transaction.on_commit(
+                lambda: send_client_otp_email.delay(
+                    email_address, otp, OTP_PASSWORD_RESET
+                )
+            )
+    except OTPCooldownError as exc:
+        return Response(
+            {
+                "error": "Please wait before requesting another code.",
+                "retry_after": getattr(exc, "retry_after", None),  # ADAPT
+            },
+            status=status.HTTP_429_TOO_MANY_REQUESTS,
+        )
+    except Exception:
+        logger.exception("Unexpected error in request_password_reset_otp")
+        return Response(
+            {"error": "Unable to process request at this time."},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
+ 
+    return Response(
+        {
+            "success": True,
+            "message": "A verification code has been sent to your email.",
+            "data": {
+                "otp_request_id": str(otp_request.request_id),
+                "masked_email": _mask_email(client.email_address),
+            },
+        },
+        status=status.HTTP_200_OK,
+    )
+ 
+ 
+# ---------------------------------------------------------------------------
+# Step 2: verify the code and set the new password in one atomic call
+# ---------------------------------------------------------------------------
+@api_view(["POST"])
+@authentication_classes([ClientJWTAuthentication])
+@permission_classes([IsAuthenticated])
+@throttle_classes([ClientOTPThrottle])
+def reset_password_with_otp(request):
+    try:
+        serializer = ResetPasswordWithOTPSerializer(
+            data=request.data,
+            context={"client": request.user},
+        )
+
+        serializer.is_valid(raise_exception=True)
+
+        new_password = serializer.validated_data["new_password"]
+
+        otp = str(request.data.get("otp") or "").strip()
+        otp_request_id = request.data.get("otp_request_id")
+
+        if not otp or not otp_request_id:
+            return Response(
+                {"error": "otp and otp_request_id are required"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        with transaction.atomic():
+            client = ClientAuth.objects.select_for_update().get(pk=request.user.pk)
+            now = timezone.now()
+
+            if client.account_locked_until and client.account_locked_until > now:
+                return Response(
+                    {"error": ["Account is temporarily locked. Try again later"]},
+                    status=status.HTTP_403_FORBIDDEN,
+                )
+
+            try:
+                otp_request = (
+                    ClientOTP.objects.select_for_update()
+                    .filter(
+                        request_id=otp_request_id,
+                        client_id=client.pk,
+                        purpose="password_reset",
+                    )
+                    .first()
+                )
+            except (DjangoValidationError, ValueError):
+                otp_request = None
+
+            if otp_request is None:
+                hash_otp("000000")
+                return Response(
+                    INVALID_OR_EXPIRED,
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            if otp_request.is_used or otp_request.is_verified:
+                hash_otp("000000")
+                return Response(
+                    INVALID_OR_EXPIRED,
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            if now >= otp_request.expires_at:
+                hash_otp("000000")
+                return Response(
+                    INVALID_OR_EXPIRED,
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            if otp_request.attempts >= otp_request.max_attempts:
+                hash_otp("000000")
+                return Response(
+                    {
+                        "success": False,
+                        "message": "Too many invalid OTP attempts.",
+                    },
+                    status=status.HTTP_429_TOO_MANY_REQUESTS,
+                )
+
+            if not secrets.compare_digest(
+                hash_otp(otp),
+                otp_request.otp_hash,
+            ):
+                otp_request.attempts += 1
+                otp_request.save(update_fields=["attempts"])
+
+                if otp_request.attempts >= otp_request.max_attempts:
+                    return Response(
+                        {
+                            "success": False,
+                            "message": "Too many invalid OTP attempts.",
+                        },
+                        status=status.HTTP_429_TOO_MANY_REQUESTS,
+                    )
+
+                return Response(
+                    INVALID_OR_EXPIRED,
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            if check_password(new_password, client.password):
+                return Response(
+                    {
+                        "error": [
+                            "New password cannot be the same as the old password."
+                        ]
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            otp_request.is_verified = True
+            otp_request.is_used = True
+            otp_request.verified_at = now
+            otp_request.save(
+                update_fields=[
+                    "is_verified",
+                    "is_used",
+                    "verified_at",
+                ]
+            )
+
+            client.password = make_password(new_password)
+            client.failed_login_attempts = 0
+            client.password_changed_at = now
+            client.session_version += 1
+
+            client.save(
+                update_fields=[
+                    "password",
+                    "failed_login_attempts",
+                    "password_changed_at",
+                    "session_version",
+                ]
+            )
+
+            email_address = client.email_address
+
+            transaction.on_commit(
+                lambda: send_password_changed_email.delay(email_address)
+            )
+
+        tokens = generate_client_tokens(client)
+
+        return Response(
+            {
+                "success": True,
+                "message": "Password changed successfully.",
+                "access": tokens["access"],
+                "refresh": tokens["refresh"],
+            },
+            status=status.HTTP_200_OK,
+        )
+
+    except ValidationError as exc:
+        return Response(
+            exc.detail,
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    except Exception:
+        logger.exception("Unexpected error in reset_password_with_otp")
+        return Response(
+            {"error": "Unable to reset password at this time."},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
+
+
 
     
 
@@ -160,7 +557,14 @@ def request_client_password_reset(request):
 def reset_client_password(request):
 
     try:
-        new_password = request.data.get("new_password")
+        serializer = ResetPasswordWithOTPSerializer(
+            data=request.data,
+            context={"client": request.user},
+        )
+
+        serializer.is_valid(raise_exception=True)
+
+        new_password = serializer.validated_data["new_password"]
         otp = request.data.get("otp")
 
         if not new_password:
@@ -309,8 +713,10 @@ def reset_client_password(request):
             client.password = make_password(new_password)
             client.failed_login_attempts = 0
             client.account_locked_until = None
+            client.password_changed_at = now
+            client.session_version += 1
             client.save(update_fields=[
-                "password", "failed_login_attempts", "account_locked_until"
+                "password", "failed_login_attempts", "account_locked_until","password_changed_at", "session_version"
             ])
 
         return Response(
@@ -326,7 +732,47 @@ def reset_client_password(request):
         )
     
 
+@api_view(["POST"])
+@authentication_classes([ClientJWTAuthentication])
+@permission_classes([IsAuthenticated])
+@throttle_classes([AuthThrottle])
+def change_password(request):
+    """
+    Change the authenticated client's password.
+    Operates ONLY on request.user, with no id taken from the payload (RLS).
+    """
+    with transaction.atomic():
+        # Lock the row so two concurrent changes can't interleave.
+        client = ClientAuth.objects.select_for_update().get(pk=request.user.pk)
 
+        serializer = ChangePasswordSerializer(
+            data=request.data,
+            context={"client": client},
+        )
+        serializer.is_valid(raise_exception=True)
+
+        client.password = make_password(serializer.validated_data["new_password"])
+        client.password_changed_at = timezone.now()
+        client.session_version += 1
+        client.save(update_fields=["password", "password_changed_at", "session_version"])
+
+        email_address = client.email_address
+        transaction.on_commit(
+            lambda: send_password_changed_email.delay(email_address)
+        )
+
+    # Old sessions are now rejected by the iat check. Issue a fresh pair so
+    # THIS device stays logged in. Use the same helper your login view uses.
+    tokens = generate_client_tokens(client)  # placeholder: adapt to your login code
+
+    return Response(
+        {
+            "message": "Password changed successfully.",
+            "access": tokens["access"],
+            "refresh": tokens["refresh"],
+        },
+        status=status.HTTP_200_OK,
+    )
     
 @api_view(['POST'])
 @throttle_classes([ClientRegistrationThrottle])
@@ -468,9 +914,9 @@ def register_client(request):
             with transaction.atomic():
 
                 client_auth = serializer.save(
-        email_address=email,
-        is_profile_completed="in-email-verification",
-    )
+                    email_address=email,
+                    is_profile_completed="in-email-verification",
+                )
 
                 ClientDetails.objects.get_or_create(
                     client_profile=client_auth
@@ -482,9 +928,9 @@ def register_client(request):
 
                 try:
                     otp_request, otp = create_client_otp(
-    client=client_auth,
-    purpose=OTP_EMAIL_VERIFICATION,
-)
+                        client=client_auth,
+                        purpose=OTP_EMAIL_VERIFICATION,
+                    )
                 except OTPCooldownError as e:
                     return Response(
                         {
@@ -519,12 +965,11 @@ def register_client(request):
 
                 transaction.on_commit(
                     lambda: send_client_otp_email.delay(
-        client_auth.email_address,
-        otp,
-        OTP_EMAIL_VERIFICATION,
-    )
+                        client_auth.email_address,
+                        otp,
+                        OTP_EMAIL_VERIFICATION,
+                    )
                 )
-
 
             return Response(
                 {
@@ -536,25 +981,21 @@ def register_client(request):
                     ),
                     "data": {
                         "id": client_auth.id,
-
-                        
                         "email": mask_email(client_auth.email_address),
-
                         "requires_email_verification": True,
-
                         "otp_request_id": str(
                             otp_request.request_id
                         ),
-
                         "verification_token": verification_token,
                     }
                 },
                 status=status.HTTP_201_CREATED
             )
 
-
-
         except IntegrityError:
+            # This branch is now actually reachable: django.db.IntegrityError
+            # is what Postgres/psycopg raises on a real constraint violation
+            # (e.g. two concurrent requests racing past the pre-checks above).
 
             ClientRegistrationHistory.objects.create(
                 email=email,
@@ -627,6 +1068,8 @@ def register_client(request):
             },
             status=status.HTTP_500_INTERNAL_SERVER_ERROR
         )
+
+    
     
 
 INVALID_OR_EXPIRED = {
@@ -1361,6 +1804,44 @@ def get_household_members(request, client_address_id):
 
 
 
+@api_view(["GET"])
+@authentication_classes([ClientJWTAuthentication])
+@permission_classes([IsAuthenticated])
+@throttle_classes([UserReadThrottle])
+def get_provider_qualifications_client(request, provider_id, service_id):
+
+    provider_service = get_object_or_404(
+        ProviderService.objects.select_related(
+            "provider",
+            "provider__sp_profile",
+        ),
+        provider__sp_profile__id=provider_id,
+        service_id=service_id,
+        is_active=True,
+    )
+
+    qualifications = (
+        ProviderQualification.objects.filter(
+            provider_service=provider_service,
+        )
+        .order_by("-uploaded_at")
+    )
+
+    serializer = ProviderQualificationReadSerializer(
+        qualifications,
+        many=True,
+        context={"request": request},
+    )
+
+    return Response(
+        {
+            "success": True,
+            "data": serializer.data,
+        },
+        status=status.HTTP_200_OK,
+    )
+
+
 
 
     
@@ -1378,7 +1859,6 @@ def client_logout(request):
                 token = RefreshToken(refresh_token)
                 token.blacklist()
             except TokenError:
-                # 🔥 IMPORTANT: already invalid → treat as success
                 pass
 
         return Response(
@@ -1387,7 +1867,7 @@ def client_logout(request):
         )
 
     except Exception:
-        # NEVER expose internal errors
+        
         return Response(
             {"detail": "Logged out successfully"},
             status=status.HTTP_200_OK,
@@ -2900,6 +3380,44 @@ def client_saved_addresses(request, client_id):
         status=status.HTTP_200_OK
     )
 
+
+
+
+INVALID_REFRESH = {"detail": "Invalid or expired token."}
+SESSION_EXPIRED = {"detail": "Session expired. Please log in again."}
+
+
+@api_view(["POST"])
+@authentication_classes([])
+@permission_classes([AllowAny])
+@throttle_classes([AuthThrottle])  
+def client_token_refresh(request):
+    raw_refresh = request.data.get("refresh")
+    if not raw_refresh:
+        return Response(INVALID_REFRESH, status=status.HTTP_401_UNAUTHORIZED)
+
+    try:
+        refresh = RefreshToken(raw_refresh)  # verifies signature + expiry
+    except TokenError:
+        return Response(INVALID_REFRESH, status=status.HTTP_401_UNAUTHORIZED)
+
+    if refresh.get("purpose") or refresh.get("user_type") != "client":
+        return Response(INVALID_REFRESH, status=status.HTTP_401_UNAUTHORIZED)
+
+    client = ClientAuth.objects.filter(pk=refresh.get("client_id")).first()
+    if client is None:
+        return Response(INVALID_REFRESH, status=status.HTTP_401_UNAUTHORIZED)
+
+    if refresh.get("sv", 0) != client.session_version:
+        return Response(SESSION_EXPIRED, status=status.HTTP_401_UNAUTHORIZED)
+
+    # Optional: block locked or blocked accounts from refreshing
+    if client.is_profile_completed == "is_blocked":
+        return Response(SESSION_EXPIRED, status=status.HTTP_401_UNAUTHORIZED)
+
+    # Keep your current behaviour. Access-only, matching the stock view
+    # when ROTATE_REFRESH_TOKENS is False:
+    return Response({"access": str(refresh.access_token)}, status=status.HTTP_200_OK)
 
 
 

@@ -23,16 +23,35 @@ class NegotiationRoundWriteSerializer(serializers.ModelSerializer):
 
     def validate(self, data):
         offered_price = data.get('offered_price')
+
         if offered_price is None:
-            raise serializers.ValidationError("Offered price is required.")
+            raise serializers.ValidationError(
+                "Offered price is required."
+            )
+
+        if offered_price <= Decimal("0"):
+            raise serializers.ValidationError({
+                "offered_price": "Offered price must be greater than 0."
+            })
+
+        if offered_price > Decimal("10000.00"):
+            raise serializers.ValidationError({
+                "offered_price": "Offered price cannot exceed R10,000."
+            })
+
         return data
 
 
 class NegotiationRoundReadSerializer(serializers.ModelSerializer):
+    order_id = serializers.SerializerMethodField()
+
     class Meta:
         model = NegotiationRound
-        fields = ["id", "negotiation", "sender_type", "offered_price", "message", "created_at"]
+        fields = ["id", "negotiation", "order_id", "sender_type", "offered_price", "message", "created_at"]
         read_only_fields = ["id", "created_at"]
+
+    def get_order_id(self, obj):
+        return obj.negotiation.service_order.order_id
 
 
 class NegotiationReadSerializer(serializers.ModelSerializer):
@@ -349,6 +368,10 @@ class OrderServiceWriteSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError(
                 "Proposal price must be greater than 0."
             )
+        if value > Decimal("10000.00"):
+            raise serializers.ValidationError(
+                "Proposal price cannot exceed R10,000."
+            )
 
         return value
     
@@ -477,10 +500,19 @@ class OrderFinalPricePatchSerializer(serializers.ModelSerializer):
 
     def validate_final_price(self, value):
         if value is None:
-            raise serializers.ValidationError("Final price is required.")
+            raise serializers.ValidationError(
+                "Final price is required."
+            )
 
         if value < 0:
-            raise serializers.ValidationError("Final price cannot be negative.")
+            raise serializers.ValidationError(
+                "Final price cannot be negative."
+            )
+
+        if value > Decimal("10000.00"):
+            raise serializers.ValidationError(
+                "Final price cannot exceed R10,000."
+            )
 
         return value
 

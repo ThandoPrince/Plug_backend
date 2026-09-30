@@ -202,6 +202,8 @@ class SPProfile(models.Model):
     null=True,
     blank=True
 )
+    session_version = models.PositiveIntegerField(default=0)
+    password_changed_at = models.DateTimeField(null=True, blank=True, db_index=True)
     email_verified_at = models.DateTimeField(
             null=True,
             blank=True,

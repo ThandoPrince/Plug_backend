@@ -1,3 +1,4 @@
+from disposable_email_domains import blocklist
 from rest_framework import serializers
 from django.contrib.auth.hashers import make_password
 from django.contrib.auth.password_validation import validate_password
@@ -88,6 +89,97 @@ class ClientAuthReadSerializer(serializers.ModelSerializer):
             'mobile_number',
             'is_profile_completed',
         ]
+
+class DeleteAccountSerializer(serializers.Serializer):
+    password = serializers.CharField(write_only=True, trim_whitespace=False)
+    confirmation = serializers.CharField(write_only=True)
+
+    def validate_confirmation(self, value):
+        if value.strip().upper() != "DELETE":
+            raise serializers.ValidationError('Type "DELETE" to confirm.')
+        return value
+
+    def validate(self, attrs):
+        client = self.context["client"]
+        if not check_password(attrs["password"], client.password):
+            raise serializers.ValidationError({"password": "Incorrect password."})
+        return attrs
+
+
+class ResetPasswordWithOTPSerializer(serializers.Serializer):
+    new_password = serializers.CharField(
+        write_only=True,
+        trim_whitespace=False,
+        min_length=8,
+        max_length=128,
+    )
+
+ 
+
+    def validate_new_password(self, value):
+        errors = []
+
+        if len(value) < 8:
+            errors.append(
+                "Password must be at least 8 characters."
+            )
+
+        if not re.search(r"[A-Z]", value):
+            errors.append(
+                "Password must contain at least one uppercase letter."
+            )
+
+        if not re.search(r"[a-z]", value):
+            errors.append(
+                "Password must contain at least one lowercase letter."
+            )
+
+        if not re.search(r"\d", value):
+            errors.append(
+                "Password must contain at least one digit."
+            )
+
+        if errors:
+            raise serializers.ValidationError(errors)
+
+        return value
+
+    def validate(self, attrs):
+        client = self.context["client"]
+
+        new_password = attrs["new_password"]
+     
+
+        
+
+        if check_password(new_password, client.password):
+            raise serializers.ValidationError({
+                "new_password":
+                    "New password must be different from your current password."
+            })
+
+        # Prevent email local-part from being used in the password
+        local_part = client.email_address.split("@")[0].lower()
+
+        if len(local_part) >= 4 and local_part in new_password.lower():
+            raise serializers.ValidationError({
+                "new_password":
+                    "Password must not contain your email address."
+            })
+
+        # Django password validators
+        try:
+            validate_password(
+                new_password,
+                user=client,
+            )
+        except DjangoValidationError as exc:
+            raise serializers.ValidationError({
+                "new_password": list(exc.messages)
+            })
+
+        return attrs
+
     
 class ClientRegisterSerializer(serializers.ModelSerializer):
     password = serializers.CharField(
@@ -106,6 +198,12 @@ class ClientRegisterSerializer(serializers.ModelSerializer):
         value = value.lower()
         if ClientAuth.objects.filter(email_address=value).exists():
             raise serializers.ValidationError("This email address is invalid.")
+
+        domain = value.rsplit('@', 1)[-1]
+        if domain in blocklist:
+            raise serializers.ValidationError(
+                "This email address is invalid."
+            )
         return value
 
     def validate_mobile_number(self, value):

@@ -5,9 +5,7 @@ from channels.layers import get_channel_layer
 def _send_group_event(group_name, event_type, payload):
     channel_layer = get_channel_layer()
 
-    print("CHANNEL LAYER:", channel_layer)
-    print("GROUP:", group_name)
-    print("EVENT:", event_type)
+
 
     async_to_sync(channel_layer.group_send)(
         group_name,
@@ -17,7 +15,7 @@ def _send_group_event(group_name, event_type, payload):
         },
     )
 
-    print("GROUP SEND COMPLETE")
+    
 
 def notify_provider_booking_removed(provider_id: int, order_id: int) -> None:
     _send_group_event(
@@ -70,6 +68,26 @@ def notify_client_booking(client_id: int, payload: dict) -> None:
         payload=payload,
     )
 
+def notify_client_negotiation_round(client_id: int, payload: dict) -> None:
+    _send_group_event(
+        group_name=f"client_{client_id}",
+        event_type="negotiation_round_created",
+        payload=payload,
+    )
+
+def notify_client_shipment_status(client_id: int, payload: dict) -> None:
+    _send_group_event(
+        group_name=f"client_{client_id}",
+        event_type="shipment_status_updated",
+        payload=payload,
+    )
+
+def notify_client_negotiation_status_changed(client_id: int, payload: dict) -> None:
+    _send_group_event(
+        group_name=f"client_{client_id}",
+        event_type="negotiation_status_changed",
+        payload=payload,
+    )
 
 def notify_client_location(client_id: int, payload: dict) -> None:
     _send_group_event(

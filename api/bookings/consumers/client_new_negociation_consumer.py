@@ -64,6 +64,18 @@ class NegotiationConsumer(AsyncWebsocketConsumer):
 
         await self.accept()
 
+    async def receive(self, text_data=None, bytes_data=None):
+        if not text_data:
+            return
+
+        try:
+            data = json.loads(text_data)
+        except json.JSONDecodeError:
+            return
+
+        if data.get("type") == "ping":
+            await self.send(text_data=json.dumps({"type": "pong"}))
+
     # -------------------------
     # Token extraction
     # -------------------------

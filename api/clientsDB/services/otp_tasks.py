@@ -262,3 +262,95 @@ def create_client_otp(
     )
 
     return otp_request, otp
+
+@shared_task(
+    bind=True,
+    autoretry_for=(Exception,),
+    retry_backoff=True,
+    retry_jitter=True,
+    max_retries=3,
+)
+def send_password_changed_email(self, email_address):
+    subject = "Your Plug password was changed"
+
+    text_content = (
+        "Your Plug account password was just changed.\n\n"
+        "If this was you, no further action is needed.\n\n"
+        "If you did not make this change, reset your password immediately "
+        "and contact support."
+    )
+
+    html_content = """
+    <html>
+        <body>
+            <h2>Your Plug password was changed</h2>
+            <p>Your account password was just changed.</p>
+            <p>If this was you, no further action is needed.</p>
+            <p><strong>If you did not make this change</strong>, reset your
+            password immediately and contact support.</p>
+        </body>
+    </html>
+    """
+
+    email = EmailMultiAlternatives(
+        subject=subject,
+        body=text_content,
+        from_email=settings.DEFAULT_FROM_EMAIL,
+        to=[email_address],
+    )
+    email.attach_alternative(html_content, "text/html")
+    email.send(fail_silently=False)
+
+    logger.info("Password changed notification sent.")
+
+
+@shared_task(
+    bind=True,
+    autoretry_for=(Exception,),
+    retry_backoff=True,
+    retry_jitter=True,
+    max_retries=3,
+)
+def send_account_deleted_email(self, email_address):
+    """
+    Confirms account deletion to the ORIGINAL email address.
+
+    Called via transaction.on_commit in delete_client_account, using
+    `original_email` captured before the row was anonymized — by the time
+    this task runs, client.email_address is already the
+    deleted-{id}@deleted.invalid placeholder.
+    """
+    subject = "Your Plug account has been deleted"
+
+    text_content = (
+        "Your Plug account and associated data have been deleted, as you "
+        "requested.\n\n"
+        "If you did not request this, please contact support immediately — "
+        "your account cannot be recovered once deletion is confirmed, but "
+        "we can help investigate unauthorized access.\n\n"
+        "You're welcome to create a new Plug account at any time."
+    )
+
+    html_content = """
+    <html>
+        <body>
+            <h2>Your Plug account has been deleted</h2>
+            <p>Your account and associated data have been deleted, as you requested.</p>
+            <p><strong>If you did not request this</strong>, please contact support
+            immediately. Your account cannot be recovered once deletion is confirmed,
+            but we can help investigate unauthorized access.</p>
+            <p>You're welcome to create a new Plug account at any time.</p>
+        </body>
+    </html>
+    """
+
+    email = EmailMultiAlternatives(
+        subject=subject,
+        body=text_content,
+        from_email=settings.DEFAULT_FROM_EMAIL,
+        to=[email_address],
+    )
+    email.attach_alternative(html_content, "text/html")
+    email.send(fail_silently=False)
+
+    logger.info("Account deletion confirmation sent.")

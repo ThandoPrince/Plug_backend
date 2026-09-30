@@ -4,6 +4,7 @@ from rest_framework import serializers
 from django.contrib.auth.hashers import check_password, make_password
 from django.db import transaction
 import re
+from django.contrib.auth.hashers import check_password
 from django.utils.html import strip_tags
 from django.db.models import Q
 from django.db import models
@@ -11,6 +12,7 @@ from rest_framework import serializers
 from django.core.validators import validate_email
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.utils import timezone
+from django.contrib.auth.password_validation import validate_password
 from datetime import date, timedelta
 from api.clientsDB.services.client_ip_address_helper import get_client_ip
 from api.clientsDB.services.sa_phone_number_helper import normalize_sa_mobile
@@ -66,6 +68,10 @@ class SPProfileWriteSerializer(serializers.ModelSerializer):
         if not re.search(r'[A-Z]', value):
             raise serializers.ValidationError(
                 "Password must contain at least one uppercase letter."
+            )
+        if len(value) < 8:
+            raise serializers.ValidationError(
+                "Password must be at least 8 characters."
             )
 
         if not re.search(r'[a-z]', value):
@@ -125,6 +131,109 @@ class SPProfileWriteSerializer(serializers.ModelSerializer):
         )
 
         return sp_profile
+
+class ChangePasswordSerializer(serializers.Serializer):
+    current_password = serializers.CharField(
+        write_only=True,
+        trim_whitespace=False,
+        max_length=128,
+    )
+
+    new_password = serializers.CharField(
+        write_only=True,
+        trim_whitespace=False,
+        min_length=8,
+        max_length=128,
+    )
+
+    confirm_password = serializers.CharField(
+        write_only=True,
+        trim_whitespace=False,
+        max_length=128,
+    )
+
+    def validate_new_password(self, value):
+        errors = []
+
+        if len(value) < 8:
+            errors.append(
+                "Password must be at least 8 characters."
+            )
+
+        if not re.search(r"[A-Z]", value):
+            errors.append(
+                "Password must contain at least one uppercase letter."
+            )
+
+        if not re.search(r"[a-z]", value):
+            errors.append(
+                "Password must contain at least one lowercase letter."
+            )
+
+        if not re.search(r"\d", value):
+            errors.append(
+                "Password must contain at least one digit."
+            )
+
+        if errors:
+            raise serializers.ValidationError(errors)
+
+        return value
+
+    def validate(self, attrs):
+        client = self.context["client"]
+
+        current = attrs["current_password"]
+        new = attrs["new_password"]
+        confirm = attrs["confirm_password"]
+
+        # -----------------------------
+        # Confirm new password
+        # -----------------------------
+        if new != confirm:
+            raise serializers.ValidationError({
+                "confirm_password": "Passwords do not match."
+            })
+
+        # -----------------------------
+        # Verify current password
+        # -----------------------------
+        if not check_password(current, client.password):
+            raise serializers.ValidationError({
+                "current_password": "Current password is incorrect."
+            })
+
+        # -----------------------------
+        # Prevent password reuse
+        # -----------------------------
+        if check_password(new, client.password):
+            raise serializers.ValidationError({
+                "new_password":
+                    "New password must be different from your current password."
+            })
+
+        # -----------------------------
+        # Prevent email local-part
+        # -----------------------------
+        local_part = client.email_address.split("@")[0].lower()
+
+        if len(local_part) >= 4 and local_part in new.lower():
+            raise serializers.ValidationError({
+                "new_password":
+                    "Password must not contain your email address."
+            })
+
+        # -----------------------------
+        # Django password validators
+        # -----------------------------
+        try:
+            validate_password(new, user=client)
+        except DjangoValidationError as e:
+            raise serializers.ValidationError({
+                "new_password": list(e.messages)
+            })
+
+        return attrs
     
 class DeviceTokenWriteSerializer(serializers.ModelSerializer):
     email = serializers.EmailField(write_only=True, required=True)
@@ -899,7 +1008,7 @@ class SPProfileMyReadSerializer(serializers.ModelSerializer):
     class Meta:
         model = SPProfile
         # List all fields except password
-        exclude = ['password', 'mfa_enabled','mfa_secret','failed_login_attempts','total_failed_login_attempts','account_locked_until','updated_at','date_created','last_login_at','last_login_ip']
+        exclude = ['password', 'mfa_enabled','mfa_secret','failed_login_attempts','total_failed_login_attempts','account_locked_until','updated_at','date_created','last_login_at','last_login_ip','email_verified_at']
         # OR, alternatively, explicitly include fields you want:
         # fields = ['id', 'email_address', 'mobile_number', 'is_profile_completed']
         read_only_fields = ['id', 'email_address', 'mobile_number', 'is_profile_completed','id']
@@ -909,7 +1018,7 @@ class SPProfileReadSerializer(serializers.ModelSerializer):
     class Meta:
         model = SPProfile
         # List all fields except password
-        exclude = ['password']
+        exclude = ['password', 'email_address', 'mobile_number','failed_login_attempts','mfa_secret','mfa_enabled','total_failed_login_attempts','account_locked_until','last_login_at','last_login_ip','email_verified_at']
         # OR, alternatively, explicitly include fields you want:
         # fields = ['id', 'email_address', 'mobile_number', 'is_profile_completed']
         read_only_fields = ['id', 'email_address', 'mobile_number', 'is_profile_completed','id']
@@ -949,7 +1058,7 @@ class ServiceGroupSerializer(serializers.ModelSerializer):
     category = ServiceCategorySerializer(read_only=True)
     class Meta:
         model = ServiceGroup
-        fields = '__all__'
+        fields = ["group_id", "name", "category"]
 
 class ServiceReadSerializer(serializers.ModelSerializer):
     class Meta:
@@ -1114,6 +1223,12 @@ class UpdateCostOfServiceSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError(
                 "Base price cannot be negative."
             )
+
+        if value is not None and value > 10000:
+            raise serializers.ValidationError(
+                "Base price cannot exceed R10,000."
+            )
+
         return value
 
 class DeleteProviderQualificationSerializer(serializers.ModelSerializer):

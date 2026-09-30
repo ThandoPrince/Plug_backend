@@ -1128,13 +1128,14 @@ def reset_sp_password(request):
             otp_request.is_verified = True
             otp_request.is_used = True
             otp_request.verified_at = now
-            otp_request.save(update_fields=["is_verified", "is_used", "verified_at"])
+            otp_request.save(update_fields=["is_verified", "is_used", "verified_at",])
 
             sp.password = make_password(new_password)
             sp.failed_login_attempts = 0
+            sp.password_changed_at = now
             sp.account_locked_until = None
             sp.save(update_fields=[
-                "password", "failed_login_attempts", "account_locked_until"
+                "password", "failed_login_attempts", "account_locked_until", "password_changed_at"
             ])
 
         return Response(
@@ -2402,6 +2403,26 @@ def update_cost_of_service(request, service_id):
     base_price = data.get("base_price")
     negotiable = data.get("negotiable", True)
     notes = data.get("notes", "")
+    if base_price is not None:
+        try:
+            base_price = Decimal(str(base_price))
+        except (InvalidOperation, ValueError, TypeError):
+            return Response(
+                {"error": "Base price must be a valid number."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        if base_price < 0:
+            return Response(
+                {"error": "Base price cannot be negative."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        if base_price > Decimal("10000.00"):
+            return Response(
+                {"error": "Base price cannot exceed R10,000."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
 
     try:
         with transaction.atomic():
@@ -2484,6 +2505,27 @@ def a_update_cost_of_service(request, service_id):
     base_price = data.get("base_price")
     negotiable = data.get("negotiable", True)
     notes = data.get("notes", "")
+
+    if base_price is not None:
+        try:
+            base_price = Decimal(str(base_price))
+        except (InvalidOperation, ValueError, TypeError):
+            return Response(
+                {"error": "Base price must be a valid number."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        if base_price < 0:
+            return Response(
+                {"error": "Base price cannot be negative."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        if base_price > Decimal("10000.00"):
+            return Response(
+                {"error": "Base price cannot exceed R10,000."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
 
     try:
         with transaction.atomic():
@@ -2802,6 +2844,41 @@ def provider_logout(request):
 
     try:
         token = RefreshToken(refresh_token)
+    except TokenError:
+        return Response(
+            {
+                "success": False,
+                "message": "Invalid or expired refresh token.",
+            },
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    # Only blacklist a token that actually belongs to the caller.
+    # Without this check, any authenticated provider could blacklist
+    # another provider's refresh token just by having a copy of it
+    # (leaked log, shared device, support ticket, etc.), forcing that
+    # other provider's session to die.
+    #
+    # Confirm "sp_id" is the exact claim name set by generate_sp_tokens() —
+    # adjust below if it differs.
+    token_sp_id = token.get("sp_id")
+
+    if token_sp_id is None or str(token_sp_id) != str(request.user.id):
+        logger.warning(
+            "provider_logout: refresh token sp_id mismatch. "
+            "caller=%s token_sp_id=%s",
+            request.user.id,
+            token_sp_id,
+        )
+        return Response(
+            {
+                "success": False,
+                "message": "Invalid or expired refresh token.",
+            },
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    try:
         token.blacklist()
 
         ProviderLoginHistory.objects.create(
@@ -2829,7 +2906,53 @@ def provider_logout(request):
             },
             status=status.HTTP_400_BAD_REQUEST,
         )
+
+
+        
     
+
+@api_view(["GET"])
+@authentication_classes([SPJWTAuthentication])
+@permission_classes([IsAuthenticated])
+@throttle_classes([UserReadThrottle])
+def get_provider_qualifications(request, provider_service_id):
+
+
+
+
+    provider_service = get_object_or_404(
+        ProviderService.objects.select_related(
+            "provider",
+            "provider__sp_profile",
+        ),
+        pk=provider_service_id,
+        provider__sp_profile=request.user,
+      
+        is_active=True,
+    )
+
+    qualifications = (
+        ProviderQualification.objects.filter(
+            provider_service=provider_service,
+        )
+        .order_by("-uploaded_at")
+    )
+
+    
+
+    serializer = ProviderQualificationReadSerializer(
+        qualifications,
+        many=True,
+        context={"request": request},
+    )
+
+    return Response(
+        {
+            "success": True,
+            "data": serializer.data,
+        },
+        status=status.HTTP_200_OK,
+    )
 
 @api_view(["GET"])
 @authentication_classes([SPJWTAuthentication])
@@ -3833,9 +3956,7 @@ def service_provider_details(request, provider_id):
         provider = ServiceProvider.objects.select_related(
             "sp_profile",
             "live_location",
-        ).get(
-            sp_profile__id=provider_id,
-        )
+        ).get(sp_profile=request.user)
 
         serializer = ServiceProviderMyReadSerializer(provider)
 
