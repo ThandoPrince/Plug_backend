@@ -392,7 +392,7 @@ class ServiceProvider(models.Model):
     updated_at = models.DateField(auto_now=True, db_index=True, null=True)
     date_created = models.DateField(auto_now_add=True, db_index=True,null=True)
 
-    is_active = models.BooleanField(default=True)
+    is_active = models.BooleanField(default=False, db_index=True)
     location = models.ForeignKey(Address, on_delete=models.SET_NULL, null=True, db_index=True)
     sp_profile = models.OneToOneField(
         SPProfile,
