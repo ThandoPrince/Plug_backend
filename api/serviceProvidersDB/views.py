@@ -95,7 +95,8 @@ logger = logging.getLogger(__name__)  ##do not remove
 def sp_login(request):
     ip_address = get_client_ip(request)
     user_agent = get_device_info(request)
-    identifier = request.data.get("email")
+    # Flutter sends "identifier", so read that first, with "email" as a fallback
+    identifier = request.data.get("identifier") or request.data.get("email")
     device_name = request.data.get("device_name")
 
     try:
@@ -125,41 +126,61 @@ def sp_login(request):
 
         sp = serializer.validated_data["user"]
 
-        # Password is correct, but this is NOT yet a completed
-        # login — the provider must complete OTP verification.
+        # Password is correct, but this is NOT yet a completed login.
+        # Unverified accounts get an email-verification OTP and token;
+        # everyone else gets a login OTP and token.
+        needs_email_verification = (
+            sp.is_profile_completed == "in-email-verification"
+        )
+        otp_purpose = (
+            OTP_EMAIL_VERIFICATION if needs_email_verification else OTP_LOGIN
+        )
 
         try:
             otp_request, otp = create_sp_otp(
                 service_provider=sp,
-                purpose=OTP_LOGIN,
+                purpose=otp_purpose,
             )
         except OTPCooldownError as e:
             return Response(
                 {
                     "success": False,
-                    "message": f"Please wait {e.retry_after} seconds before requesting another code.",
+                    "message": (
+                        f"Please wait {e.retry_after} seconds "
+                        "before requesting another code."
+                    ),
                 },
                 status=status.HTTP_429_TOO_MANY_REQUESTS,
             )
 
-        verification_token = generate_sp_login_token(sp, otp_request)
+        if needs_email_verification:
+            verification_token = generate_sp_email_verification_token(
+                sp, otp_request
+            )
+            message = (
+                "Please verify your email to complete registration. "
+                "A verification code has been sent to your email."
+            )
+        else:
+            verification_token = generate_sp_login_token(sp, otp_request)
+            message = "A verification code has been sent to your email."
 
         transaction.on_commit(
             lambda: send_sp_otp_email.delay(
                 sp.email_address,
                 otp,
-                OTP_LOGIN,
+                otp_purpose,
             )
         )
 
         return Response(
             {
                 "success": True,
-                "message": "A verification code has been sent to your email.",
+                "message": message,
                 "data": {
                     "id": sp.id,
                     "is_profile_completed": sp.is_profile_completed,
-                    "requires_email_verification": True,
+                    "requires_email_verification": needs_email_verification,
                     "otp_request_id": str(otp_request.request_id),
                     "verification_token": verification_token,
                 },

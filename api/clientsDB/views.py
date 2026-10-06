@@ -557,14 +557,7 @@ def reset_password_with_otp(request):
 def reset_client_password(request):
 
     try:
-        serializer = ResetPasswordWithOTPSerializer(
-            data=request.data,
-            context={"client": request.user},
-        )
-
-        serializer.is_valid(raise_exception=True)
-
-        new_password = serializer.validated_data["new_password"]
+        new_password = request.data.get("new_password")
         otp = request.data.get("otp")
 
         if not new_password:

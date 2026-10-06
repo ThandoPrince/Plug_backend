@@ -1,5 +1,5 @@
 import os
-
+from disposable_email_domains import blocklist as disposable_blocklist
 from rest_framework import serializers
 from django.contrib.auth.hashers import check_password, make_password
 from django.db import transaction
@@ -56,6 +56,16 @@ class SPProfileWriteSerializer(serializers.ModelSerializer):
             validate_email(email)
         except DjangoValidationError:
             raise serializers.ValidationError("Enter a valid email address.")
+
+        # Reject temporary / disposable email domains (including subdomains,
+        # so "x.mailinator.com" is caught as well)
+        domain = email.rsplit("@", 1)[-1]
+        parts = domain.split(".")
+        candidates = {".".join(parts[i:]) for i in range(len(parts) - 1)}
+        if candidates & set(disposable_blocklist):
+            raise serializers.ValidationError(
+                "Please use a permanent email address."
+            )
 
         if SPProfile.objects.filter(email_address=email).exists():
             raise serializers.ValidationError(
