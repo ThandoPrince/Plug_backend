@@ -211,6 +211,9 @@ class SPProfile(models.Model):
         )
     updated_at = models.DateField(auto_created=True,null=True, blank=True)
     date_created = models.DateField(null=True,blank=True,auto_created=True)
+    deleted_at = models.DateTimeField(null=True, blank=True, db_index=True)
+    session_version = models.PositiveIntegerField(default=0)
+    password_changed_at = models.DateTimeField(null=True, blank=True, db_index=True)
 
     last_login_at = models.DateTimeField(
     null=True,
@@ -251,6 +254,7 @@ class SPOTP(models.Model):
     PURPOSE_CHOICES = [
         ("login", "Login"),
         ("email_verification", "Email Verification"),
+        ("password_reset", "Password Reset"),
     ]
 
     request_id = models.UUIDField(

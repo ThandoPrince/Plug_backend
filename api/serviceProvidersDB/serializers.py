@@ -142,6 +142,114 @@ class SPProfileWriteSerializer(serializers.ModelSerializer):
 
         return sp_profile
 
+
+
+class ResetSPPasswordWithOTPSerializer(serializers.Serializer):
+    new_password = serializers.CharField(
+        write_only=True,
+        trim_whitespace=False,
+        min_length=8,
+        max_length=128,
+    )
+
+    def validate_new_password(self, value):
+        errors = []
+        if len(value) < 8:
+            errors.append("Password must be at least 8 characters.")
+        if not re.search(r"[A-Z]", value):
+            errors.append("Password must contain at least one uppercase letter.")
+        if not re.search(r"[a-z]", value):
+            errors.append("Password must contain at least one lowercase letter.")
+        if not re.search(r"\d", value):
+            errors.append("Password must contain at least one digit.")
+        if not re.search(r"[^\w\s]", value):
+            errors.append("Password must contain at least one special character.")
+        if errors:
+            raise serializers.ValidationError(errors)
+        return value
+
+    def validate(self, attrs):
+        sp = self.context["sp"]
+        new_password = attrs["new_password"]
+
+        if check_password(new_password, sp.password):
+            raise serializers.ValidationError({
+                "new_password": "New password must be different from your current password."
+            })
+
+        local_part = sp.email_address.split("@")[0].lower()
+        if len(local_part) >= 4 and local_part in new_password.lower():
+            raise serializers.ValidationError({
+                "new_password": "Password must not contain your email address."
+            })
+
+        try:
+            validate_password(new_password, user=sp)
+        except DjangoValidationError as exc:
+            raise serializers.ValidationError({"new_password": list(exc.messages)})
+
+        return attrs    
+
+
+class SPChangePasswordSerializer(serializers.Serializer):
+    current_password = serializers.CharField(
+        write_only=True, trim_whitespace=False, max_length=128
+    )
+    new_password = serializers.CharField(
+        write_only=True, trim_whitespace=False, min_length=8, max_length=128
+    )
+    confirm_password = serializers.CharField(
+        write_only=True, trim_whitespace=False, max_length=128
+    )
+
+    def validate_new_password(self, value):
+        errors = []
+        if not re.search(r"[A-Z]", value):
+            errors.append("Password must contain at least one uppercase letter.")
+        if not re.search(r"[a-z]", value):
+            errors.append("Password must contain at least one lowercase letter.")
+        if not re.search(r"\d", value):
+            errors.append("Password must contain at least one digit.")
+        if not re.search(r"[^\w\s]", value):
+            errors.append("Password must contain at least one special character.")
+        if errors:
+            raise serializers.ValidationError(errors)
+        return value
+
+    def validate(self, attrs):
+        sp = self.context["sp"]
+        current = attrs["current_password"]
+        new = attrs["new_password"]
+
+        if new != attrs["confirm_password"]:
+            raise serializers.ValidationError(
+                {"confirm_password": "Passwords do not match."}
+            )
+
+        if not check_password(current, sp.password):
+            raise serializers.ValidationError(
+                {"current_password": "Current password is incorrect."}
+            )
+
+        if check_password(new, sp.password):
+            raise serializers.ValidationError(
+                {"new_password": "New password must be different from your current password."}
+            )
+
+        local_part = sp.email_address.split("@")[0].lower()
+        if len(local_part) >= 4 and local_part in new.lower():
+            raise serializers.ValidationError(
+                {"new_password": "Password must not contain your email address."}
+            )
+
+        try:
+            validate_password(new, user=sp)
+        except DjangoValidationError as e:
+            raise serializers.ValidationError({"new_password": list(e.messages)})
+
+        return attrs
+
+
 class ChangePasswordSerializer(serializers.Serializer):
     current_password = serializers.CharField(
         write_only=True,

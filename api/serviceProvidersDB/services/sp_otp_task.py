@@ -122,3 +122,45 @@ def send_sp_otp_email(self, email_address, otp, purpose):
     email.send(fail_silently=False)
 
     logger.info("Service provider OTP email sent successfully.")
+
+
+
+@shared_task(
+    bind=True,
+    autoretry_for=(Exception,),
+    retry_backoff=True,
+    retry_jitter=True,
+    max_retries=3,
+)
+def send_sp_password_changed_email(self, email_address):
+    subject = "Your Plug provider password was changed"
+
+    text_content = (
+        "Your Plug provider account password was just changed.\n\n"
+        "If this was you, no further action is needed.\n\n"
+        "If you did not make this change, reset your password immediately "
+        "and contact support."
+    )
+
+    html_content = """
+    <html>
+        <body>
+            <h2>Your Plug Provider Password Was Changed</h2>
+            <p>Your provider account password was just changed.</p>
+            <p>If this was you, no further action is needed.</p>
+            <p><strong>If you did not make this change</strong>, reset your
+            password immediately and contact support.</p>
+        </body>
+    </html>
+    """
+
+    email = EmailMultiAlternatives(
+        subject=subject,
+        body=text_content,
+        from_email=settings.DEFAULT_FROM_EMAIL,
+        to=[email_address],
+    )
+    email.attach_alternative(html_content, "text/html")
+    email.send(fail_silently=False)
+
+    logger.info("Service provider password changed notification sent.")

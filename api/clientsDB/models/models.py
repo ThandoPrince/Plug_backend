@@ -169,6 +169,7 @@ class ClientOTP(models.Model):
     PURPOSE_CHOICES = [
         ("login", "Login"),
         ("email_verification", "Email Verification"),
+        ("password_reset", "Password Reset"),
     ]
 
     request_id = models.UUIDField(

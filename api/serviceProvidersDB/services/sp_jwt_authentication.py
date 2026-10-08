@@ -2,48 +2,50 @@ from rest_framework_simplejwt.authentication import JWTAuthentication
 from rest_framework.exceptions import AuthenticationFailed
 from api.serviceProvidersDB.models import SPProfile
 
+
 class SPJWTAuthentication(JWTAuthentication):
 
     def authenticate(self, request):
-        # 1. Safely extract the raw header using SimpleJWT native utilities
         header = self.get_header(request)
         if header is None:
-            print("AUTH HEADER: None")
-            return None  # Let DRF handle anonymous request routing natively
+            return None
+
+        raw_token = self.get_raw_token(header)
+        if raw_token is None:
+            return None
 
         try:
-            # 2. Extract token string out of structural syntax rules (e.g., Bearer <token>)
-            raw_token = self.get_raw_token(header)
-            if raw_token is None:
-                print("RAW TOKEN: Extraction evaluated to None")
-                return None
-
-            # print("RAW TOKEN:", raw_token)
-
-            # 3. Assert signature integrity and checking expiration limits
             validated_token = self.get_validated_token(raw_token)
-            # print("VALIDATED TOKEN:", validated_token)
+        except Exception:
+            raise AuthenticationFailed("Invalid or expired token.")
 
-            # 4. Resolve token custom payload claims down to the database record
-            user = self.get_user(validated_token)
-            # print("SP USER:", user)
-
-            return (user, validated_token)
-
-        except Exception as e:
-            print("JWT ERROR:", str(e))
-            # Critical: Raise DRF standard tracking exceptions to enforce clean 401 JSON API wrappers
-            raise AuthenticationFailed(f"Authentication failed: {str(e)}")
+        user = self.get_user(validated_token)  # raises AuthenticationFailed itself
+        return (user, validated_token)
 
     def get_user(self, validated_token):
-        # Map target identity claim from payload dictionary keys
-        sp_id = validated_token.get("sp_id")
-        # print("SP ID:", sp_id)
+        # Verification tokens (e.g. purpose="password_reset") must never
+        # work as session tokens.
+        if validated_token.get("purpose"):
+            raise AuthenticationFailed("Invalid token.")
 
+        if validated_token.get("user_type") != "service_provider":
+            raise AuthenticationFailed("Invalid token.")
+
+        sp_id = validated_token.get("sp_id")
         if not sp_id:
-            raise AuthenticationFailed("Invalid token: Missing service provider claim identifier.")
+            raise AuthenticationFailed("Invalid token.")
 
         try:
-            return SPProfile.objects.get(id=sp_id)
+            sp = SPProfile.objects.get(id=sp_id)
         except SPProfile.DoesNotExist:
-            raise AuthenticationFailed("Service Provider profile instance not found.")
+            raise AuthenticationFailed("Invalid token.")
+
+        if not sp.is_active:
+            raise AuthenticationFailed("Invalid token.")
+
+        # Session version: a password change/reset bumps this and
+        # invalidates every token issued before it.
+        if validated_token.get("sv", 0) != sp.session_version:
+            raise AuthenticationFailed("Session expired. Please log in again.")
+
+        return sp

@@ -33,6 +33,9 @@ def authenticate_ws_token(token: str):
         if client is None:
             return None, None
 
+        if not client.is_active:
+            return None, None
+
         # Revoked by a password change/reset
         if validated_token.get("sv", 0) != client.session_version:
             return None, None
@@ -40,9 +43,20 @@ def authenticate_ws_token(token: str):
         return client, "client"
 
     if sp_id:
+        if validated_token.get("user_type") != "service_provider":
+            return None, None
+
         provider = SPProfile.objects.filter(id=sp_id).first()
         if provider is None:
             return None, None
+
+        if not provider.is_active:
+            return None, None
+
+        # Revoked by a password change/reset
+        if validated_token.get("sv", 0) != provider.session_version:
+            return None, None
+
         return provider, "provider"
 
     return None, None

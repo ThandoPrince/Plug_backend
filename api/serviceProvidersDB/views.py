@@ -35,6 +35,7 @@ from api.clientsDB.services.jwt_client_authentication import ClientJWTAuthentica
 from api.clientsDB.services.otp_service import hash_otp
 from api.clientsDB.services.otp_tasks import OTP_EMAIL_VERIFICATION, OTP_LOGIN, OTP_PASSWORD_RESET, OTPCooldownError
 from api.clientsDB.services.sa_phone_number_helper import normalize_sa_mobile
+from api.clientsDB.views import INVALID_REFRESH, SESSION_EXPIRED, _mask_email
 from api.serviceProvidersDB.services.affidavit_hash_calcultor import calculate_sha256
 from api.serviceProvidersDB.services.affidavit_verification_service import AIKYCClient
 from api.serviceProvidersDB.services.generate_sp_password_reset_token import generate_sp_password_reset_token
@@ -43,7 +44,7 @@ from api.serviceProvidersDB.services.otp_utils import create_sp_otp
 from api.serviceProvidersDB.services.service_validator import validate_service_submission
 from api.serviceProvidersDB.services.sp_jwt_authentication import SPJWTAuthentication
 from api.serviceProvidersDB.services.sp_otp_service import generate_sp_email_verification_token, generate_sp_login_token
-from api.serviceProvidersDB.services.sp_otp_task import send_sp_otp_email
+from api.serviceProvidersDB.services.sp_otp_task import send_sp_otp_email, send_sp_password_changed_email
 from plug_backend import settings
 from plug_backend.helpers.auth_helpers import get_service_provider, get_sp_profile
 from plug_backend.throttles import AuthThrottle, ClientOTPThrottle, HeavyReadThrottle, LiveLocationReadThrottle, LiveLocationWriteThrottle, ProfileWriteThrottle, RegisterThrottle, UploadThrottle, UserReadThrottle
@@ -61,7 +62,9 @@ from .serializers import (
     ProviderQualificationSerializer,
     ProviderServiceAffidavitSerializer,
     ProviderSeviceSerializer,
+    ResetSPPasswordWithOTPSerializer,
     SPAddressDocumentWriteSerializer,
+    SPChangePasswordSerializer,
     SPCostOfServiceImageReadSerializer,
     SPLiveLocationSerializer,
     SPLoginSerializer,
@@ -88,6 +91,36 @@ logger = logging.getLogger(__name__)  ##do not remove
 
 
 
+
+
+@api_view(["POST"])
+@authentication_classes([])
+@permission_classes([AllowAny])
+@throttle_classes([AuthThrottle])
+def sp_token_refresh(request):
+    raw_refresh = request.data.get("refresh")
+    if not raw_refresh:
+        return Response(INVALID_REFRESH, status=status.HTTP_401_UNAUTHORIZED)
+
+    try:
+        refresh = RefreshToken(raw_refresh)
+    except TokenError:
+        return Response(INVALID_REFRESH, status=status.HTTP_401_UNAUTHORIZED)
+
+    if refresh.get("purpose") or refresh.get("user_type") != "service_provider":
+        return Response(INVALID_REFRESH, status=status.HTTP_401_UNAUTHORIZED)
+
+    sp = SPProfile.objects.filter(pk=refresh.get("sp_id")).first()
+    if sp is None:
+        return Response(INVALID_REFRESH, status=status.HTTP_401_UNAUTHORIZED)
+
+    if refresh.get("sv", 0) != sp.session_version:
+        return Response(SESSION_EXPIRED, status=status.HTTP_401_UNAUTHORIZED)
+
+    if not sp.is_active:
+        return Response(SESSION_EXPIRED, status=status.HTTP_401_UNAUTHORIZED)
+
+    return Response({"access": str(refresh.access_token)}, status=status.HTTP_200_OK)
 
 @api_view(["POST"])
 @throttle_classes([AuthThrottle])
@@ -1280,6 +1313,46 @@ def request_sp_password_reset(request):
         )
 
 
+@api_view(["POST"])
+@authentication_classes([SPJWTAuthentication])
+@permission_classes([IsAuthenticated])
+@throttle_classes([AuthThrottle])
+def change_sp_password(request):
+    """
+    Change the authenticated service provider's password.
+    Operates ONLY on request.user, with no id taken from the payload (RLS).
+    """
+    with transaction.atomic():
+        sp = SPProfile.objects.select_for_update().get(pk=request.user.pk)
+
+        serializer = SPChangePasswordSerializer(
+            data=request.data,
+            context={"sp": sp},
+        )
+        serializer.is_valid(raise_exception=True)
+
+        sp.password = make_password(serializer.validated_data["new_password"])
+        sp.password_changed_at = timezone.now()
+        sp.session_version += 1
+        sp.save(update_fields=["password", "password_changed_at", "session_version"])
+
+        email_address = sp.email_address
+        transaction.on_commit(
+            lambda: send_sp_password_changed_email.delay(email_address)
+        )
+
+    # Minted AFTER the sv bump — this device stays logged in; every other
+    # device's token now fails the sv check immediately.
+    tokens = generate_sp_tokens(sp)
+
+    return Response(
+        {
+            "message": "Password changed successfully.",
+            "access": tokens["access"],
+            "refresh": tokens["refresh"],
+        },
+        status=status.HTTP_200_OK,
+    )
 
 
 @api_view(["POST"])
@@ -1393,6 +1466,184 @@ def resend_sp_otp(request):
             },
             status=status.HTTP_500_INTERNAL_SERVER_ERROR,
         )
+
+    
+
+@api_view(["POST"])
+@authentication_classes([SPJWTAuthentication])
+@permission_classes([IsAuthenticated])
+@throttle_classes([AuthThrottle])
+def request_sp_password_reset_otp(request):
+    sp = request.user
+
+    if sp.account_locked_until and sp.account_locked_until > timezone.now():
+        return Response(
+            {"error": "Account is temporarily locked. Try again later."},
+            status=status.HTTP_403_FORBIDDEN,
+        )
+
+    try:
+        with transaction.atomic():
+            otp_request, otp = create_sp_otp(
+                service_provider=sp,
+                purpose=OTP_PASSWORD_RESET,
+            )
+            email_address = sp.email_address
+            transaction.on_commit(
+                lambda: send_sp_otp_email.delay(
+                    email_address, otp, OTP_PASSWORD_RESET
+                )
+            )
+    except OTPCooldownError as exc:
+        return Response(
+            {
+                "error": "Please wait before requesting another code.",
+                "retry_after": getattr(exc, "retry_after", None),
+            },
+            status=status.HTTP_429_TOO_MANY_REQUESTS,
+        )
+    except Exception:
+        logger.exception("Unexpected error in request_sp_password_reset_otp")
+        return Response(
+            {"error": "Unable to process request at this time."},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
+
+    return Response(
+        {
+            "success": True,
+            "message": "A verification code has been sent to your email.",
+            "data": {
+                "otp_request_id": str(otp_request.request_id),
+                "masked_email": _mask_email(sp.email_address),
+            },
+        },
+        status=status.HTTP_200_OK,
+    )
+
+
+@api_view(["POST"])
+@authentication_classes([SPJWTAuthentication])
+@permission_classes([IsAuthenticated])
+@throttle_classes([ClientOTPThrottle])
+def reset_sp_password_with_otp(request):
+    try:
+        serializer = ResetSPPasswordWithOTPSerializer(
+            data=request.data,
+            context={"sp": request.user},
+        )
+        serializer.is_valid(raise_exception=True)
+
+        new_password = serializer.validated_data["new_password"]
+        otp = str(request.data.get("otp") or "").strip()
+        otp_request_id = request.data.get("otp_request_id")
+
+        if not otp or not otp_request_id:
+            return Response(
+                {"error": "otp and otp_request_id are required"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        with transaction.atomic():
+            sp = SPProfile.objects.select_for_update().get(pk=request.user.pk)
+            now = timezone.now()
+
+            if sp.account_locked_until and sp.account_locked_until > now:
+                return Response(
+                    {"error": ["Account is temporarily locked. Try again later"]},
+                    status=status.HTTP_403_FORBIDDEN,
+                )
+
+            otp_request = (
+                SPOTP.objects.select_for_update()
+                .filter(
+                    request_id=otp_request_id,
+                    service_provider_id=sp.pk,
+                    purpose="password_reset",
+                )
+                .first()
+            )
+
+            if otp_request is None:
+                hash_otp("000000")
+                return Response(SP_PASSWORD_RESET_INVALID_OR_EXPIRED, status=status.HTTP_400_BAD_REQUEST)
+
+            if otp_request.is_used or otp_request.is_verified:
+                hash_otp("000000")
+                return Response(SP_PASSWORD_RESET_INVALID_OR_EXPIRED, status=status.HTTP_400_BAD_REQUEST)
+
+            if now >= otp_request.expires_at:
+                hash_otp("000000")
+                return Response(SP_PASSWORD_RESET_INVALID_OR_EXPIRED, status=status.HTTP_400_BAD_REQUEST)
+
+            if otp_request.attempts >= otp_request.max_attempts:
+                hash_otp("000000")
+                return Response(
+                    {"success": False, "message": "Too many invalid OTP attempts."},
+                    status=status.HTTP_429_TOO_MANY_REQUESTS,
+                )
+
+            if not secrets.compare_digest(hash_otp(otp), otp_request.otp_hash):
+                otp_request.attempts += 1
+                otp_request.save(update_fields=["attempts"])
+
+                if otp_request.attempts >= otp_request.max_attempts:
+                    return Response(
+                        {"success": False, "message": "Too many invalid OTP attempts."},
+                        status=status.HTTP_429_TOO_MANY_REQUESTS,
+                    )
+
+                return Response(SP_PASSWORD_RESET_INVALID_OR_EXPIRED, status=status.HTTP_400_BAD_REQUEST)
+
+            if check_password(new_password, sp.password):
+                return Response(
+                    {"error": ["New password cannot be the same as the old password."]},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            otp_request.is_verified = True
+            otp_request.is_used = True
+            otp_request.verified_at = now
+            otp_request.save(update_fields=["is_verified", "is_used", "verified_at"])
+
+            sp.password = make_password(new_password)
+            sp.failed_login_attempts = 0
+            sp.password_changed_at = now
+            sp.session_version += 1
+            sp.save(update_fields=[
+                "password", "failed_login_attempts",
+                "password_changed_at", "session_version",
+            ])
+
+            email_address = sp.email_address
+            transaction.on_commit(
+                lambda: send_sp_password_changed_email.delay(email_address)
+            )
+
+        # Minted AFTER the sv bump — this device stays logged in; every
+        # other token (any other device) now fails the sv check.
+        tokens = generate_sp_tokens(sp)
+
+        return Response(
+            {
+                "success": True,
+                "message": "Password changed successfully.",
+                "access": tokens["access"],
+                "refresh": tokens["refresh"],
+            },
+            status=status.HTTP_200_OK,
+        )
+
+    except ValidationError as exc:
+        return Response(exc.detail, status=status.HTTP_400_BAD_REQUEST)
+    except Exception:
+        logger.exception("Unexpected error in reset_sp_password_with_otp")
+        return Response(
+            {"error": "Unable to reset password at this time."},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
+
+
     
 @api_view(['POST'])
 @throttle_classes([RegisterThrottle])

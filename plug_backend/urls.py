@@ -32,11 +32,7 @@ urlpatterns = [
         views.get_my_auth,
         name='client-auth-by-email'
     ), ##used
-    path(
-        "api/sp/token/refresh/",
-        TokenRefreshView.as_view(),
-        name="token_refresh",
-    ),
+    
 
     path(
         "api/client/token/refresh/",
@@ -129,6 +125,11 @@ path("api/client/delete-account/",    views.delete_client_account,    name="clie
     sp_views.provider_logout,
     name="provider-logout",
 ),##used
+
+path("api/sp/password-reset/request-otp/", sp_views.request_sp_password_reset_otp, name="sp_request_password_reset_otp"),##used
+path("api/sp/password-reset/confirm/", sp_views.reset_sp_password_with_otp, name="sp_reset_password_with_otp"),##used
+path("api/sp/token/refresh/", sp_views.sp_token_refresh, name="sp_token_refresh"),##used
+path("api/sp/change-password/", sp_views.change_sp_password, name="sp_change_password"),
     path('api/sp_service/cost/<int:service_id>/', sp_views.update_cost_of_service, name='sp_cost_of'), ##used
     path('api/a_sp_service/cost/<int:service_id>/', sp_views.a_update_cost_of_service, name='a_sp_cost_of'),##used
     
