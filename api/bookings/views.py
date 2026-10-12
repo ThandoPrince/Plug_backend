@@ -2,7 +2,11 @@ from datetime import timedelta
 from decimal import Decimal
 import json
 import logging
+from django.core.exceptions import ObjectDoesNotExist
 from types import SimpleNamespace
+from django.http import Http404
+from rest_framework.exceptions import ValidationError
+from rest_framework.pagination import PageNumberPagination
 from django.conf import settings
 from django.utils import timezone
 from django.shortcuts import get_object_or_404
@@ -32,6 +36,7 @@ from channels.layers import get_channel_layer
 from asgiref.sync import async_to_sync
 from .models import BookingItem, NegotiationRound, OrderService, Negotiation, Rating, Session, SessionLocationPing, SessionToken, Shipment, ShipmentHistory, ShipmentRoute
 from .serializers import (
+    ROUNDS_PAGE_SIZE,
     CancelOrderSerializer,
     ClientRatingReadSerializer,
     ClientRatingSerializer,
@@ -47,6 +52,8 @@ from .serializers import (
     NegotiationClientCounterSerializer,
     BookingItemReadSerializer,
     NegotiationRoundReadSerializer,
+    PagedNegotiationReadSerializer,
+    ProviderNegotiationReadSerializer,
     RatingReadSerializer,
     RatingWriteSerializer,
     RemoveInvitedProviderSerializer,
@@ -227,38 +234,48 @@ def negotiation_list(request):
 @permission_classes([IsAuthenticated])
 @throttle_classes([HeavyReadThrottle])
 def negotiation_detail(request, pk):
-
+    """Rounds are paginated: optional ?before=<round pk>&limit=<n>."""
     try:
+        try:
+            before = request.query_params.get("before")
+            before = int(before) if before else None
+            limit = min(int(request.query_params.get("limit", ROUNDS_PAGE_SIZE)), 50)
+            if limit < 1:
+                raise ValueError
+        except ValueError:
+            return Response({"detail": "Invalid parameters."},
+                            status=status.HTTP_400_BAD_REQUEST)
+
         client = get_client_details(request)
 
         # 🔒 RLS enforcement via order relationship
         negotiation = get_object_or_404(
             Negotiation.objects.select_related("service_order"),
             pk=pk,
-            service_order__client=client
+            service_order__client=client,
         )
 
-        serializer = NegotiationReadSerializer(negotiation)
+        ctx = {"before": before, "limit": limit, "has_more": False}
+        data = PagedNegotiationReadSerializer(negotiation, context=ctx).data
+        # data must be evaluated before reading ctx["has_more"]
 
-        return Response(serializer.data)
+        response = Response(data)
+        response["X-Has-More-Rounds"] = "true" if ctx["has_more"] else "false"
+        return response
+
+    except Http404:
+        # get_object_or_404 raises Http404, which neither except below
+        # caught, so a missing negotiation returned a 500.
+        raise
 
     except Negotiation.DoesNotExist:
-        return Response(
-            {
-                "detail": "Negotiation not found or access denied."
-            },
-            status=status.HTTP_404_NOT_FOUND
-        )
+        return Response({"detail": "Negotiation not found or access denied."},
+                        status=status.HTTP_404_NOT_FOUND)
 
     except Exception:
         logger.exception("Error fetching negotiation detail")
-
-        return Response(
-            {
-                "detail": "Unexpected server error."
-            },
-            status=status.HTTP_500_INTERNAL_SERVER_ERROR
-        )
+        return Response({"detail": "Unexpected server error."},
+                        status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     
         
@@ -467,29 +484,36 @@ def provider_accept_negotiation(request, negotiation_id):
 
             order.invited_providers.clear()
 
-            transaction.on_commit(
-                lambda: (
-                    EventBus.emit(
-                        OrderAcceptedEvent({
-                            "order": order,
-                            "negotiation": negotiation,
-                            "provider_service": provider_service,
-                        })
-                    ),
+            order_id = order.order_id
+            provider_profile_id = provider.sp_profile.id
+            client_profile_id = order.client.client_profile.id
 
-                    notify_provider_booking_update(
-                        provider_id=provider.sp_profile.id,
+            def _after_commit():
+                steps = (
+                    lambda: EventBus.emit(OrderAcceptedEvent({
+                        "order": order,
+                        "negotiation": negotiation,
+                        "provider_service": provider_service,
+                    })),
+                    lambda: notify_provider_booking_update(
+                        provider_id=provider_profile_id,
                         payload=OrderServiceReadSerializer(order).data,
                     ),
-
-                    _send_status_changed(negotiation, order),
-
-                    notify_client_booking(
-                        client_id=order.client.client_profile.id,
+                    lambda: _send_status_changed(negotiation, order),
+                    lambda: notify_client_booking(
+                        client_id=client_profile_id,
                         payload=OrderServiceReadSerializer(order).data,
                     ),
                 )
-            )
+                for step in steps:
+                    try:
+                        step()
+                    except Exception:
+                        logger.exception(
+                            "Post-accept step failed. order_id=%s", order_id
+                        )
+
+            transaction.on_commit(_after_commit)
 
         return Response(
             {
@@ -617,21 +641,57 @@ def negotiations_by_order(request, order_id):
 @throttle_classes([HeavyReadThrottle])
 def negotiations_by_order_and_provider(request, order_id):
     """
-    Get all negotiations for a specific order belonging to the authenticated provider.
+    Get negotiations for a specific order belonging to the authenticated provider.
+    Rounds are paginated: optional ?before=<round pk>&limit=<n>.
     """
     try:
+        try:
+            before = request.query_params.get("before")
+            before = int(before) if before else None
+            limit = min(
+                int(request.query_params.get("limit", ROUNDS_PAGE_SIZE)),
+                50,
+            )
+            if limit < 1:
+                raise ValueError
+        except ValueError:
+            return Response(
+                {"error": "Invalid parameters."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
         profile = get_sp_profile(request)
         provider = ServiceProvider.objects.get(sp_profile=profile)
 
         order = get_object_or_404(OrderService, pk=order_id)
 
-        negotiations = Negotiation.objects.filter(
-            service_order=order,
-            provider_for_negotiation__provider=provider,
-        ).order_by("-created_at")
+        negotiations = list(
+            Negotiation.objects
+            .filter(
+                service_order=order,
+                provider_for_negotiation__provider=provider,
+            )
+            .select_related("provider_for_negotiation")
+            .order_by("-created_at")
+        )
 
-        serializer = NegotiationReadSerializer(negotiations, many=True)
-        return Response(serializer.data, status=status.HTTP_200_OK)
+        ctx = {"before": before, "limit": limit, "has_more": {}}
+        data = ProviderNegotiationReadSerializer(
+            negotiations, many=True, context=ctx
+        ).data  # evaluate before reading ctx["has_more"]
+
+        # The chat uses the first negotiation, so the header describes it.
+        first = negotiations[0] if negotiations else None
+        has_more = bool(first and ctx["has_more"].get(first.pk))
+
+        response = Response(data, status=status.HTTP_200_OK)
+        response["X-Has-More-Rounds"] = "true" if has_more else "false"
+        return response
+
+    except Http404:
+        # get_object_or_404 raises Http404, which is not an ObjectDoesNotExist,
+        # so without this it fell into the catch-all and returned a 500.
+        raise
 
     except ObjectDoesNotExist as e:
         logger.warning(
@@ -655,21 +715,65 @@ def negotiations_by_order_and_provider(request, order_id):
         )
 
 
+class BookingsPagination(PageNumberPagination):
+    page_size = 10
+    page_size_query_param = "page_size"
+    max_page_size = 20 
+
 
 @api_view(['GET'])
 @throttle_classes([HeavyReadThrottle])
 @authentication_classes([SPJWTAuthentication])
 @permission_classes([IsAuthenticated])
 def bookings_by_invited_provider(request, id):
-    """Get all bookings where the given provider email is invited"""
-    orders = OrderService.objects.filter(
-        invited_providers__id=id,
-        status__in=['pending', 'in_progress', 'in-negotiation','rescheduled']
-    ).distinct().order_by('-date_and_time_created')
 
-    serializer = OrderServiceReadSerializer(orders, many=True)
-    return Response(serializer.data)
+    # RLS: the URL id is never used for authorization. The provider can
+    # only ever read their own invited bookings.
+    if str(request.user.id) != str(id):
+        return Response(
+            {"detail": "You do not have permission to view these bookings."},
+            status=status.HTTP_403_FORBIDDEN,
+        )
 
+    try:
+        orders = (
+            OrderService.objects
+            .filter(
+                invited_providers=request.user,   # from the token, not the URL
+                status__in=[
+                    'pending',
+                    'in_progress',
+                    'in-negotiation',
+                    'rescheduled',
+                ],
+            )
+            .distinct()
+            .select_related("client", "service_required")
+            .order_by('-date_and_time_created', '-pk')
+        )
+
+        paginator = BookingsPagination()
+        page = paginator.paginate_queryset(orders, request)
+
+        serializer = OrderServiceReadSerializer(page, many=True)
+
+        return paginator.get_paginated_response(serializer.data)
+
+    except Exception:
+        logger.exception(
+            "Unexpected error retrieving invited-provider bookings. "
+            "provider_id=%s",
+            request.user.id,
+        )
+
+        return Response(
+            {
+                "detail": "Unable to retrieve bookings at this time. Please try again later."
+            },
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
+
+    
 
 @api_view(["PATCH"])
 @throttle_classes([BookingLikeWriteThrottle])
@@ -916,14 +1020,12 @@ def provider_start_round(request, negotiation_id):
             )
 
     with transaction.atomic():
-        # Prevent exceeding the allowed number of rounds
         if negotiation.round_count >= negotiation.max_rounds:
             return Response(
                 {"error": "Maximum negotiation rounds reached."},
-                status=status.HTTP_400_BAD_REQUEST
+                status=status.HTTP_400_BAD_REQUEST,
             )
 
-        # Create the new provider round
         new_round = NegotiationRound.objects.create(
             negotiation=negotiation,
             sender_type="provider",
@@ -931,19 +1033,43 @@ def provider_start_round(request, negotiation_id):
             message=message,
         )
 
-        transaction.on_commit(
-    lambda: notify_provider_booking_update(
-        provider_id=negotiation.provider_for_negotiation.provider.sp_profile.id,
-        payload=OrderServiceReadSerializer(order).data,
-    )
-)
+        provider_profile_id = negotiation.provider_for_negotiation.provider.sp_profile.id
+        client_profile_id = order.client.client_profile.id
+        round_data = NegotiationRoundReadSerializer(new_round).data
+        round_payload = {
+            "negotiation_id": negotiation.negotiation_id,
+            "round": round_data,
+        }
+
+        def _after_commit():
+            layer = get_channel_layer()
+            async_to_sync(layer.group_send)(
+                f"negotiation_{negotiation.negotiation_id}",
+                build_negotiation_event(
+                    "negotiation_round_created",
+                    negotiation.negotiation_id,
+                    round_payload,
+                ),
+            )
+            async_to_sync(layer.group_send)(
+                f"client_{client_profile_id}",
+                {"type": "negotiation_round_created", "data": round_payload},
+            )
+            notify_provider_booking_update(
+                provider_id=provider_profile_id,
+                payload=OrderServiceReadSerializer(order).data,
+            )
+
+        transaction.on_commit(_after_commit)
+
+        # Handler schedules the Celery push via on_commit as well.
         EventBus.emit(
-    NegotiationRoundCreatedEvent({
-        "negotiation": negotiation,
-        "round": new_round,
-        "sender_type": "provider",
-    })
-)
+            NegotiationRoundCreatedEvent({
+                "negotiation": negotiation,
+                "round": new_round,
+                "sender_type": "provider",
+            })
+        )
         channel_layer = get_channel_layer()
 
         round_payload = {
@@ -1110,68 +1236,57 @@ def negotiation_rounds_by_negotiation(request, negotiation_id):
     serializer = NegotiationRoundReadSerializer(rounds, many=True)
     return Response(serializer.data, status=status.HTTP_200_OK)
 
+
+
 @api_view(['POST'])
 @authentication_classes([ClientJWTAuthentication])
 @permission_classes([IsAuthenticated])
 @throttle_classes([HeavyReadThrottle])
 def client_start_round(request, negotiation_id):
-
     try:
-        # 🔒 RLS: resolve actual ClientDetails
         client = get_client_details(request)
 
-        # 🔒 RLS enforcement through order ownership
         negotiation = get_object_or_404(
             Negotiation.objects.select_related("service_order"),
             pk=negotiation_id,
-            service_order__client=client
+            service_order__client=client,
         )
-
         order = negotiation.service_order
 
-        # ❌ Block invalid states
         if order.status in ['accepted', 'cancelled'] or negotiation.status in ['accepted', 'cancelled']:
             return Response(
                 {"detail": "Negotiation cannot continue in current state."},
-                status=status.HTTP_400_BAD_REQUEST
+                status=status.HTTP_400_BAD_REQUEST,
             )
 
-        # ✅ Validate input
         serializer = NegotiationRoundWriteSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-
         offered_price = serializer.validated_data['offered_price']
         message = serializer.validated_data.get('message', '')
 
-        # 💰 Enforce minimum allowed offer
         if order.proposal_price is not None:
-            min_allowed = (
-                order.proposal_price * MIN_OFFER_RATIO
-            ).quantize(Decimal("0.01"))
-
+            min_allowed = (order.proposal_price * MIN_OFFER_RATIO).quantize(Decimal("0.01"))
             if offered_price < min_allowed:
                 return Response(
                     {
-                        "error": (
-                            f"proposed price. Minimum allowed is R{min_allowed}."
-                        ),
+                        "error": f"Offered price is too low. Minimum allowed is R{min_allowed}.",
                         "minimum_allowed": str(min_allowed),
                     },
-                    status=status.HTTP_400_BAD_REQUEST
+                    status=status.HTTP_400_BAD_REQUEST,
                 )
 
         with transaction.atomic():
+            # Lock so concurrent sends can't both slip past the round limit.
+            locked = Negotiation.objects.select_for_update().get(pk=negotiation.pk)
 
-  
-            if negotiation.round_count >= negotiation.max_rounds:
+            if locked.round_count >= locked.max_rounds:
                 return Response(
                     {"detail": "Maximum negotiation rounds reached."},
-                    status=status.HTTP_400_BAD_REQUEST
+                    status=status.HTTP_400_BAD_REQUEST,
                 )
 
-            # ✅ create round
             new_round = NegotiationRound.objects.create(
-                negotiation=negotiation,
+                negotiation=locked,
                 sender_type="client",
                 offered_price=offered_price,
                 message=message,
@@ -1179,27 +1294,28 @@ def client_start_round(request, negotiation_id):
 
             EventBus.emit(
                 NegotiationCreatedEvent({
-                    "negotiation": negotiation,
+                    "negotiation": locked,
                     "round": new_round,
                 })
             )
+
         return Response(
             NegotiationRoundReadSerializer(new_round).data,
-            status=status.HTTP_201_CREATED
+            status=status.HTTP_201_CREATED,
         )
 
-    except Negotiation.DoesNotExist:
+    except Http404:
         return Response(
             {"detail": "Negotiation not found or access denied."},
-            status=status.HTTP_404_NOT_FOUND
+            status=status.HTTP_404_NOT_FOUND,
         )
-
+    except ValidationError:
+        raise  # let DRF return the field errors as 400
     except Exception:
-        # 🧯 NO stacktrace leakage
         logger.exception("Client counter offer failed")
         return Response(
             {"detail": "Unexpected server error."},
-            status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
         )
 
     
@@ -1272,68 +1388,76 @@ def get_shipment_by_id(request, shipment_id):
     return Response(serializer.data, status=status.HTTP_200_OK)
 
 
-from django.core.exceptions import ObjectDoesNotExist
+
+from rest_framework.exceptions import APIException
+from rest_framework.pagination import PageNumberPagination
+
+
+class ShipmentsPagination(PageNumberPagination):
+    page_size = 10
+    page_size_query_param = "page_size"
+    max_page_size = 30
+
+
+ACTIVE_SHIPMENT_STATUSES = ["Pending", "in_transit", "arrived", "delivered", "in_session"]
+FILTERABLE_STATUSES = {"pending", "in_transit", "arrived", "in_session", "delivered"}
+
+
 @api_view(['GET'])
 @throttle_classes([HeavyReadThrottle])
 @authentication_classes([SPJWTAuthentication])
 @permission_classes([IsAuthenticated])
 def get_shipments_by_provider(request):
     """
-    Returns all active shipments for the authenticated provider.
+    Returns a page of active shipments for the authenticated provider.
+    Optional query params: page, page_size, status.
     """
-
     try:
         profile = get_sp_profile(request)
         provider = ServiceProvider.objects.get(sp_profile=profile)
 
-        provider_services = ProviderService.objects.filter(
-            provider=provider
+        shipments = (
+            Shipment.objects
+            .filter(
+                # Same result as the chained provider_services -> orders ->
+                # booking_items subqueries, as one join.
+                service_ordered__order__provider_for_service__provider=provider,
+                shipment_status__in=ACTIVE_SHIPMENT_STATUSES,
+            )
+            # Extend to everything ShipmentReadSerializer touches.
+            .select_related("service_ordered__order")
+            .order_by("-created_at", "-pk")  # stable order for paging
         )
 
-        provider_orders = OrderService.objects.filter(
-            provider_for_service__in=provider_services
-        )
+        raw_status = request.query_params.get("status", "")
+        requested = {s.strip().lower() for s in raw_status.split(",") if s.strip()}
+        valid_statuses = requested & FILTERABLE_STATUSES
 
-        booking_items = BookingItem.objects.filter(
-            order__in=provider_orders
-        )
+        if valid_statuses:
+            # iexact because "Pending" is stored capitalised, the rest lowercase.
+            status_q = Q()
+            for s in valid_statuses:
+                status_q |= Q(shipment_status__iexact=s)
+            shipments = shipments.filter(status_q)
 
-        shipments = Shipment.objects.filter(
-            service_ordered__in=booking_items,
-            shipment_status__in=[
-                "Pending",
-                "in_transit",
-                "arrived",
-                "delivered",
-                "in_session",
-            ],
-        ).order_by("-created_at")
+        paginator = ShipmentsPagination()
+        page = paginator.paginate_queryset(shipments, request)
+        serializer = ShipmentReadSerializer(page, many=True)
+        return paginator.get_paginated_response(serializer.data)
 
-        serializer = ShipmentReadSerializer(shipments, many=True)
-        return Response(serializer.data, status=status.HTTP_200_OK)
+    except APIException:
+        # Let DRF handle its own errors. Without this, the catch-all below
+        # turns "invalid page" (404) into a 500.
+        raise
 
     except ObjectDoesNotExist as e:
-        logger.warning(
-            "Provider lookup failed for user_id=%s: %s",
-            request.user.id,
-            str(e),
-        )
-
-        return Response(
-            {"error": str(e)},
-            status=status.HTTP_404_NOT_FOUND,
-        )
+        logger.warning("Provider lookup failed for user_id=%s: %s", request.user.id, str(e))
+        return Response({"error": str(e)}, status=status.HTTP_404_NOT_FOUND)
 
     except Exception:
-        logger.exception(
-            "Unexpected error while retrieving shipments for user_id=%s",
-            request.user.id,
-        )
-
+        logger.exception("Unexpected error while retrieving shipments for user_id=%s", request.user.id)
         return Response(
-            {
-                "error": "An unexpected error occurred while retrieving shipments."
-            },
+            {"error": "An unexpected error occurred while retrieving shipments."},
             status=status.HTTP_500_INTERNAL_SERVER_ERROR,
         )
     
@@ -2370,6 +2494,11 @@ def update_session_status(request, session_id):
         status=status.HTTP_200_OK,
     )
 
+
+class RatingsPagination(PageNumberPagination):
+    page_size = 5
+    page_size_query_param = "page_size"
+    max_page_size = 10
     
 @api_view(['GET'])
 @authentication_classes([SPJWTAuthentication])
@@ -2377,19 +2506,33 @@ def update_session_status(request, session_id):
 @throttle_classes([HeavyReadThrottle])
 def get_my_ratings(request):
     sp_profile = get_sp_profile(request)
-
     session_id = request.query_params.get("session_id")
 
-    ratings = Rating.objects.filter(
-        rater_provider__sp_profile=sp_profile
+    ratings = (
+        Rating.objects
+        .filter(rater_provider__sp_profile=sp_profile)
+
+        .select_related("session__shipment")
+        .order_by("-created_at", "-pk")   
     )
 
     if session_id:
         ratings = ratings.filter(session__session_id=session_id)
+        return Response(RatingReadSerializer(ratings, many=True).data)
 
-    serializer = RatingReadSerializer(ratings, many=True)
-    return Response(serializer.data)
+    paginator = RatingsPagination()
+    page = paginator.paginate_queryset(ratings, request)
+    serializer = RatingReadSerializer(page, many=True)
+    return paginator.get_paginated_response(serializer.data)
 
+
+
+
+
+class ClientRatingsPagination(PageNumberPagination):
+    page_size = 7
+    page_size_query_param = "page_size"
+    max_page_size = 15
 
 
 @api_view(['GET'])
@@ -2398,47 +2541,59 @@ def get_my_ratings(request):
 @permission_classes([IsAuthenticated])
 def get_ratings_by_client_email(request, client_id):
     """
-    Get ratings for a client.
-
-    Optional query params:
-        - session_id
+    Ratings for the authenticated client.
+    Optional query params: session_id, page, page_size.
     """
-
     try:
-        session_id = request.query_params.get("session_id")
+        client = get_client_details(request)
 
-        ratings = Rating.objects.filter(
-            rater_client_id=client_id
-        )
-
-        if session_id:
-            ratings = ratings.filter(
-                session__session_id=session_id
+        # RLS: the URL id must belong to the authenticated client. Same
+        # check as pending_orders_by_client_id.
+        if client.client_profile.id != client_id:
+            return Response(
+                {"success": False,
+                 "message": "You do not have permission to access records for this profile."},
+                status=status.HTTP_403_FORBIDDEN,
             )
 
-        serializer = RatingReadSerializer(
-            ratings,
-            many=True
+        # Filter by the authenticated client, not by the id in the URL.
+        # Add select_related for the relations RatingReadSerializer nests
+        # (session -> shipment -> ...), otherwise each row costs extra queries.
+        ratings = Rating.objects.filter(rater_client=client).order_by("-pk")
+
+        session_id = request.query_params.get("session_id")
+        if session_id:
+            # A single session has very few ratings: keep the plain list.
+            ratings = ratings.filter(session__session_id=session_id)
+            return Response(
+                RatingReadSerializer(ratings, many=True).data,
+                status=status.HTTP_200_OK,
+            )
+
+        # Old app versions send no paging params and expect a plain list.
+        if "page" not in request.query_params and "page_size" not in request.query_params:
+            return Response(
+                RatingReadSerializer(ratings, many=True).data,
+                status=status.HTTP_200_OK,
+            )
+
+        paginator = ClientRatingsPagination()
+        page = paginator.paginate_queryset(ratings, request)
+        return paginator.get_paginated_response(
+            RatingReadSerializer(page, many=True).data
         )
 
-        return Response(
-            serializer.data,
-            status=status.HTTP_200_OK
-        )
+    except APIException:
+        # Without this, the paginator's "invalid page" 404 became a 500.
+        raise
 
     except Exception:
-        logger.error(
-            "Unexpected error in get_ratings_by_client",
-            exc_info=True
+        logger.error("Unexpected error in get_ratings_by_client", exc_info=True)
+        return Response(
+            {"success": False, "message": "Unexpected server error."},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
         )
 
-        return Response(
-            {
-                "success": False,
-                "message": "Unexpected server error."
-            },
-            status=status.HTTP_500_INTERNAL_SERVER_ERROR
-        )
 
 ##public
 @api_view(['GET'])

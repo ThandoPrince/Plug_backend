@@ -4,7 +4,8 @@ from rest_framework.throttling import ScopedRateThrottle, UserRateThrottle, Anon
 class AuthThrottle(AnonRateThrottle):
     scope = "auth"
 
-
+class AccountDeleteThrottle(UserRateThrottle):
+    scope = "account_delete"
 
 class ClientOTPThrottle(ScopedRateThrottle):
     scope = "client_otp"

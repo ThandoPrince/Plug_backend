@@ -1,3 +1,4 @@
+import os
 import uuid
 
 from django.conf import settings
@@ -379,50 +380,91 @@ class ProviderLoginHistory(models.Model):
 
     
     
-class ServiceProvider(models.Model):
 
-    rating = models.DecimalField(max_digits=3, decimal_places=2, null=True, blank=True, default=0.0, db_index=True)
+
+
+
+def service_provider_upload_path(instance, filename):
+    extension = os.path.splitext(filename)[1].lower()
+    unique_filename = f"{uuid.uuid4().hex}{extension}"
+
+    return f"profile_images/providers/{unique_filename}"
+
+
+class ServiceProvider(models.Model):
+    rating = models.DecimalField(
+        max_digits=3,
+        decimal_places=2,
+        null=True,
+        blank=True,
+        default=0.0,
+        db_index=True,
+    )
+
     full_name = models.CharField(max_length=85, db_index=True)
-    gender = models.CharField(max_length=50, null=True, blank=True, db_index=True)
+
+    gender = models.CharField(
+        max_length=50,
+        null=True,
+        blank=True,
+        db_index=True,
+    )
+
     id_number = models.CharField(max_length=20, db_index=True)
+
     sp_description = models.CharField(
         max_length=255,
         null=True,
         blank=True,
-        help_text="Brief description of yourself and qualities"
+        help_text="Brief description of yourself and qualities",
     )
+
     dob = models.DateField()
 
-    updated_at = models.DateField(auto_now=True, db_index=True, null=True)
-    date_created = models.DateField(auto_now_add=True, db_index=True,null=True)
+    updated_at = models.DateField(
+        auto_now=True,
+        db_index=True,
+        null=True,
+    )
+
+    date_created = models.DateField(
+        auto_now_add=True,
+        db_index=True,
+        null=True,
+    )
 
     is_active = models.BooleanField(default=False, db_index=True)
-    location = models.ForeignKey(Address, on_delete=models.SET_NULL, null=True, db_index=True)
+
+    location = models.ForeignKey(
+        "Address",
+        on_delete=models.SET_NULL,
+        null=True,
+        db_index=True,
+    )
+
     sp_profile = models.OneToOneField(
-        SPProfile,
+        "SPProfile",
         on_delete=models.CASCADE,
         primary_key=True,
-        db_index=True
+        db_index=True,
     )
 
     class Meta:
         indexes = [
-            models.Index(fields=['rating']),
-            models.Index(fields=['dob']),
-            models.Index(fields=['sp_profile']),
-            models.Index(fields=['date_created']),
-            models.Index(fields=['updated_at']),
-            models.Index(fields=['id_number', 'gender', 'full_name']),
+            models.Index(fields=["rating"]),
+            models.Index(fields=["dob"]),
+            models.Index(fields=["sp_profile"]),
+            models.Index(fields=["date_created"]),
+            models.Index(fields=["updated_at"]),
+            models.Index(
+                fields=["id_number", "gender", "full_name"]
+            ),
         ]
-
-    def service_provider_upload_path(instance, filename):
-        safe_email = instance.sp_profile.email_address.replace('@', '_at_')
-        return f"profile_images/providers/{safe_email}/{filename}"
 
     profile_image = models.ImageField(
         upload_to=service_provider_upload_path,
         null=True,
-        blank=True
+        blank=True,
     )
 
 

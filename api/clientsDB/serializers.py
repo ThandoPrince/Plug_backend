@@ -991,6 +991,7 @@ class AddressOnlySerializer(serializers.ModelSerializer):
             "latitude",
             "longitude",
             "place_id",
+            "is_verified",
             "street_number",
             "route",
             "locality",

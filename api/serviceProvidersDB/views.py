@@ -1,11 +1,12 @@
 import re
 from django.contrib.auth.hashers import check_password, make_password
 from django.utils import timezone
-from decimal import Decimal, InvalidOperation
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 import json
 import os
 import secrets
 import time
+
 from rest_framework_simplejwt.tokens import AccessToken, RefreshToken
 from tokenize import TokenError
 from unittest import result
@@ -25,7 +26,7 @@ from rest_framework.decorators import api_view, parser_classes
 from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 from rest_framework.response import Response
 from rest_framework.permissions import AllowAny, IsAuthenticated
-from api.bookings.models import OrderService
+from api.bookings.models import Negotiation, OrderService, Session, Shipment
 from api.bookings.utils.choices import ACTIVE_ORDER_STATUSES
 from api.clientsDB.models.models import ClientAddress, ClientDetails, DeviceToken
 from api.clientsDB.serializers import ClientOTPVerifySerializer
@@ -35,7 +36,7 @@ from api.clientsDB.services.jwt_client_authentication import ClientJWTAuthentica
 from api.clientsDB.services.otp_service import hash_otp
 from api.clientsDB.services.otp_tasks import OTP_EMAIL_VERIFICATION, OTP_LOGIN, OTP_PASSWORD_RESET, OTPCooldownError
 from api.clientsDB.services.sa_phone_number_helper import normalize_sa_mobile
-from api.clientsDB.views import INVALID_REFRESH, SESSION_EXPIRED, _mask_email
+from api.clientsDB.views import BLOCKING_SHIPMENT_STATUSES, INVALID_REFRESH, SESSION_EXPIRED, TERMINAL_ORDER_STATUSES, _mask_email
 from api.serviceProvidersDB.services.affidavit_hash_calcultor import calculate_sha256
 from api.serviceProvidersDB.services.affidavit_verification_service import AIKYCClient
 from api.serviceProvidersDB.services.generate_sp_password_reset_token import generate_sp_password_reset_token
@@ -44,12 +45,13 @@ from api.serviceProvidersDB.services.otp_utils import create_sp_otp
 from api.serviceProvidersDB.services.service_validator import validate_service_submission
 from api.serviceProvidersDB.services.sp_jwt_authentication import SPJWTAuthentication
 from api.serviceProvidersDB.services.sp_otp_service import generate_sp_email_verification_token, generate_sp_login_token
-from api.serviceProvidersDB.services.sp_otp_task import send_sp_otp_email, send_sp_password_changed_email
+from api.serviceProvidersDB.services.sp_otp_task import send_sp_account_deleted_email, send_sp_otp_email, send_sp_password_changed_email
+from api.serviceProvidersDB.services.sp_profile_flow import PS, advance_profile_status, require_profile_status
 from plug_backend import settings
 from plug_backend.helpers.auth_helpers import get_service_provider, get_sp_profile
-from plug_backend.throttles import AuthThrottle, ClientOTPThrottle, HeavyReadThrottle, LiveLocationReadThrottle, LiveLocationWriteThrottle, ProfileWriteThrottle, RegisterThrottle, UploadThrottle, UserReadThrottle
+from plug_backend.throttles import AccountDeleteThrottle, AuthThrottle, ClientOTPThrottle, HeavyReadThrottle, LiveLocationReadThrottle, LiveLocationWriteThrottle, ProfileWriteThrottle, RegisterThrottle, UploadThrottle, UserReadThrottle
 from plug_backend.utils.sp_jwt_helper import generate_sp_tokens
-from .models import SPOTP, CostOfService, CostOfServiceImage, ProviderLoginHistory, ProviderQualification, ProviderRegistrationHistory, ProviderService, ProviderServiceAffidavit, ProviderServiceHistory, SPLiveLocation, SPLocationHistory, SPProfile, ServiceGroup, Service, ServiceProvider, Address
+from .models import SPOTP, CostOfService, CostOfServiceImage, ProviderLoginHistory, ProviderQualification, ProviderRegistrationHistory, ProviderService, ProviderServiceAffidavit, ProviderServiceHistory, SPLiveLocation, SPLocationHistory, SPProfile, ServiceGroup, Service, ServiceProvider, Address, SupportingDocument
 from .serializers import (
     ClientSPProfileReadSerializer,
     ClientServiceProviderReadSerializer,
@@ -57,6 +59,7 @@ from .serializers import (
     CostOfServiceImageSerializer,
     CostOfServiceImageWriteSerializer,
     CostOfServiceSerializer,
+    DeleteSPAccountSerializer,
     DeviceTokenWriteSerializer,
     ProviderQualificationReadSerializer,
     ProviderQualificationSerializer,
@@ -450,21 +453,38 @@ def sp_update_profile(request):
 
 
 
+VERIFIED_STATUSES = {"verified", "approved", "success"}
+
+
 @api_view(["POST"])
 @throttle_classes([ProfileWriteThrottle])
 @authentication_classes([SPJWTAuthentication])
 @permission_classes([IsAuthenticated])
+@require_profile_status(PS.ADDRESS)
 def sp_add_address_document(request):
-    print("FILES RECEIVED:", request.FILES)
-    print("POST DATA:", request.data)
-    address_raw = request.data.get("address")
+    ip = get_client_ip(request)
+    sp_profile = get_sp_profile(request)
 
-    if not address_raw:
+    # Defense in depth: no KYC before the email is verified.
+    if sp_profile.email_verified_at is None:
+        logger.warning(
+            "profile_flow event=status_rejected view=sp_add_address_document "
+            "sp=%s reason=email_not_verified ip=%s",
+            sp_profile.pk, ip,
+        )
         return Response(
             {
                 "success": False,
-                "message": "Address data missing",
+                "message": "Please verify your email first.",
+                "current_status": sp_profile.is_profile_completed,
             },
+            status=status.HTTP_403_FORBIDDEN,
+        )
+
+    address_raw = request.data.get("address")
+    if not address_raw:
+        return Response(
+            {"success": False, "message": "Address data missing"},
             status=status.HTTP_400_BAD_REQUEST,
         )
 
@@ -472,13 +492,9 @@ def sp_add_address_document(request):
         address_dict = json.loads(address_raw)
     except (json.JSONDecodeError, TypeError):
         return Response(
-            {
-                "success": False,
-                "message": "Invalid address format",
-            },
+            {"success": False, "message": "Invalid address format"},
             status=status.HTTP_400_BAD_REQUEST,
         )
-    sp_profile = get_sp_profile(request)
 
     clean_data = {
         "address": address_dict,
@@ -488,23 +504,24 @@ def sp_add_address_document(request):
         "liveness_video": request.FILES.get("liveness_video"),
     }
 
-    liveness = request.FILES.get("liveness_video")
-
-    if liveness:
-        print("Liveness name:", liveness.name)
-        print("Liveness size:", liveness.size)
-        print("Content type:", liveness.content_type)
-    else:
-        print("No liveness video received")
+    liveness = clean_data["liveness_video"]
+    logger.debug(
+        "profile_flow view=sp_add_address_document sp=%s liveness_received=%s size=%s type=%s",
+        sp_profile.pk,
+        bool(liveness),
+        getattr(liveness, "size", None),
+        getattr(liveness, "content_type", None),
+    )
 
     serializer = SPAddressDocumentWriteSerializer(data=clean_data)
 
     if not serializer.is_valid():
-        logger.warning(
-            "SP address document validation failed: %s",
-            serializer.errors
+        # Field names only; error text can echo submitted values.
+        logger.info(
+            "profile_flow event=validation_failed view=sp_add_address_document "
+            "sp=%s fields=%s ip=%s",
+            sp_profile.pk, list(serializer.errors.keys()), ip,
         )
-
         return Response(
             {
                 "success": False,
@@ -515,179 +532,120 @@ def sp_add_address_document(request):
         )
 
     def save_temp(file_obj, filename):
-        """
-        Copies the uploaded file's bytes to a temp path WITHOUT
-        touching/moving/renaming the original uploaded file object,
-        so it remains fully readable/saveable afterward (e.g. by
-        the serializer's model save).
-        """
         if not file_obj:
             return None
-
         path = f"temp/{filename}"
         full_path = os.path.join(settings.MEDIA_ROOT, path)
         os.makedirs(os.path.dirname(full_path), exist_ok=True)
-
         file_obj.seek(0)
         with open(full_path, "wb") as dest:
             for chunk in file_obj.chunks():
                 dest.write(chunk)
-
-        file_obj.seek(0)  # reset for whoever reads it next
+        file_obj.seek(0)
         return full_path
 
     front_path = back_path = liveness_path = None
+    kyc_error = None
+    conflict = False
 
     try:
         with transaction.atomic():
+            front_path = save_temp(clean_data["front_file"], f"{sp_profile.pk}_front.jpg")
+            back_path = save_temp(clean_data["back_file"], f"{sp_profile.pk}_back.jpg")
+            liveness_path = save_temp(clean_data["liveness_video"], f"{sp_profile.pk}_liveness.mp4")
 
-            # ----------------------------------
-            # Save temp files FIRST — copies bytes only,
-            # doesn't move/consume the original file objects
-            # ----------------------------------
-            front_path = save_temp(
-                clean_data["front_file"],
-                f"{sp_profile.pk}_front.jpg"
-            )
-
-            back_path = save_temp(
-                clean_data["back_file"],
-                f"{sp_profile.pk}_back.jpg"
-            )
-
-            liveness_path = save_temp(
-                clean_data["liveness_video"],
-                f"{sp_profile.pk}_liveness.mp4"
-            )
-
-            # ----------------------------------
-            # Now save provider + document
-            # (safe: original file objects are untouched)
-            # ----------------------------------
             result = serializer.save(sp_profile=sp_profile)
-
             service_provider = result["provider"]
             document = result["document"]
 
-            # ----------------------------------
-            # Call AI
-            # ----------------------------------
             ai_result = KYCService.verify_with_ai(
-                customer_id=service_provider.sp_profile.pk,
+                customer_id=sp_profile.pk,
                 full_name=service_provider.full_name,
                 front_path=front_path,
                 back_path=back_path,
                 selfie_path=liveness_path,
             )
 
-            logger.info("AI RESULT: %s", ai_result)
-
             if not isinstance(ai_result, dict):
+                # No verdict to record, so rolling back is correct here.
                 raise ValidationError(
-                    {
-                        "kyc": "Invalid response from AI verification service."
-                    }
+                    {"kyc": "Invalid response from AI verification service."}
                 )
 
-            # ----------------------------------
-            # HTTP/API failure
-            # ----------------------------------
-            if ai_result.get("success") is False:
+            api_failed = ai_result.get("success") is False
+            verification_status = (ai_result.get("verification_status") or "").lower()
+            face_meta = ai_result.get("face_meta") or {}
 
+            logger.info(
+                "profile_flow event=kyc_result view=sp_add_address_document "
+                "sp=%s api_failed=%s status=%s score=%s",
+                sp_profile.pk, api_failed, verification_status,
+                ai_result.get("face_match_score"),
+            )
+
+            if api_failed or verification_status not in VERIFIED_STATUSES:
                 document.ai_response = ai_result
                 document.verification_status = "rejected"
-                document.risk_level = "high"
                 document.verification_score = ai_result.get("face_match_score")
-
+                document.risk_level = (
+                    "high" if api_failed else ai_result.get("risk_level", "high")
+                )
                 document.save(update_fields=[
-                    "ai_response",
-                    "verification_status",
-                    "verification_score",
-                    "risk_level",
+                    "ai_response", "verification_status",
+                    "verification_score", "risk_level",
                 ])
 
-                face_meta = ai_result.get("face_meta", {})
-
-                raise ValidationError({
-                    "kyc": {
-                        "type": face_meta.get("error_type") or ai_result.get("reason"),
-                        "message": (
-                            face_meta.get("message")
-                            or ai_result.get("message")
-                            or "Identity verification failed."
-                        ),
-                        "details": face_meta.get("details") or ai_result.get("reason"),
-                        "score": ai_result.get("face_match_score"),
-                    }
-                })
-
-            # ----------------------------------
-            # Verification failed
-            # ----------------------------------
-            verification_status = ai_result.get(
-                "verification_status",
-                ""
-            ).lower()
-
-            if verification_status not in ["verified", "approved", "success"]:
-
+                # Not raised: leaving the block normally commits the
+                # rejected record. The status stays "in-address".
+                kyc_error = {
+                    "type": face_meta.get("error_type") or ai_result.get("reason"),
+                    "message": (
+                        face_meta.get("message")
+                        or ai_result.get("message")
+                        or "Identity verification failed."
+                    ),
+                    "details": face_meta.get("details") or ai_result.get("reason"),
+                    "score": ai_result.get("face_match_score"),
+                }
+            else:
                 document.ai_response = ai_result
-                document.verification_status = "rejected"
-                document.verification_score = ai_result.get(
-                    "face_match_score"
-                )
-                document.risk_level = ai_result.get(
-                    "risk_level",
-                    "high"
-                )
-
+                document.verification_status = "verified"
+                document.verification_score = ai_result.get("face_match_score", 0)
+                document.risk_level = ai_result.get("risk_level", "low")
                 document.save(update_fields=[
-                    "ai_response",
-                    "verification_status",
-                    "verification_score",
-                    "risk_level",
+                    "ai_response", "verification_status",
+                    "verification_score", "risk_level",
                 ])
 
-                face_meta = ai_result.get("face_meta", {})
+                # in-address -> in-services, only once.
+                if not advance_profile_status(sp_profile, PS.ADDRESS):
+                    conflict = True
+                    transaction.set_rollback(True)
 
-                raise ValidationError({
-                    "kyc": {
-                        "type": face_meta.get("error_type"),
-                        "message": face_meta.get(
-                            "message",
-                            "Identity verification failed."
-                        ),
-                        "details": face_meta.get("details"),
-                        "score": ai_result.get("face_match_score"),
-                    }
-                })
-
-            # ----------------------------------
-            # SUCCESS
-            # ----------------------------------
-            document.ai_response = ai_result
-            document.verification_status = "verified"
-            document.verification_score = ai_result.get(
-                "face_match_score",
-                0
+        if conflict:
+            logger.warning(
+                "profile_flow event=advance_conflict view=sp_add_address_document sp=%s ip=%s",
+                sp_profile.pk, ip,
             )
-            document.risk_level = ai_result.get(
-                "risk_level",
-                "low"
+            return Response(
+                {"success": False, "message": "This step was already completed."},
+                status=status.HTTP_409_CONFLICT,
             )
 
-            document.save(update_fields=[
-                "ai_response",
-                "verification_status",
-                "verification_score",
-                "risk_level",
-            ])
-
-            sp_profile = service_provider.sp_profile
-            sp_profile.is_profile_completed = "in-services"
-            sp_profile.save(update_fields=[
-                "is_profile_completed"
-            ])
+        if kyc_error:
+            logger.warning(
+                "profile_flow event=kyc_rejected view=sp_add_address_document "
+                "sp=%s type=%s ip=%s",
+                sp_profile.pk, kyc_error.get("type"), ip,
+            )
+            return Response(
+                {
+                    "success": False,
+                    "message": "KYC verification failed.",
+                    "errors": {"kyc": kyc_error},
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         return Response(
             {
@@ -701,41 +659,32 @@ def sp_add_address_document(request):
         )
 
     except ValidationError as e:
-
-        logger.warning("KYC validation failed: %s", e.detail)
-
+        logger.warning(
+            "profile_flow event=kyc_invalid_response view=sp_add_address_document sp=%s ip=%s",
+            sp_profile.pk, ip,
+        )
         return Response(
-            {
-                "success": False,
-                "message": "KYC verification failed.",
-                "errors": e.detail,
-            },
+            {"success": False, "message": "KYC verification failed.", "errors": e.detail},
             status=status.HTTP_400_BAD_REQUEST,
         )
 
     except Exception:
-
         logger.exception(
-            "Failed to complete SP address document registration"
+            "profile_flow event=unexpected_error view=sp_add_address_document sp=%s ip=%s",
+            sp_profile.pk, ip,
         )
-
         return Response(
-            {
-                "success": False,
-                "message": "Unable to complete registration at this time.",
-            },
+            {"success": False, "message": "Unable to complete registration at this time."},
             status=status.HTTP_500_INTERNAL_SERVER_ERROR,
         )
 
     finally:
-        # Cleanup temp files
         for path in [front_path, back_path, liveness_path]:
             try:
                 if path and os.path.exists(path):
                     os.remove(path)
             except Exception:
-                logger.warning("Failed to delete temp file %s", path)
-
+                logger.warning("Failed to delete temp file for sp=%s", sp_profile.pk)
                 
 
 SP_INVALID_OR_EXPIRED = {
@@ -950,14 +899,35 @@ def verify_sp_email(request):
             )
 
             if otp_request is None:
+                hash_otp("000000")
                 return Response(SP_INVALID_OR_EXPIRED, status=status.HTTP_400_BAD_REQUEST)
 
             now = timezone.now()
+            sp = otp_request.service_provider
+
+            # Defense in depth, matching the client flow.
+            if str(sp.id) != str(token_sp_id):
+                logger.error(
+                    "SP email verification mismatch: token=%s otp_row=%s",
+                    token_sp_id, sp.id,
+                )
+                return Response(SP_INVALID_OR_EXPIRED, status=status.HTTP_400_BAD_REQUEST)
 
             if otp_request.is_used or otp_request.is_verified:
                 return Response(SP_INVALID_OR_EXPIRED, status=status.HTTP_400_BAD_REQUEST)
 
             if now >= otp_request.expires_at:
+                return Response(SP_INVALID_OR_EXPIRED, status=status.HTTP_400_BAD_REQUEST)
+
+            # Status gate: only a provider still awaiting email verification
+            # may use this endpoint. Same generic error, so callers can't
+            # learn which status an account is in.
+            if sp.is_profile_completed != PS.EMAIL_VERIFICATION:
+                logger.warning(
+                    "SP email verification rejected: sp=%s status=%s",
+                    sp.id, sp.is_profile_completed,
+                )
+                hash_otp("000000")  # keep timing similar to the other reject paths
                 return Response(SP_INVALID_OR_EXPIRED, status=status.HTTP_400_BAD_REQUEST)
 
             if otp_request.attempts >= otp_request.max_attempts:
@@ -981,14 +951,9 @@ def verify_sp_email(request):
 
                 return Response(SP_INVALID_OR_EXPIRED, status=status.HTTP_400_BAD_REQUEST)
 
-            sp = otp_request.service_provider
-
-            # Defense in depth, matching the client flow.
-            if str(sp.id) != str(token_sp_id):
-                logger.error(
-                    "SP email verification mismatch: token=%s otp_row=%s",
-                    token_sp_id, sp.id,
-                )
+            # Atomic EMAIL_VERIFICATION -> DETAILS. Fails if the row changed
+            # underneath us, so the step can't run twice.
+            if not advance_profile_status(sp, PS.EMAIL_VERIFICATION):
                 return Response(SP_INVALID_OR_EXPIRED, status=status.HTTP_400_BAD_REQUEST)
 
             otp_request.is_verified = True
@@ -997,8 +962,7 @@ def verify_sp_email(request):
             otp_request.save(update_fields=["is_verified", "is_used", "verified_at"])
 
             sp.email_verified_at = now
-            sp.is_profile_completed = "in-details"
-            sp.save(update_fields=["email_verified_at", "is_profile_completed"])
+            sp.save(update_fields=["email_verified_at"])  # status already advanced
 
             tokens = generate_sp_tokens(sp)
 
@@ -1242,7 +1206,7 @@ def request_sp_password_reset(request):
 
         except SPProfile.DoesNotExist:
             return Response(
-                {"error": "Service provider not found"},
+                {"error": "Invalid email or mobile number provided."},
                 status=status.HTTP_404_NOT_FOUND
             )
 
@@ -1694,60 +1658,100 @@ def register_device_token(request):
 @throttle_classes([ProfileWriteThrottle])
 @authentication_classes([SPJWTAuthentication])
 @permission_classes([IsAuthenticated])
+@require_profile_status(
+    PS.DETAILS, PS.ADDRESS, PS.SERVICES, PS.COST, PS.COMPLETED
+)
 def patch_sp_profile(request):
+    sp_profile = request.user
+    ip = get_client_ip(request)
+
+    # Defense in depth: details can't be saved before the email is verified.
+    if sp_profile.email_verified_at is None:
+        logger.warning(
+            "profile_flow event=status_rejected view=patch_sp_profile "
+            "sp=%s reason=email_not_verified ip=%s",
+            sp_profile.id, ip,
+        )
+        return Response(
+            {
+                "success": False,
+                "message": "Please verify your email first.",
+                "current_status": sp_profile.is_profile_completed,
+            },
+            status=status.HTTP_403_FORBIDDEN,
+        )
 
     try:
         service_provider = ServiceProvider.objects.select_related(
-            'sp_profile'
-        ).get(sp_profile=request.user)
+            "sp_profile"
+        ).get(sp_profile=sp_profile)
 
     except ServiceProvider.DoesNotExist:
-        return Response({
-            "success": False,
-            "message": "Service Provider profile not found."
-        }, status=status.HTTP_404_NOT_FOUND)
+        logger.warning(
+            "profile_flow event=not_found view=patch_sp_profile sp=%s ip=%s",
+            sp_profile.id, ip,
+        )
+        return Response(
+            {"success": False, "message": "Service Provider profile not found."},
+            status=status.HTTP_404_NOT_FOUND,
+        )
 
     try:
         serializer = ServiceProviderPatchSerializer(
             service_provider,
             data=request.data,
             partial=True,
-            context={'request': request}
+            context={"request": request},
         )
 
         if not serializer.is_valid():
-            return Response({
-                "success": False,
-                "message": "Please fix the errors below.",
-                "errors": serializer.errors
-            }, status=status.HTTP_400_BAD_REQUEST)
+            logger.info(
+                "profile_flow event=validation_failed view=patch_sp_profile "
+                "sp=%s fields=%s ip=%s",
+                sp_profile.id, list(serializer.errors.keys()), ip,
+            )
+            return Response(
+                {
+                    "success": False,
+                    "message": "Please fix the errors below.",
+                    "errors": serializer.errors,
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
-        serializer.save()
+        with transaction.atomic():
+            serializer.save()
 
-        sp_profile = service_provider.sp_profile
-        sp_profile.is_profile_completed = "in-address"
-        sp_profile.save(update_fields=["is_profile_completed"])
+            if sp_profile.is_profile_completed == PS.DETAILS:
+                if not advance_profile_status(sp_profile, PS.DETAILS):
 
-        return Response({
-            "success": True,
-            "message": "Profile updated successfully.",
-            "data": {
-                **serializer.data,
-                "profile_status": sp_profile.is_profile_completed,
-            }
-        }, status=status.HTTP_200_OK)
+                    sp_profile.refresh_from_db(fields=["is_profile_completed"])
+
+        return Response(
+            {
+                "success": True,
+                "message": "Profile updated successfully.",
+                "data": {
+                    **serializer.data,
+                    "profile_status": sp_profile.is_profile_completed,
+                },
+            },
+            status=status.HTTP_200_OK,
+        )
 
     except Exception:
         logger.exception(
-            "Failed to update service provider profile. User ID: %s",
-            request.user.id
+            "profile_flow event=unexpected_error view=patch_sp_profile sp=%s ip=%s",
+            sp_profile.id, ip,
         )
-
-        return Response({
-            "success": False,
-            "message": "A server error occurred. Please try again later."
-        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-
+        return Response(
+            {
+                "success": False,
+                "message": "A server error occurred. Please try again later.",
+            },
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
+    
 
 
 @api_view(["GET"])
@@ -1794,387 +1798,197 @@ def approved_services_list(request):
 
 
 
-@api_view(['POST'])
+
+
+
+@api_view(["POST"])
 @throttle_classes([ProfileWriteThrottle])
 @authentication_classes([SPJWTAuthentication])
 @permission_classes([IsAuthenticated])
+@require_profile_status(PS.SERVICES, PS.COST, PS.COMPLETED)
 def submit_service(request, provider_id):
+    sp_profile = request.user
+    ip = get_client_ip(request)
+
+    # Ownership: the URL id must be the caller's own profile.
+    if str(provider_id) != str(sp_profile.pk):
+        logger.warning(
+            "profile_flow event=ownership_rejected view=submit_service "
+            "sp=%s requested_provider=%s ip=%s",
+            sp_profile.pk, provider_id, ip,
+        )
+        return Response(
+            {"error": "Provider not found."},
+            status=status.HTTP_404_NOT_FOUND,  # 404, so ids can't be probed
+        )
+
+    if sp_profile.email_verified_at is None:
+        logger.warning(
+            "profile_flow event=status_rejected view=submit_service "
+            "sp=%s reason=email_not_verified ip=%s",
+            sp_profile.pk, ip,
+        )
+        return Response(
+            {"error": "Please verify your email first.",
+             "current_status": sp_profile.is_profile_completed},
+            status=status.HTTP_403_FORBIDDEN,
+        )
+
+    service_name = (request.data.get("service_name") or "").strip()
+    description = request.data.get("description", "")
+    service_group_id = request.data.get("service_group")
+
+    if not service_name:
+        return Response(
+            {"error": "service_name is required"},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
 
     try:
-        service_name = request.data.get("service_name")
-        description = request.data.get("description", "")
-        service_group_id = request.data.get("service_group")
-
-        if not service_name:
-            return Response(
-                {"error": "service_name is required"},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-
-        # Provider lookup
-        provider = ServiceProvider.objects.select_related('sp_profile').get(
-            sp_profile__id=provider_id
+        provider = ServiceProvider.objects.select_related("sp_profile").get(
+            sp_profile=sp_profile
         )
 
         validation = validate_service_submission(service_name, description)
 
         if validation["status"] == "rejected":
-            return Response({
-                "status": "rejected",
-                "reason": validation.get("reason", "Service violates policy")
-            }, status=status.HTTP_400_BAD_REQUEST)
+            logger.info(
+                "profile_flow event=service_rejected view=submit_service sp=%s ip=%s",
+                sp_profile.pk, ip,
+            )
+            return Response(
+                {
+                    "status": "rejected",
+                    "reason": validation.get("reason", "Service violates policy"),
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         with transaction.atomic():
 
             if validation["status"] == "exists":
                 service = validation["service"]
 
-                existing_provider_service = ProviderService.objects.filter(
-                    provider=provider,
-                    service=service,
+                existing = ProviderService.objects.filter(
+                    provider=provider, service=service
                 ).first()
 
-                if existing_provider_service:
-                    if existing_provider_service.is_active:
-                        return Response(
-                            {"error": "Service already linked to provider."},
-                            status=status.HTTP_400_BAD_REQUEST,
-                        )
-
-                    existing_provider_service.is_active = True
-                    existing_provider_service.save(update_fields=["is_active"])
-                    ProviderServiceHistory.objects.create(
-                        provider_service=existing_provider_service,
-                        provider=provider,
-                        service=service,
-                        action="reactivated",
-                        notes="Service reactivated by provider.",
-                        created_by=request.user,
-                    )
-
-                    provider.sp_profile.is_profile_completed = "in-cost"
-                    provider.sp_profile.save(update_fields=["is_profile_completed"])
-
+                if existing and existing.is_active:
                     return Response(
-                        {
-                            "status": "reactivated",
-                            "id": existing_provider_service.id,
-                            "is_primary": existing_provider_service.is_primary,
-                            "service": ServiceReadSerializer(service).data,
-                            "profile_status": provider.sp_profile.is_profile_completed,
-                        },
-                        status=status.HTTP_200_OK,
+                        {"error": "Service already linked to provider."},
+                        status=status.HTTP_400_BAD_REQUEST,
                     )
 
-                # First-time link to an already-existing service.
-                # No service_group needed -- the service already has one.
+                if existing:
+                    existing.is_active = True
+                    existing.save(update_fields=["is_active"])
+                    provider_service = existing
+                    action, notes = "reactivated", "Service reactivated by provider."
+                    result_status, http_code = "reactivated", status.HTTP_200_OK
+                else:
+                    provider_service = ProviderService.objects.create(
+                        provider=provider, service=service
+                    )
+                    action, notes = "linked", "Service linked by provider."
+                    result_status, http_code = validation["status"], status.HTTP_201_CREATED
+
+            else:
+                # "new" / "requires_review": needs a group.
+                if not service_group_id:
+                    return Response(
+                        {"error": "service_group is required for new service."},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+
+                service_group = ServiceGroup.objects.select_related("category").get(
+                    group_id=service_group_id
+                )
+
+                service = Service.objects.create(
+                    service_name=service_name.title(),
+                    description=description,
+                    service_group=service_group,
+                    review_status=(
+                        "PENDING" if validation["status"] == "requires_review"
+                        else "APPROVED"
+                    ),
+                    risk_level=service_group.category.risk_level,
+                )
                 provider_service = ProviderService.objects.create(
-                    provider=provider,
-                    service=service,
+                    provider=provider, service=service
                 )
-                ProviderServiceHistory.objects.create(
-                    provider_service=provider_service,
-                    provider=provider,
-                    service=service,
-                    action="linked",
-                    notes="Service linked by provider.",
-                    created_by=request.user,
-                )
+                action, notes = "linked", "Service linked by provider."
+                result_status, http_code = validation["status"], status.HTTP_201_CREATED
 
-                provider.sp_profile.is_profile_completed = "in-cost"
-                provider.sp_profile.save(update_fields=["is_profile_completed"])
-
-                return Response({
-                    "id": provider_service.id,
-                    "status": validation["status"],
-                    "is_primary": provider_service.is_primary,
-                    "service": ServiceReadSerializer(service).data,
-                    "profile_status": provider.sp_profile.is_profile_completed,
-                }, status=status.HTTP_201_CREATED)
-
-            # --- Only "new" / "requires_review" services get here ---
-            # New service requires group
-            if not service_group_id:
-                return Response(
-                    {"error": "service_group is required for new service."},
-                    status=status.HTTP_400_BAD_REQUEST
-                )
-
-            service_group = ServiceGroup.objects.select_related('category').get(
-                group_id=service_group_id
-            )
-
-            review_status = (
-                "PENDING"
-                if validation["status"] == "requires_review"
-                else "APPROVED"
-            )
-
-            service = Service.objects.create(
-                service_name=service_name.strip().title(),
-                description=description,
-                service_group=service_group,
-                review_status=review_status,
-                risk_level=service_group.category.risk_level
-            )
-
-            provider_service = ProviderService.objects.create(
-                provider=provider,
-                service=service
-            )
             ProviderServiceHistory.objects.create(
                 provider_service=provider_service,
                 provider=provider,
                 service=service,
-                action="linked",
-                notes="Service linked by provider.",
+                action=action,
+                notes=notes,
                 created_by=request.user,
             )
 
-            provider.sp_profile.is_profile_completed = "in-cost"
-            provider.sp_profile.save(update_fields=["is_profile_completed"])
+            # in-services -> in-cost on the first service only. Later
+            # statuses are untouched, so adding services never regresses.
+            if sp_profile.is_profile_completed == PS.SERVICES:
+                if not advance_profile_status(sp_profile, PS.SERVICES):
+                    # Concurrent request already advanced it; the service is
+                    # saved either way, so just report the real status.
+                    sp_profile.refresh_from_db(fields=["is_profile_completed"])
 
-            return Response({
+        logger.info(
+            "profile_flow event=service_%s view=submit_service sp=%s service=%s ip=%s",
+            action, sp_profile.pk, service.pk, ip,
+        )
+
+        return Response(
+            {
                 "id": provider_service.id,
-                "status": validation["status"],
+                "status": result_status,
                 "is_primary": provider_service.is_primary,
                 "service": ServiceReadSerializer(service).data,
-                "profile_status": provider.sp_profile.is_profile_completed
-            }, status=status.HTTP_201_CREATED)
+                "profile_status": sp_profile.is_profile_completed,
+            },
+            status=http_code,
+        )
 
     except ServiceProvider.DoesNotExist:
-        return Response(
-            {"error": "Provider not found."},
-            status=status.HTTP_404_NOT_FOUND
-        )
+        return Response({"error": "Provider not found."},
+                        status=status.HTTP_404_NOT_FOUND)
 
     except ServiceGroup.DoesNotExist:
-        return Response(
-            {"error": "Invalid service group."},
-            status=status.HTTP_400_BAD_REQUEST
-        )
-
-    except ValidationError:
-        # No message_dict exposure
-        return Response(
-            {"error": "Invalid data provided."},
-            status=status.HTTP_400_BAD_REQUEST
-        )
-
-    except IntegrityError:
-        logger.error("Integrity error in submit_service", exc_info=True)
-        return Response(
-            {"error": "Request could not be completed."},
-            status=status.HTTP_400_BAD_REQUEST
-        )
-
-    except DatabaseError:
-        logger.error("Database error in submit_service", exc_info=True)
-        return Response(
-            {"error": "Service temporarily unavailable."},
-            status=status.HTTP_503_SERVICE_UNAVAILABLE
-        )
-
-    except Exception:
-        logger.error("Unhandled error in submit_service", exc_info=True)
-        return Response(
-            {"error": "Unexpected server error."},
-            status=status.HTTP_500_INTERNAL_SERVER_ERROR
-        )
-
-
-@api_view(['POST'])
-@throttle_classes([ProfileWriteThrottle])
-@authentication_classes([SPJWTAuthentication])
-@permission_classes([IsAuthenticated])
-def submit_service(request, provider_id):
-
-    try:
-        service_name = request.data.get("service_name")
-        description = request.data.get("description", "")
-        service_group_id = request.data.get("service_group")
-
-        if not service_name:
-            return Response(
-                {"error": "service_name is required"},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-
-        # Provider lookup
-        provider = ServiceProvider.objects.select_related('sp_profile').get(
-            sp_profile__id=provider_id
-        )
-
-        validation = validate_service_submission(service_name, description)
-
-        if validation["status"] == "rejected":
-            return Response({
-                "status": "rejected",
-                "reason": validation.get("reason", "Service violates policy")
-            }, status=status.HTTP_400_BAD_REQUEST)
-
-        with transaction.atomic():
-
-            if validation["status"] == "exists":
-                service = validation["service"]
-
-                existing_provider_service = ProviderService.objects.filter(
-                    provider=provider,
-                    service=service,
-                ).first()
-
-                if existing_provider_service:
-                    if existing_provider_service.is_active:
-                        return Response(
-                            {"error": "Service already linked to provider."},
-                            status=status.HTTP_400_BAD_REQUEST,
-                        )
-
-                    existing_provider_service.is_active = True
-                    existing_provider_service.save(update_fields=["is_active"])
-                    ProviderServiceHistory.objects.create(
-                        provider_service=existing_provider_service,
-                        provider=provider,
-                        service=service,
-                        action="reactivated",
-                        notes="Service reactivated by provider.",
-                        created_by=request.user,
-                    )
-
-                    provider.sp_profile.is_profile_completed = "in-cost"
-                    provider.sp_profile.save(update_fields=["is_profile_completed"])
-
-                    return Response(
-                        {
-                            "status": "reactivated",
-                            "id": existing_provider_service.id,
-                            "is_primary": existing_provider_service.is_primary,
-                            "service": ServiceReadSerializer(service).data,
-                            "profile_status": provider.sp_profile.is_profile_completed,
-                        },
-                        status=status.HTTP_200_OK,
-                    )
-
-                # First-time link to an already-existing service.
-                # No service_group needed -- the service already has one.
-                provider_service = ProviderService.objects.create(
-                    provider=provider,
-                    service=service,
-                )
-                ProviderServiceHistory.objects.create(
-                    provider_service=provider_service,
-                    provider=provider,
-                    service=service,
-                    action="linked",
-                    notes="Service linked by provider.",
-                    created_by=request.user,
-                )
-
-                provider.sp_profile.is_profile_completed = "in-cost"
-                provider.sp_profile.save(update_fields=["is_profile_completed"])
-
-                return Response({
-                    "id": provider_service.id,
-                    "status": validation["status"],
-                    "is_primary": provider_service.is_primary,
-                    "service": ServiceReadSerializer(service).data,
-                    "profile_status": provider.sp_profile.is_profile_completed,
-                }, status=status.HTTP_201_CREATED)
-
-            # --- Only "new" / "requires_review" services get here ---
-            # New service requires group
-            if not service_group_id:
-                return Response(
-                    {"error": "service_group is required for new service."},
-                    status=status.HTTP_400_BAD_REQUEST
-                )
-
-            service_group = ServiceGroup.objects.select_related('category').get(
-                group_id=service_group_id
-            )
-
-            review_status = (
-                "PENDING"
-                if validation["status"] == "requires_review"
-                else "APPROVED"
-            )
-
-            service = Service.objects.create(
-                service_name=service_name.strip().title(),
-                description=description,
-                service_group=service_group,
-                review_status=review_status,
-                risk_level=service_group.category.risk_level
-            )
-
-            provider_service = ProviderService.objects.create(
-                provider=provider,
-                service=service
-            )
-            ProviderServiceHistory.objects.create(
-                provider_service=provider_service,
-                provider=provider,
-                service=service,
-                action="linked",
-                notes="Service linked by provider.",
-                created_by=request.user,
-            )
-
-            provider.sp_profile.is_profile_completed = "in-cost"
-            provider.sp_profile.save(update_fields=["is_profile_completed"])
-
-            return Response({
-                "id": provider_service.id,
-                "status": validation["status"],
-                "is_primary": provider_service.is_primary,
-                "service": ServiceReadSerializer(service).data,
-                "profile_status": provider.sp_profile.is_profile_completed
-            }, status=status.HTTP_201_CREATED)
-
-    except ServiceProvider.DoesNotExist:
-        return Response(
-            {"error": "Provider not found."},
-            status=status.HTTP_404_NOT_FOUND
-        )
-
-    except ServiceGroup.DoesNotExist:
-        return Response(
-            {"error": "Invalid service group."},
-            status=status.HTTP_400_BAD_REQUEST
-        )
+        return Response({"error": "Invalid service group."},
+                        status=status.HTTP_400_BAD_REQUEST)
 
     except ValidationError as e:
-        message = (
-        e.messages[0]
-        if hasattr(e, "messages") and e.messages
-        else str(e)
-    )
-        
-        return Response(
-            {"error": message},
-        status=status.HTTP_400_BAD_REQUEST,
-    )
+        message = e.messages[0] if getattr(e, "messages", None) else str(e)
+        return Response({"error": message}, status=status.HTTP_400_BAD_REQUEST)
 
     except IntegrityError:
-        logger.error("Integrity error in submit_service", exc_info=True)
-        return Response(
-            {"error": "Request could not be completed."},
-            status=status.HTTP_400_BAD_REQUEST
+        logger.exception(
+            "profile_flow event=integrity_error view=submit_service sp=%s ip=%s",
+            sp_profile.pk, ip,
         )
+        return Response({"error": "Request could not be completed."},
+                        status=status.HTTP_400_BAD_REQUEST)
 
     except DatabaseError:
-        logger.error("Database error in submit_service", exc_info=True)
-        return Response(
-            {"error": "Service temporarily unavailable."},
-            status=status.HTTP_503_SERVICE_UNAVAILABLE
+        logger.exception(
+            "profile_flow event=database_error view=submit_service sp=%s ip=%s",
+            sp_profile.pk, ip,
         )
+        return Response({"error": "Service temporarily unavailable."},
+                        status=status.HTTP_503_SERVICE_UNAVAILABLE)
 
     except Exception:
-        logger.error("Unhandled error in submit_service", exc_info=True)
-        return Response(
-            {"error": "Unexpected server error."},
-            status=status.HTTP_500_INTERNAL_SERVER_ERROR
+        logger.exception(
+            "profile_flow event=unexpected_error view=submit_service sp=%s ip=%s",
+            sp_profile.pk, ip,
         )
+        return Response({"error": "Unexpected server error."},
+                        status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
 
 
 
@@ -2236,8 +2050,6 @@ def a_submit_service(request, provider_id):
                         created_by=request.user,
                     )
 
-                    provider.sp_profile.is_profile_completed = "in-cost"
-                    provider.sp_profile.save(update_fields=["is_profile_completed"])
 
                     return Response(
                         {
@@ -2245,7 +2057,7 @@ def a_submit_service(request, provider_id):
                             "id": existing_provider_service.id,
                             "is_primary": existing_provider_service.is_primary,
                             "service": ServiceReadSerializer(service).data,
-                            "profile_status": provider.sp_profile.is_profile_completed,
+ 
                         },
                         status=status.HTTP_200_OK,
                     )
@@ -2640,208 +2452,286 @@ def upload_provider_qualification(request, service_id):
     )
 
 
-@api_view(['PATCH'])
+def _parse_bool(value, default=True):
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    s = str(value).strip().lower()
+    if s in ("true", "1", "yes"):
+        return True
+    if s in ("false", "0", "no"):
+        return False
+    return None  # invalid
+
+
+@api_view(["PATCH"])
 @throttle_classes([ProfileWriteThrottle])
 @authentication_classes([SPJWTAuthentication])
 @permission_classes([IsAuthenticated])
+@require_profile_status(PS.COST, PS.COMPLETED)
 def update_cost_of_service(request, service_id):
+    sp_profile = request.user
+    ip = get_client_ip(request)
 
-    try:
-        provider = ServiceProvider.objects.select_related(
-            'sp_profile'
-        ).get(sp_profile=request.user)
-
-    except ServiceProvider.DoesNotExist:
+    if sp_profile.email_verified_at is None:
+        logger.warning(
+            "profile_flow event=status_rejected view=update_cost_of_service "
+            "sp=%s reason=email_not_verified ip=%s",
+            sp_profile.pk, ip,
+        )
         return Response(
-            {"error": "Provider not found"},
-            status=status.HTTP_404_NOT_FOUND
+            {"error": "Please verify your email first.",
+             "current_status": sp_profile.is_profile_completed},
+            status=status.HTTP_403_FORBIDDEN,
         )
 
+    # ---- Input validation (before touching the DB) ----
+    raw_price = request.data.get("base_price")
+    if raw_price is None or str(raw_price).strip() == "":
+        return Response({"error": "base_price is required."},
+                        status=status.HTTP_400_BAD_REQUEST)
+
     try:
-        service = Service.objects.get(service_id=service_id)
+        base_price = Decimal(str(raw_price).strip())
+    except (InvalidOperation, ValueError, TypeError):
+        return Response({"error": "Base price must be a valid number."},
+                        status=status.HTTP_400_BAD_REQUEST)
 
-    except Service.DoesNotExist:
-        return Response(
-            {"error": "Service not found"},
-            status=status.HTTP_404_NOT_FOUND
-        )
+    if not base_price.is_finite():
+        return Response({"error": "Base price must be a valid number."},
+                        status=status.HTTP_400_BAD_REQUEST)
+    if base_price < 0:
+        return Response({"error": "Base price cannot be negative."},
+                        status=status.HTTP_400_BAD_REQUEST)
+    if base_price > Decimal("10000.00"):
+        return Response({"error": "Base price cannot exceed R10,000."},
+                        status=status.HTTP_400_BAD_REQUEST)
 
-    provider_service, _ = ProviderService.objects.get_or_create(
-        provider=provider,
-        service=service
-    )
+    base_price = base_price.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
-    data = request.data
-    base_price = data.get("base_price")
-    negotiable = data.get("negotiable", True)
-    notes = data.get("notes", "")
-    if base_price is not None:
-        try:
-            base_price = Decimal(str(base_price))
-        except (InvalidOperation, ValueError, TypeError):
-            return Response(
-                {"error": "Base price must be a valid number."},
-                status=status.HTTP_400_BAD_REQUEST
-            )
+    negotiable = _parse_bool(request.data.get("negotiable"), default=True)
+    if negotiable is None:
+        return Response({"error": "negotiable must be true or false."},
+                        status=status.HTTP_400_BAD_REQUEST)
 
-        if base_price < 0:
-            return Response(
-                {"error": "Base price cannot be negative."},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-
-        if base_price > Decimal("10000.00"):
-            return Response(
-                {"error": "Base price cannot exceed R10,000."},
-                status=status.HTTP_400_BAD_REQUEST
-            )
+    notes = str(request.data.get("notes") or "").strip()[:1000]  # match your field's max_length
 
     try:
         with transaction.atomic():
+            provider = ServiceProvider.objects.get(sp_profile=sp_profile)
 
-            if provider_service.cost_of_service is None:
+            # Existing, active link only. No get_or_create: services are
+            # linked through submit_service, which runs the policy checks.
+            provider_service = (
+                ProviderService.objects
+                .select_for_update(of=("self",))
+                .select_related("cost_of_service")
+                .filter(
+                    provider=provider,
+                    service__service_id=service_id,
+                    is_active=True,
+                )
+                .first()
+            )
+
+            if provider_service is None:
+                logger.warning(
+                    "profile_flow event=not_linked view=update_cost_of_service "
+                    "sp=%s service=%s ip=%s",
+                    sp_profile.pk, service_id, ip,
+                )
+                return Response({"error": "Service not found"},
+                                status=status.HTTP_404_NOT_FOUND)
+
+            cost = provider_service.cost_of_service
+            if cost is None:
                 cost = CostOfService.objects.create(
-                    base_price=base_price,
-                    negotiable=negotiable,
-                    notes=notes
+                    base_price=base_price, negotiable=negotiable, notes=notes
                 )
                 provider_service.cost_of_service = cost
-                provider_service.save()
+                provider_service.save(update_fields=["cost_of_service"])
             else:
-                cost = provider_service.cost_of_service
                 cost.base_price = base_price
                 cost.negotiable = negotiable
                 cost.notes = notes
-                cost.save()
+                cost.save(update_fields=["base_price", "negotiable", "notes"])
 
-            provider.sp_profile.is_profile_completed = "completed"
-            provider.sp_profile.save(update_fields=["is_profile_completed"])
+            # in-cost -> completed, once. Editing prices later is a plain
+            # update and never touches the status.
+            if sp_profile.is_profile_completed == PS.COST:
+                if not advance_profile_status(sp_profile, PS.COST):
+                    # Concurrent request advanced it; the price is saved.
+                    sp_profile.refresh_from_db(fields=["is_profile_completed"])
 
-        return Response({
-            "success": True,
-            "cost_of_service": {
-                "id": cost.id,
-                "base_price": str(cost.base_price) if cost.base_price else None,
-                "negotiable": cost.negotiable,
-                "notes": cost.notes,
+        return Response(
+            {
+                "success": True,
+                "cost_of_service": {
+                    "id": cost.id,
+                    "base_price": str(cost.base_price),
+                    "negotiable": cost.negotiable,
+                    "notes": cost.notes,
+                },
+                "profile_status": sp_profile.is_profile_completed,
             },
-            "profile_status": provider.sp_profile.is_profile_completed
-        }, status=status.HTTP_200_OK)
+            status=status.HTTP_200_OK,
+        )
+
+    except ServiceProvider.DoesNotExist:
+        return Response({"error": "Provider not found"},
+                        status=status.HTTP_404_NOT_FOUND)
 
     except DatabaseError:
-        logger.error("Database error in update_cost_of_service", exc_info=True)
-        return Response(
-            {"error": "Service temporarily unavailable"},
-            status=status.HTTP_503_SERVICE_UNAVAILABLE
+        logger.exception(
+            "profile_flow event=database_error view=update_cost_of_service sp=%s ip=%s",
+            sp_profile.pk, ip,
         )
+        return Response({"error": "Service temporarily unavailable"},
+                        status=status.HTTP_503_SERVICE_UNAVAILABLE)
 
     except Exception:
-        logger.error("Unexpected error in update_cost_of_service", exc_info=True)
-        return Response(
-            {"error": "Unexpected server error"},
-            status=status.HTTP_500_INTERNAL_SERVER_ERROR
+        logger.exception(
+            "profile_flow event=unexpected_error view=update_cost_of_service sp=%s ip=%s",
+            sp_profile.pk, ip,
         )
+        return Response({"error": "Unexpected server error"},
+                        status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
-@api_view(['PATCH'])
+
+                        
+
+@api_view(["PATCH"])
 @throttle_classes([ProfileWriteThrottle])
 @authentication_classes([SPJWTAuthentication])
 @permission_classes([IsAuthenticated])
+@require_profile_status(PS.COMPLETED)
 def a_update_cost_of_service(request, service_id):
+    sp_profile = request.user
+    ip = get_client_ip(request)
 
-    try:
-        provider = ServiceProvider.objects.select_related(
-            'sp_profile'
-        ).get(sp_profile=request.user)
-
-    except ServiceProvider.DoesNotExist:
+    if sp_profile.email_verified_at is None:
+        logger.warning(
+            "profile_flow event=status_rejected view=a_update_cost_of_service "
+            "sp=%s reason=email_not_verified ip=%s",
+            sp_profile.pk, ip,
+        )
         return Response(
-            {"error": "Provider not found"},
-            status=status.HTTP_404_NOT_FOUND
+            {"error": "Please verify your email first.",
+             "current_status": sp_profile.is_profile_completed},
+            status=status.HTTP_403_FORBIDDEN,
         )
 
+    # ---- Input validation (before touching the DB) ----
+    raw_price = request.data.get("base_price")
+    if raw_price is None or str(raw_price).strip() == "":
+        return Response({"error": "base_price is required."},
+                        status=status.HTTP_400_BAD_REQUEST)
+
     try:
-        service = Service.objects.get(service_id=service_id)
+        base_price = Decimal(str(raw_price).strip())
+    except (InvalidOperation, ValueError, TypeError):
+        return Response({"error": "Base price must be a valid number."},
+                        status=status.HTTP_400_BAD_REQUEST)
 
-    except Service.DoesNotExist:
-        return Response(
-            {"error": "Service not found"},
-            status=status.HTTP_404_NOT_FOUND
-        )
+    if not base_price.is_finite():
+        return Response({"error": "Base price must be a valid number."},
+                        status=status.HTTP_400_BAD_REQUEST)
+    if base_price < 0:
+        return Response({"error": "Base price cannot be negative."},
+                        status=status.HTTP_400_BAD_REQUEST)
+    if base_price > Decimal("10000.00"):
+        return Response({"error": "Base price cannot exceed R10,000."},
+                        status=status.HTTP_400_BAD_REQUEST)
 
-    provider_service, _ = ProviderService.objects.get_or_create(
-        provider=provider,
-        service=service
-    )
+    base_price = base_price.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
-    data = request.data
-    base_price = data.get("base_price")
-    negotiable = data.get("negotiable", True)
-    notes = data.get("notes", "")
+    negotiable = _parse_bool(request.data.get("negotiable"), default=True)
+    if negotiable is None:
+        return Response({"error": "negotiable must be true or false."},
+                        status=status.HTTP_400_BAD_REQUEST)
 
-    if base_price is not None:
-        try:
-            base_price = Decimal(str(base_price))
-        except (InvalidOperation, ValueError, TypeError):
-            return Response(
-                {"error": "Base price must be a valid number."},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-
-        if base_price < 0:
-            return Response(
-                {"error": "Base price cannot be negative."},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-
-        if base_price > Decimal("10000.00"):
-            return Response(
-                {"error": "Base price cannot exceed R10,000."},
-                status=status.HTTP_400_BAD_REQUEST
-            )
+    notes = str(request.data.get("notes") or "").strip()[:1000]  # match the model's max_length
 
     try:
         with transaction.atomic():
+            provider = ServiceProvider.objects.get(sp_profile=sp_profile)
 
-            if provider_service.cost_of_service is None:
+            # Existing, active link only. No get_or_create: services are
+            # linked through submit_service, which runs the policy checks.
+            provider_service = (
+                ProviderService.objects
+                .select_for_update(of=("self",))
+                .select_related("cost_of_service")
+                .filter(
+                    provider=provider,
+                    service__service_id=service_id,
+                    is_active=True,
+                )
+                .first()
+            )
+
+            if provider_service is None:
+                logger.warning(
+                    "profile_flow event=not_linked view=a_update_cost_of_service "
+                    "sp=%s service=%s ip=%s",
+                    sp_profile.pk, service_id, ip,
+                )
+                return Response({"error": "Service not found"},
+                                status=status.HTTP_404_NOT_FOUND)
+
+            cost = provider_service.cost_of_service
+            if cost is None:
                 cost = CostOfService.objects.create(
-                    base_price=base_price,
-                    negotiable=negotiable,
-                    notes=notes
+                    base_price=base_price, negotiable=negotiable, notes=notes
                 )
                 provider_service.cost_of_service = cost
-                provider_service.save()
+                provider_service.save(update_fields=["cost_of_service"])
             else:
-                cost = provider_service.cost_of_service
                 cost.base_price = base_price
                 cost.negotiable = negotiable
                 cost.notes = notes
-                cost.save()
+                cost.save(update_fields=["base_price", "negotiable", "notes"])
 
+        logger.info(
+            "profile_flow event=cost_updated view=a_update_cost_of_service "
+            "sp=%s service=%s ip=%s",
+            sp_profile.pk, service_id, ip,
+        )
 
-        return Response({
-            "success": True,
-            "cost_of_service": {
-                "id": cost.id,
-                "base_price": str(cost.base_price) if cost.base_price else None,
-                "negotiable": cost.negotiable,
-                "notes": cost.notes,
+        return Response(
+            {
+                "success": True,
+                "cost_of_service": {
+                    "id": cost.id,
+                    "base_price": str(cost.base_price),
+                    "negotiable": cost.negotiable,
+                    "notes": cost.notes,
+                },
+                "profile_status": sp_profile.is_profile_completed,
             },
-            "profile_status": provider.sp_profile.is_profile_completed
-        }, status=status.HTTP_200_OK)
+            status=status.HTTP_200_OK,
+        )
+
+    except ServiceProvider.DoesNotExist:
+        return Response({"error": "Provider not found"},
+                        status=status.HTTP_404_NOT_FOUND)
 
     except DatabaseError:
-        logger.error("Database error in update_cost_of_service", exc_info=True)
-        return Response(
-            {"error": "Service temporarily unavailable"},
-            status=status.HTTP_503_SERVICE_UNAVAILABLE
+        logger.exception(
+            "profile_flow event=database_error view=a_update_cost_of_service sp=%s ip=%s",
+            sp_profile.pk, ip,
         )
+        return Response({"error": "Service temporarily unavailable"},
+                        status=status.HTTP_503_SERVICE_UNAVAILABLE)
 
     except Exception:
-        logger.error("Unexpected error in update_cost_of_service", exc_info=True)
-        return Response(
-            {"error": "Unexpected server error"},
-            status=status.HTTP_500_INTERNAL_SERVER_ERROR
+        logger.exception(
+            "profile_flow event=unexpected_error view=a_update_cost_of_service sp=%s ip=%s",
+            sp_profile.pk, ip,
         )
+        return Response({"error": "Unexpected server error"},
+                        status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
 
@@ -4736,4 +4626,140 @@ def client_get_sps_by_live_location(request):
     return Response(
         {'service_providers': serializer.data},
         status=status.HTTP_200_OK
+    )
+
+
+
+@api_view(["POST"])
+@authentication_classes([SPJWTAuthentication])
+@permission_classes([IsAuthenticated])
+@throttle_classes([AccountDeleteThrottle])
+def delete_sp_account(request):
+    with transaction.atomic():
+        sp = SPProfile.objects.select_for_update().get(pk=request.user.pk)
+
+        serializer = DeleteSPAccountSerializer(data=request.data, context={"sp": sp})
+        serializer.is_valid(raise_exception=True)
+
+        service_provider = ServiceProvider.objects.filter(
+            sp_profile=sp
+        ).select_for_update().first()
+
+        # ---------------- BLOCKING CHECKS ----------------
+        # ASSUMPTION: OrderService.provider_for_service -> ProviderService -> provider -> ServiceProvider.
+        # Confirm this path matches your actual relations.
+        active_orders = OrderService.objects.filter(
+            provider_for_service__provider=service_provider
+        ).exclude(status__in=TERMINAL_ORDER_STATUSES)
+
+        blocked_session = Session.objects.filter(
+            shipment__service_ordered__order__provider_for_service__provider=service_provider,
+            session_status="in_session",
+        ).exists()
+
+        blocked_shipment = Shipment.objects.filter(
+            service_ordered__order__provider_for_service__provider=service_provider,
+            shipment_status__in=BLOCKING_SHIPMENT_STATUSES,
+        ).exists()
+
+        if blocked_session or blocked_shipment:
+            return Response(
+                {
+                    "error": (
+                        "You can't delete your account while a booking is "
+                        "in progress. Please wait for the current session "
+                        "to finish, or cancel bookings that are in transit "
+                        "or have arrived."
+                    )
+                },
+                status=status.HTTP_409_CONFLICT,
+            )
+
+        # ---------------- RELEASE ACTIVE ORDERS ASSIGNED TO THIS PROVIDER ----------------
+        for order in active_orders:
+            Negotiation.objects.filter(
+                service_order=order
+            ).exclude(
+                status__in=["accepted", "rejected", "canceled", "expired"]
+            ).update(status="canceled")
+
+            order.provider_for_service = None
+            order.status = "cancelled"  # confirm exact terminal string
+            order.save(update_fields=["provider_for_service", "status"])
+
+        # ---------------- REMOVE FROM EVERY INVITED-PROVIDERS LIST ----------------
+        for order in OrderService.objects.filter(invited_providers=sp):
+            order.invited_providers.remove(sp)
+
+        # ---------------- DEACTIVATE SERVICES + DELETE THEIR UPLOADS ----------------
+        if service_provider:
+            provider_services = ProviderService.objects.filter(provider=service_provider)
+
+            for ps in provider_services:
+                for q in ps.qualifications.all():
+                    if q.document:
+                        q.document.delete(save=False)
+                ps.qualifications.all().delete()
+
+                for aff in ps.affidavits.all():
+                    if aff.affidavit:
+                        aff.affidavit.delete(save=False)
+                ps.affidavits.all().delete()
+
+                if ps.cost_of_service:
+                    for img in ps.cost_of_service.images.all():
+                        if img.image:
+                            img.image.delete(save=False)
+                    ps.cost_of_service.images.all().delete()
+
+            provider_services.update(is_active=False)
+
+        # ---------------- DELETE ID / LIVENESS DOCUMENTS ----------------
+        if service_provider:
+            documents = SupportingDocument.objects.filter(provider=service_provider)
+            for doc in documents:
+                for f in (doc.front_file, doc.back_file, doc.liveness_video):
+                    if f:
+                        f.delete(save=False)
+            documents.delete()
+
+        # ---------------- ANONYMIZE SERVICE PROVIDER ----------------
+        if service_provider:
+            if service_provider.profile_image:
+                service_provider.profile_image.delete(save=False)
+
+            service_provider.full_name = "Deleted Provider"
+            service_provider.gender = None
+            service_provider.sp_description = None
+            service_provider.profile_image = None
+            service_provider.is_active = False
+            service_provider.save(update_fields=[
+                "full_name", "gender", "sp_description",
+                "profile_image", "is_active",
+            ])
+
+        # ---------------- ANONYMIZE + LOCK SP AUTH ----------------
+        original_email = sp.email_address
+
+        sp.email_address = f"deleted-sp-{sp.id}@deleted.invalid"
+        sp.mobile_number = None
+        sp.is_active = False
+        sp.mfa_enabled = False
+        sp.mfa_secret = None
+        sp.password = make_password(secrets.token_urlsafe(48))
+        sp.session_version += 1  # same "blacklist" mechanism as client deletion
+        sp.deleted_at = timezone.now()
+        sp.save(update_fields=[
+            "email_address", "mobile_number", "is_active",
+            "mfa_enabled", "mfa_secret", "password",
+            "session_version", "deleted_at",
+        ])
+
+        transaction.on_commit(
+            lambda: send_sp_account_deleted_email.delay(original_email)
+        )
+
+    return Response(
+        {"message": "Your account has been deleted."},
+        status=status.HTTP_200_OK,
     )

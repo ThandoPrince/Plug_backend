@@ -1,7 +1,8 @@
 import re
 import secrets
 from sqlite3 import IntegrityError
-
+from rest_framework.exceptions import APIException
+from rest_framework.pagination import PageNumberPagination
 import requests
 from django.core.exceptions import ValidationError as DjangoValidationError
 from rest_framework.exceptions import ValidationError
@@ -1728,6 +1729,9 @@ def _user_has_access(user, address_obj):
     ).exists()
 
 
+HOUSEHOLD_PAGE_SIZE = 15
+HOUSEHOLD_MAX_PAGE_SIZE = 30
+
 @api_view(["GET"])
 @authentication_classes([ClientJWTAuthentication])
 @throttle_classes([UserReadThrottle])
@@ -1764,22 +1768,40 @@ def get_household_members(request, client_address_id):
             "client",
             "client__client_profile",
         )
-        .filter(
-            address=selected.address,
-            is_active=True,
-        )
-        .exclude(
-            client__client_profile=request.user,
-        )
+        .filter(address=selected.address, is_active=True)
+        .exclude(client__client_profile=request.user)
         .order_by(
             "-is_owner",
             "-house_administrator",
             "client__first_name",
+            "id",  # stable tie-breaker for paging
         )
     )
 
+    total = members.count()
+    has_paging = "page" in request.query_params or "page_size" in request.query_params
+
+    if not has_paging:
+        # Old app versions: everything in one response, as before.
+        rows, has_next = list(members), False
+    else:
+        try:
+            page = max(int(request.query_params.get("page", 1)), 1)
+            size = int(request.query_params.get("page_size", HOUSEHOLD_PAGE_SIZE))
+            size = min(max(size, 1), HOUSEHOLD_MAX_PAGE_SIZE)
+        except ValueError:
+            return Response(
+                {"success": False, "message": "Invalid parameters."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        offset = (page - 1) * size
+        rows = list(members[offset: offset + size + 1])  # +1 tells us if more exist
+        has_next = len(rows) > size
+        rows = rows[:size]
+
     serializer = HouseholdMemberSerializer(
-        members,
+        rows,
         many=True,
         context={"request": request},
     )
@@ -1787,12 +1809,12 @@ def get_household_members(request, client_address_id):
     return Response(
         {
             "success": True,
-            "count": members.count(),
+            "count": total,
+            "has_next": has_next,
             "data": serializer.data,
         },
         status=status.HTTP_200_OK,
     )
-
 
 
 
@@ -3276,6 +3298,12 @@ def update_client_profile(request):
 
     
 
+class ClientAddressPagination(PageNumberPagination):
+    page_size = 15
+    page_size_query_param = "page_size"
+    max_page_size = 30
+
+
 @api_view(['GET'])
 @throttle_classes([UserReadThrottle])
 @authentication_classes([ClientJWTAuthentication])
@@ -3293,18 +3321,25 @@ def client_address_detail(request, client_id, format=None):
             ClientAddress.objects
             .select_related('address')
             .filter(client=client, is_active=True)
-            .order_by('-is_default', 'id')
+            .order_by('-is_default', 'id')  # default first, stable for paging
         )
 
-        serializer = ClientAddressSerializer(
-            client_addresses,
-            many=True
+        # Old app versions send no paging params and expect a plain list.
+        if "page" not in request.query_params and "page_size" not in request.query_params:
+            return Response(
+                ClientAddressSerializer(client_addresses, many=True).data,
+                status=status.HTTP_200_OK
+            )
+
+        paginator = ClientAddressPagination()
+        page = paginator.paginate_queryset(client_addresses, request)
+        return paginator.get_paginated_response(
+            ClientAddressSerializer(page, many=True).data
         )
 
-        return Response(
-            serializer.data,
-            status=status.HTTP_200_OK
-        )
+    except APIException:
+        # Without this, the paginator's "invalid page" 404 became a 500.
+        raise
 
     except ClientDetails.DoesNotExist:
         return Response(

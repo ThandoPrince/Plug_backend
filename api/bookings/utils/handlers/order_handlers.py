@@ -1,13 +1,15 @@
 
 
 
+from django.db import transaction
+
 from api.bookings.events.event_base import EventBus
 from api.bookings.events.order_events import ProviderDeclinedInvitationEvent, ProviderOrderCancelledEvent
 from api.bookings.events.ws_events import notify_client_booking_cancelled, notify_provider_booking_invite, notify_provider_booking_removed, notify_provider_negotiation_update
 from api.bookings.models import OrderService
 from api.bookings.serializers import NegotiationRoundReadSerializer, OrderServiceReadSerializer
 
-from api.bookings.services.celery_task import process_order_created
+from api.bookings.services.celery_task import process_order_created, send_client_round_notification_to_provider, send_order_accepted_notification
 from api.bookings.utils.handlers.visibility import is_visible_to_provider
 from api.clientsDB.notifications.services.notification_builder import OrderNotificationBuilder
 from api.clientsDB.notifications.services.notification_service import NotificationService
@@ -48,37 +50,23 @@ def handle_order_updated(order):
 
 def handle_negotiation_created(payload):
     negotiation = payload["negotiation"]
-    round = payload["round"]
+    round_obj = payload["round"]
 
-    provider = negotiation.provider_for_negotiation.provider.sp_profile
+    provider_id = negotiation.provider_for_negotiation.provider.sp_profile.id
+    live_payload = {
+        "action": "new_round",
+        "type": "negotiation_update",
+        "order_id": negotiation.service_order.order_id,
+        "negotiation_id": negotiation.negotiation_id,
+        "round": NegotiationRoundReadSerializer(round_obj).data,
+    }
+    round_id = round_obj.pk
 
-    # Live update
-    notify_provider_negotiation_update(
-        provider_id=provider.id,
-        payload={
-            "action": "new_round",
-            "type": "negotiation_update",
-            "order_id": negotiation.service_order.order_id,
-            "negotiation_id": negotiation.negotiation_id,
-            "round": NegotiationRoundReadSerializer(round).data,
-        },
-    )
+    def _after_commit():
+        notify_provider_negotiation_update(provider_id=provider_id, payload=live_payload)
+        send_client_round_notification_to_provider.delay(round_id)
 
-    # Push notification
-    NotificationService.notify_provider(
-        
-        provider=provider,
-        notification_type="negotiation_created",
-        title="New Negotiation Message 💬",
-        body="The client sent you a new offer.",
-        payload={
-            "type": "negotiation_update",
-            "action": "new_round",
-            "order_id": negotiation.service_order.order_id,
-            "negotiation_id": negotiation.negotiation_id,
-        },
-        websocket_invite=False,
-    )
+    transaction.on_commit(_after_commit)
 
 
 def handle_provider_order_cancelled(payload):
@@ -157,27 +145,16 @@ def handle_order_cancelled(payload):
 
 
 def handle_order_accepted(payload):
-
     order = payload["order"]
+    order_id = order.pk
 
-    client = getattr(order.client, "client_profile", None)
+    # Existing live-update logic. Keep it as is, it's cheap.
+    handle_order_updated(order)
 
-    handle_order_updated(payload["order"])
-
-    if client:
-        NotificationService.notify_client(
-            client=client,
-            notification_type="order_accepted",
-            title="Order Accepted 🛠️",
-            body="Your booking has been accepted.",
-            payload=OrderNotificationBuilder.order_accepted(order),
-        )
-
-    for provider in order.invited_providers.all():
-        notify_provider_booking_removed(
-            provider_id=provider.id,
-            order_id=order.order_id,
-        )
+    # Worker must never run before the accept is committed.
+    transaction.on_commit(
+        lambda: send_order_accepted_notification.delay(order_id)
+    )
 
 
 def handle_provider_in_transit(payload):

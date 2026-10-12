@@ -62,7 +62,7 @@ class Migration(migrations.Migration):
                 ('is_active', models.BooleanField(default=True)),
                 ('is_discoverable', models.BooleanField(default=True)),
                 ('sp_profile', models.OneToOneField(on_delete=django.db.models.deletion.CASCADE, primary_key=True, serialize=False, to='serviceProvidersDB.spprofile')),
-                ('profile_image', models.ImageField(blank=True, null=True, upload_to=api.serviceProvidersDB.models.ServiceProvider.service_provider_upload_path)),
+                ('profile_image', models.ImageField(blank=True, null=True, upload_to=api.serviceProvidersDB.models.service_provider_upload_path)),
                 ('location', models.ForeignKey(null=True, on_delete=django.db.models.deletion.SET_NULL, to='serviceProvidersDB.address')),
             ],
         ),

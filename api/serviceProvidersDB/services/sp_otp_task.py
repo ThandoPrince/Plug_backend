@@ -164,3 +164,38 @@ def send_sp_password_changed_email(self, email_address):
     email.send(fail_silently=False)
 
     logger.info("Service provider password changed notification sent.")
+
+
+@shared_task(
+    bind=True,
+    autoretry_for=(Exception,),
+    retry_backoff=True,
+    retry_jitter=True,
+    max_retries=3,
+)
+def send_sp_account_deleted_email(self, email_address):
+    subject = "Your Plug provider account has been deleted"
+
+    text_content = (
+        "Your Plug provider account and associated data have been deleted.\n\n"
+        "If you did not request this, contact support immediately."
+    )
+
+    html_content = """
+    <html>
+        <body>
+            <h2>Your Plug Provider Account Has Been Deleted</h2>
+            <p>Your account and associated data have been deleted, as requested.</p>
+            <p><strong>If you did not request this</strong>, contact support immediately.</p>
+        </body>
+    </html>
+    """
+
+    email = EmailMultiAlternatives(
+        subject=subject,
+        body=text_content,
+        from_email=settings.DEFAULT_FROM_EMAIL,
+        to=[email_address],
+    )
+    email.attach_alternative(html_content, "text/html")
+    email.send(fail_silently=False)

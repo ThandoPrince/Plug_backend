@@ -186,6 +186,7 @@ REST_FRAMEWORK = {
     "DEFAULT_THROTTLE_RATES": {
         "anon": "30/min",
         "user": "100/min",
+        "account_delete": "3/day",
         "auth": "5/min",
         "client_otp": "3/minute",
         "client_registration": "3/minute",
@@ -257,6 +258,18 @@ CELERY_BROKER_CONNECTION_RETRY_ON_STARTUP = True
 CELERY_RESULT_SERIALIZER = "json"
 
 CELERY_TIMEZONE = "Africa/Johannesburg"
+
+
+CELERY_BEAT_SCHEDULE = {
+    "auto-reschedule-orders": {
+        "task": "bookings.tasks.auto_reschedule_orders",
+        "schedule": 60.0,
+    },
+    "expire-overdue-orders": {
+        "task": "bookings.tasks.expire_overdue_orders",
+        "schedule": 300.0,   # every 5 minutes is plenty for a 1-day window
+    },
+}
 
 
 # ============================================================================

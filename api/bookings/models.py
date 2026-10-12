@@ -113,6 +113,7 @@ class OrderService(models.Model):
     date_and_time_created = models.DateTimeField(auto_now_add=True)
     status = models.CharField(max_length=100, choices=ORDER_STATUS, default='pending')
     is_broadcasted = models.BooleanField(default=False)
+    overdue_at = models.DateTimeField(null=True, blank=True)
     invited_providers = models.ManyToManyField(
         'serviceProvidersDB.SPProfile',
         related_name='invited_orders',
@@ -130,63 +131,64 @@ class OrderService(models.Model):
                 .values_list('status', flat=True)
                 .first()
             )
-        self._auto_reschedule_if_needed()
 
-        # 1. Save the order status change first
+        # Keep overdue_at in sync with status (works for any code path that sets it)
+        if self._sync_overdue_at() and kwargs.get('update_fields') is not None:
+            kwargs['update_fields'] = set(kwargs['update_fields']) | {'overdue_at'}
+
         super().save(*args, **kwargs)
 
-        # 2. Intercept status transition to trigger side effects
         if not is_new and old_status != self.status:
-            if self.status == 'canceled':
+            if self.status in ('canceled', 'expired'):
                 self._cascade_negotiation_cancellation()
-
             self._log_order_history(old_status=old_status, new_status=self.status)
 
+    RESCHEDULABLE_STATUSES = ["pending", "rescheduled", "overdue"]
+    MAX_AUTO_RESCHEDULES = 18
+    RESCHEDULE_STEP = timedelta(hours=4)
+    OVERDUE_EXPIRY = timedelta(days=1)
 
+    def _sync_overdue_at(self):
+        """Start the overdue clock on entering overdue; reset it if the order leaves."""
+        if self.status == 'overdue' and self.overdue_at is None:
+            self.overdue_at = timezone.now()
+            return True
+        if self.status not in ('overdue', 'expired') and self.overdue_at is not None:
+            self.overdue_at = None
+            return True
+        return False
 
-
-    def _auto_reschedule_if_needed(self):
-        """
-        Automatically reschedule orders that are about to expire.
-
-        - If less than 10 minutes remain, move the booking forward by 1 hour.
-        - Maximum of 72 automatic reschedules (3 days).
-        - After that, mark the order as overdue.
-        """
-
-        if self.status not in ["pending", "in-negociation", "rescheduled","overdue"]:
-            return
-
+    def apply_auto_reschedule(self):
+        """Mutates the instance in memory. Returns True if anything changed."""
+        if self.status not in self.RESCHEDULABLE_STATUSES:
+            return False
         if not self.requested_date or not self.requested_date_time:
-            return
+            return False
 
         scheduled = timezone.make_aware(
-            datetime.combine(
-                self.requested_date,
-                self.requested_date_time
-            ),
-            timezone.get_current_timezone()
+            datetime.combine(self.requested_date, self.requested_date_time),
+            timezone.get_current_timezone(),
         )
-
         minimum_time = timezone.now() + timedelta(minutes=10)
+        original_status = self.status
         rescheduled = False
 
         while scheduled < minimum_time:
-
-            # Already rescheduled for 3 days
-            if self.reschedule_count >= 72:
+            if self.reschedule_count >= self.MAX_AUTO_RESCHEDULES:
                 self.status = "overdue"
-                return
-
-            scheduled += timedelta(hours=1)
+                return self.status != original_status or rescheduled
+            scheduled += self.RESCHEDULE_STEP
             self.reschedule_count += 1
             rescheduled = True
 
+        if not rescheduled:
+            return False
+
         self.requested_date = scheduled.date()
         self.requested_date_time = scheduled.time()
-
-        if rescheduled and self.status != "overdue":
-            self.status = "rescheduled"         
+        if self.status != "overdue":
+            self.status = "rescheduled"
+        return True        
 
     def _cascade_negotiation_cancellation(self):
         """

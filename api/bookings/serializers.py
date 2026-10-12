@@ -65,10 +65,56 @@ class NegotiationReadSerializer(serializers.ModelSerializer):
 
 
 
+ROUNDS_PAGE_SIZE = 20
 
-from rest_framework import serializers
-from django.utils import timezone
-from api.bookings.models import Shipment
+
+
+
+class PagedNegotiationReadSerializer(NegotiationReadSerializer):
+    # Only a page of rounds instead of all of them.
+    rounds = serializers.SerializerMethodField()
+
+    def get_rounds(self, obj):
+        before = self.context.get("before")
+        limit = self.context.get("limit", ROUNDS_PAGE_SIZE)
+
+        qs = obj.rounds.all()
+        if before is not None:
+            qs = qs.filter(pk__lt=before)
+
+        rows = list(qs.order_by("-pk")[: limit + 1])  # +1 tells us if more exist
+        self.context["has_more"] = len(rows) > limit
+        rows = rows[:limit]
+        rows.reverse()  # oldest -> newest, as before
+
+        return NegotiationRoundReadSerializer(
+            rows, many=True, context=self.context
+        ).data
+
+
+class ProviderNegotiationReadSerializer(NegotiationReadSerializer):
+    # Only a page of rounds per negotiation instead of all of them.
+    rounds = serializers.SerializerMethodField()
+
+    def get_rounds(self, obj):
+        before = self.context.get("before")
+        limit = self.context.get("limit", ROUNDS_PAGE_SIZE)
+
+        qs = obj.rounds.all()
+        if before is not None:
+            qs = qs.filter(pk__lt=before)
+
+        rows = list(qs.order_by("-pk")[: limit + 1])  # +1 tells us if more exist
+        self.context["has_more"][obj.pk] = len(rows) > limit
+        rows = rows[:limit]
+        rows.reverse()  # oldest -> newest, as before
+
+        return NegotiationRoundReadSerializer(
+            rows, many=True, context=self.context
+        ).data
+
+
+
 
 
 class RescheduleShipmentSerializer(serializers.ModelSerializer):
@@ -293,6 +339,19 @@ class OrderServiceReadSerializer(serializers.ModelSerializer):
         model = OrderService
         fields = '__all__'
         read_only_fields = ['order_id', 'date_and_time_created', 'total_price', 'final_price']
+
+
+class ClientPendingOrderSerializer(OrderServiceReadSerializer):
+    # Comes from the Exists() annotation on the queryset, not from a query.
+    in_negotiation = serializers.BooleanField(read_only=True)
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        # OrderService.status has no 'in-negotiation' value, so derive it for
+        # display. The stored status is untouched.
+        if instance.status == 'pending' and instance.in_negotiation:
+            data['status'] = 'in-negotiation'
+        return data
 
 # ------------------- BookingItem -------------------
 

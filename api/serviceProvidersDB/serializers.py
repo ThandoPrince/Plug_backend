@@ -191,6 +191,22 @@ class ResetSPPasswordWithOTPSerializer(serializers.Serializer):
         return attrs    
 
 
+class DeleteSPAccountSerializer(serializers.Serializer):
+    password = serializers.CharField(write_only=True, trim_whitespace=False)
+    confirmation = serializers.CharField(write_only=True)
+
+    def validate_confirmation(self, value):
+        if value.strip().upper() != "DELETE":
+            raise serializers.ValidationError('Type "DELETE" to confirm.')
+        return value
+
+    def validate(self, attrs):
+        sp = self.context["sp"]
+        if not check_password(attrs["password"], sp.password):
+            raise serializers.ValidationError({"password": "Incorrect password."})
+        return attrs
+
+
 class SPChangePasswordSerializer(serializers.Serializer):
     current_password = serializers.CharField(
         write_only=True, trim_whitespace=False, max_length=128
@@ -1126,9 +1142,9 @@ class SPProfileMyReadSerializer(serializers.ModelSerializer):
     class Meta:
         model = SPProfile
         # List all fields except password
-        exclude = ['password', 'mfa_enabled','mfa_secret','failed_login_attempts','total_failed_login_attempts','account_locked_until','updated_at','date_created','last_login_at','last_login_ip','email_verified_at']
+        # exclude = ['password', 'mfa_enabled','mfa_secret','failed_login_attempts','total_failed_login_attempts','account_locked_until','updated_at','date_created','last_login_at','last_login_ip','email_verified_at']
         # OR, alternatively, explicitly include fields you want:
-        # fields = ['id', 'email_address', 'mobile_number', 'is_profile_completed']
+        fields = ['id', 'is_profile_completed','email_address', 'mobile_number']
         read_only_fields = ['id', 'email_address', 'mobile_number', 'is_profile_completed','id']
 
 
@@ -1136,18 +1152,18 @@ class SPProfileReadSerializer(serializers.ModelSerializer):
     class Meta:
         model = SPProfile
         # List all fields except password
-        exclude = ['password', 'email_address', 'mobile_number','failed_login_attempts','mfa_secret','mfa_enabled','total_failed_login_attempts','account_locked_until','last_login_at','last_login_ip','email_verified_at']
+        # exclude = ['password', 'email_address', 'mobile_number','failed_login_attempts','mfa_secret','mfa_enabled','total_failed_login_attempts','account_locked_until','last_login_at','last_login_ip','email_verified_at']
         # OR, alternatively, explicitly include fields you want:
-        # fields = ['id', 'email_address', 'mobile_number', 'is_profile_completed']
+        fields = ['id', 'is_profile_completed']
         read_only_fields = ['id', 'email_address', 'mobile_number', 'is_profile_completed','id']
 
 class ClientSPProfileReadSerializer(serializers.ModelSerializer):
     class Meta:
         model = SPProfile
         # List all fields except password
-        exclude = ['password', 'email_address', 'mobile_number','failed_login_attempts','mfa_secret','mfa_enabled','total_failed_login_attempts','account_locked_until','last_login_at','last_login_ip']
+        # exclude = ['password', 'email_address', 'mobile_number','failed_login_attempts','mfa_secret','mfa_enabled','total_failed_login_attempts','account_locked_until','last_login_at','last_login_ip']
         # OR, alternatively, explicitly include fields you want:
-        # fields = ['id', 'email_address', 'mobile_number', 'is_profile_completed']
+        fields = ['id', 'is_profile_completed']
         read_only_fields = [ 'is_profile_completed', 'id']
 
 class ServiceProviderSerializer(serializers.ModelSerializer):
@@ -1156,7 +1172,7 @@ class ServiceProviderSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = ServiceProvider
-        fields = '__all__'
+        exclude = ['id_number']
         read_only_fields = ["rating"]
 
 
@@ -1453,7 +1469,7 @@ class ServiceProviderWriteSerializer(serializers.ModelSerializer):
         if SPProfile.objects.filter(email_address=email).exists():
             raise serializers.ValidationError({
                 "sp_profile": {
-                    "email_address": "A profile with this email already exists."
+                    "email_address": "A profile with this email already exists. Please proceed to login or use a different email address."
                 }
             })
 

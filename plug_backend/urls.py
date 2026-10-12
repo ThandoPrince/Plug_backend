@@ -127,13 +127,14 @@ path("api/client/delete-account/",    views.delete_client_account,    name="clie
 ),##used
 
 path("api/sp/password-reset/request-otp/", sp_views.request_sp_password_reset_otp, name="sp_request_password_reset_otp"),##used
-path("api/sp/password-reset/confirm/", sp_views.reset_sp_password_with_otp, name="sp_reset_password_with_otp"),##used
+path("api/sp/password-reset/confirm-otp/", sp_views.reset_sp_password_with_otp, name="sp_reset_password_with_otp"),##used
 path("api/sp/token/refresh/", sp_views.sp_token_refresh, name="sp_token_refresh"),##used
 path("api/sp/change-password/", sp_views.change_sp_password, name="sp_change_password"),
     path('api/sp_service/cost/<int:service_id>/', sp_views.update_cost_of_service, name='sp_cost_of'), ##used
     path('api/a_sp_service/cost/<int:service_id>/', sp_views.a_update_cost_of_service, name='a_sp_cost_of'),##used
     
     path('api/sp_details/upload/', sp_views.patch_sp_profile, name='sp_details_upload'), ##used
+    path("api/sp/delete-account/", sp_views.delete_sp_account, name="sp_delete_account"), ##used
     path('api/sp/upload/address_document/', sp_views.sp_add_address_document, name='sp_details_upload'),
     path(
     "api/provider-services/<int:provider_service_id>/affidavit/",
@@ -150,7 +151,8 @@ path(
     "api/provider/logout/",
     sp_views.provider_logout,
     name="provider-logout",
-), path('api/sp/password-reset/request/', sp_views.request_sp_password_reset, name='sp-request-password-reset'),
+), 
+path('api/sp/password-reset/request/', sp_views.request_sp_password_reset, name='sp-request-password-reset'),
 path('api/sp/password-reset/confirm/', sp_views.reset_sp_password, name='sp-reset-password'),
 
     path(
