@@ -2949,9 +2949,13 @@ def verify_client_login_otp(request):
             demo_bypass = bool(
     demo_bypass_email
     and demo_bypass_otp
-    and sp.email_address == demo_bypass_email
+    and user.email_address == demo_bypass_email
     and str(otp) == str(demo_bypass_otp)
 )
+
+
+
+
 
             submitted_hash = hash_otp(otp)
 
