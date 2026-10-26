@@ -117,6 +117,14 @@ class OrderNotificationBuilder:
             "type": "provider_in_transit",
             "status": order.status,
         }
+    @staticmethod
+    def provider_no_show(order):
+        return {
+            "entity_type": "order",
+            "entity_id": order.order_id,
+            "type": "provider_no_show",
+            "status": order.status,
+        }
 
     @staticmethod
     def provider_arrived(order):

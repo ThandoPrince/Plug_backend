@@ -9,7 +9,7 @@ from api.bookings.events.ws_events import notify_client_booking_cancelled, notif
 from api.bookings.models import OrderService
 from api.bookings.serializers import NegotiationRoundReadSerializer, OrderServiceReadSerializer
 
-from api.bookings.services.celery_task import process_order_created, send_client_round_notification_to_provider, send_order_accepted_notification
+from api.bookings.services.celery_task import notify_invited_providers_order_removed, notify_invited_providers_order_removed2, process_order_created, send_client_round_notification_to_provider, send_order_accepted_notification, send_order_cancelled_notification, send_shipment_status_notification
 from api.bookings.utils.handlers.visibility import is_visible_to_provider
 from api.clientsDB.notifications.services.notification_builder import OrderNotificationBuilder
 from api.clientsDB.notifications.services.notification_service import NotificationService
@@ -63,8 +63,10 @@ def handle_negotiation_created(payload):
     round_id = round_obj.pk
 
     def _after_commit():
+        print(f"[negotiation_created] after_commit provider_id={provider_id} round_id={round_id}", flush=True)
         notify_provider_negotiation_update(provider_id=provider_id, payload=live_payload)
         send_client_round_notification_to_provider.delay(round_id)
+        print("[negotiation_created] task queued", flush=True)
 
     transaction.on_commit(_after_commit)
 
@@ -105,44 +107,21 @@ def handle_provider_order_cancelled(payload):
 
 
 def handle_order_cancelled(payload):
-
     order = payload.get("order")
     shipment = payload.get("shipment")
 
     if not order or not shipment:
         return
 
-    provider_service = shipment.service_ordered.order.provider_for_service
+    handle_order_updated(order)  # unchanged, still synchronous
 
-    if not provider_service:
-        return
+    order_id = order.pk
 
-    service_provider = provider_service.provider
+    def _dispatch():
+        send_order_cancelled_notification.delay(order_id)
+        notify_invited_providers_order_removed2.delay(order_id)
 
-    if not service_provider:
-        return
-
-    sp_profile = service_provider.sp_profile
-
-    if not sp_profile:
-        return
-    handle_order_updated(payload["order"])
-
-
-    NotificationService.notify_provider(
-        provider=sp_profile,
-        notification_type="order_cancelled",
-        title="Booking Cancelled ❌",
-        body="The client has cancelled the booking.",
-        payload=OrderNotificationBuilder.order_cancelled(order),
-    )
-    for provider in order.invited_providers.all():
-        notify_provider_booking_removed(
-            provider_id=provider.id,
-            order_id=order.order_id,
-        )
-
-
+    transaction.on_commit(_dispatch)
 
 def handle_order_accepted(payload):
     order = payload["order"]
@@ -157,23 +136,6 @@ def handle_order_accepted(payload):
     )
 
 
-def handle_provider_in_transit(payload):
-    order_id = payload["order_id"]
-
-    order = OrderService.objects.get(order_id=order_id)
-
-    client = getattr(order.client, "client_profile", None)
-
-    if not client:
-        return
-
-    NotificationService.notify_client(
-        client=client,
-        notification_type="provider_in_transit",
-        title="Provider On The Way 🚗",
-        body="Your provider is on the way.",
-        payload=OrderNotificationBuilder.provider_in_transit(order),
-    )
 
 def handle_final_price_updated(payload):
     order = payload.get("order")
@@ -201,22 +163,22 @@ def handle_final_price_updated(payload):
 
 
 def handle_provider_arrived(payload):
-
     order_id = payload["order_id"]
+    shipment_id = payload["shipment_id"]
+    transaction.on_commit(
+        lambda: send_shipment_status_notification.delay(
+            order_id, shipment_id, "provider_arrived"
+        )
+    )
 
-    order = OrderService.objects.select_related("client").get(order_id=order_id)
 
-    client = getattr(order.client, "client_profile", None)
-
-    if not client:
-        return
-
-    NotificationService.notify_client(
-        client=client,
-        notification_type="provider_arrived",
-        title="Provider Arrived 📍",
-        body="Your provider has arrived.",
-        payload=OrderNotificationBuilder.provider_arrived(order),
+def handle_provider_in_transit(payload):
+    order_id = payload["order_id"]
+    shipment_id = payload["shipment_id"]
+    transaction.on_commit(
+        lambda: send_shipment_status_notification.delay(
+            order_id, shipment_id, "provider_in_transit"
+        )
     )
 
 def handle_order_rescheduled(payload):
@@ -298,6 +260,17 @@ def handle_provider_declined_invitation(payload):
                 "remaining_providers": remaining_providers,
             },
         )
+
+
+
+def handle_provider_no_show(payload):
+    transaction.on_commit(
+        lambda: send_shipment_status_notification.delay(
+            payload["order_id"], payload["shipment_id"], "provider_no_show"
+        )
+    )
+
+EventBus.register("shipment.no_show", handle_provider_no_show)
 
 EventBus.register(
     "order.created",

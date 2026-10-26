@@ -65,6 +65,7 @@ SESSION_STATUS = [
     ('on_break', 'On Break'),
     ('in_session', 'In Session'),
     ('completed', 'Completed'),
+    ('awaiting_payment', 'Awaiting Payment'),
     ('canceled', 'Canceled'),
 ]
 

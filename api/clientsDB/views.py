@@ -24,6 +24,7 @@ from api.clientsDB.services.client_history_model_helper import create_client_add
 from api.clientsDB.services.client_ip_address_helper import get_client_ip, get_device_info
 from api.clientsDB.services.client_login_token import  generate_email_login_tokenn
 from api.clientsDB.services.client_otp_token import generate_email_verification_token
+from api.clientsDB.services.client_profile_flow import CS, advance_client_status, require_client_status, logger as flow_logger
 from api.clientsDB.services.email_mask_helper import mask_email
 from api.clientsDB.services.jwt_client_authentication import ClientJWTAuthentication
 from api.clientsDB.services.otp_service import create_client_otp,  hash_otp
@@ -1076,104 +1077,72 @@ INVALID_OR_EXPIRED_RESET = {
     "message": "Invalid or expired verification code. Please go back to login.",
 }
 
+
+
+
 @api_view(["POST"])
 @throttle_classes([ClientOTPThrottle])
-@authentication_classes([]) 
+@authentication_classes([])
 @permission_classes([AllowAny])
 def verify_client_email(request):
-
     ip_address = get_client_ip(request)
-    user_agent = get_device_info(request)
 
-
-
-    serializer = ClientOTPVerifySerializer(
-        data=request.data
-    )
-
+    serializer = ClientOTPVerifySerializer(data=request.data)
     if not serializer.is_valid():
-
-
         return Response(
-            {
-                "success": False,
-                "errors": serializer.errors,
-            },
+            {"success": False, "errors": serializer.errors},
             status=status.HTTP_400_BAD_REQUEST,
         )
 
     otp = serializer.validated_data["otp"]
 
-
-
-    # --------------------------------------------------
-    # EXTRACT + VALIDATE VERIFICATION TOKEN FROM HEADER
-    # --------------------------------------------------
-
+    # ---- Verification token from the Authorization header ----
     auth_header = request.headers.get("Authorization", "")
-
-
-
     if not auth_header.startswith("Bearer "):
-
-
         hash_otp("000000")
-        return Response(
-            INVALID_OR_EXPIRED,
-            status=status.HTTP_400_BAD_REQUEST,
+        flow_logger.info(
+            "client_flow event=token_rejected view=verify_client_email reason=no_bearer ip=%s",
+            ip_address,
         )
+        return Response(INVALID_OR_EXPIRED, status=status.HTTP_400_BAD_REQUEST)
 
     raw_verification_token = auth_header[len("Bearer "):].strip()
 
-  
-
     try:
         validated_token = AccessToken(raw_verification_token)
-
-
-    except TokenError as e:
-
-
+    except TokenError:
         hash_otp("000000")
-        return Response(
-            INVALID_OR_EXPIRED,
-            status=status.HTTP_400_BAD_REQUEST,
+        flow_logger.info(
+            "client_flow event=token_rejected view=verify_client_email reason=bad_token ip=%s",
+            ip_address,
         )
+        return Response(INVALID_OR_EXPIRED, status=status.HTTP_400_BAD_REQUEST)
 
     if validated_token.get("purpose") != "email_verification":
-
-
         hash_otp("000000")
-        return Response(
-            INVALID_OR_EXPIRED,
-            status=status.HTTP_400_BAD_REQUEST,
+        flow_logger.info(
+            "client_flow event=token_rejected view=verify_client_email reason=wrong_purpose ip=%s",
+            ip_address,
         )
+        return Response(INVALID_OR_EXPIRED, status=status.HTTP_400_BAD_REQUEST)
 
     token_client_id = validated_token.get("client_id")
     token_id = validated_token.get("request_id")
 
-
-
     if not token_client_id or not token_id:
-
-
         hash_otp("000000")
-        return Response(
-            INVALID_OR_EXPIRED,
-            status=status.HTTP_400_BAD_REQUEST,
+        flow_logger.info(
+            "client_flow event=token_rejected view=verify_client_email reason=missing_claims ip=%s",
+            ip_address,
         )
+        return Response(INVALID_OR_EXPIRED, status=status.HTTP_400_BAD_REQUEST)
 
     try:
-
-     
-
         with transaction.atomic():
-
-      
 
             otp_request = (
                 ClientOTP.objects
-                .select_for_update()
+                .select_for_update(of=("self", "client"))
                 .select_related("client")
                 .filter(
                     request_id=token_id,
@@ -1184,151 +1153,78 @@ def verify_client_email(request):
             )
 
             if otp_request is None:
-               
-
-                return Response(
-                    INVALID_OR_EXPIRED,
-                    status=status.HTTP_400_BAD_REQUEST,
+                hash_otp("000000")
+                flow_logger.info(
+                    "client_flow event=otp_not_found view=verify_client_email client=%s ip=%s",
+                    token_client_id, ip_address,
                 )
-
-
+                return Response(INVALID_OR_EXPIRED, status=status.HTTP_400_BAD_REQUEST)
 
             now = timezone.now()
-
-            # --------------------------------------------------
-            # ALREADY USED / VERIFIED
-            # --------------------------------------------------
-
-            if (
-                otp_request.is_used
-                or otp_request.is_verified
-            ):
-
-
-                return Response(
-                    INVALID_OR_EXPIRED,
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
-
-            # --------------------------------------------------
-            # EXPIRED
-            # --------------------------------------------------
-
-            if now >= otp_request.expires_at:
-
-
-                return Response(
-                    INVALID_OR_EXPIRED,
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
-
-            # --------------------------------------------------
-            # MAXIMUM ATTEMPTS
-            # --------------------------------------------------
-
-            if (
-                otp_request.attempts
-                >= otp_request.max_attempts
-            ):
-
-
-                return Response(
-                    {
-                        "success": False,
-                        "message": (
-                            "Too many invalid verification "
-                            "code attempts."
-                        ),
-                    },
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
-
-            # --------------------------------------------------
-            # VERIFY OTP
-            # --------------------------------------------------
-
-
-            submitted_hash = hash_otp(otp)
-
-      
-
-            otp_valid = secrets.compare_digest(
-                submitted_hash,
-                otp_request.otp_hash,
-            )
-
-    
-
-            if not otp_valid:
-
-                otp_request.attempts += 1
-
-   
-
-                otp_request.save(
-                    update_fields=["attempts"]
-                )
-
-                if (
-                    otp_request.attempts
-                    >= otp_request.max_attempts
-                ):
-
-
-                    return Response(
-                        {
-                            "success": False,
-                            "message": (
-                                "Too many invalid "
-                                "verification code attempts."
-                            ),
-                        },
-                        status=status.HTTP_400_BAD_REQUEST,
-                    )
-
-                return Response(
-                    INVALID_OR_EXPIRED,
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
-
-            # --------------------------------------------------
-            # OTP VALID
-            # --------------------------------------------------
-
-
-
             user = otp_request.client
 
+            if otp_request.is_used or otp_request.is_verified:
+                return Response(INVALID_OR_EXPIRED, status=status.HTTP_400_BAD_REQUEST)
 
+            if now >= otp_request.expires_at:
+                return Response(INVALID_OR_EXPIRED, status=status.HTTP_400_BAD_REQUEST)
+
+            # Status gate, before any attempt is counted. Blocked, inactive
+            # or already-verified accounts get the same generic error, so
+            # callers can't learn which status an account is in.
+            if user.is_profile_completed != CS.EMAIL_VERIFICATION or not user.is_active:
+                flow_logger.warning(
+                    "client_flow event=status_rejected view=verify_client_email "
+                    "client=%s status=%s active=%s ip=%s",
+                    user.id, user.is_profile_completed, user.is_active, ip_address,
+                )
+                hash_otp("000000")  # keep timing similar to the other reject paths
+                return Response(INVALID_OR_EXPIRED, status=status.HTTP_400_BAD_REQUEST)
+
+            if otp_request.attempts >= otp_request.max_attempts:
+                return Response(
+                    {"success": False, "message": "Too many invalid verification code attempts."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            otp_valid = secrets.compare_digest(hash_otp(otp), otp_request.otp_hash)
+
+            if not otp_valid:
+                otp_request.attempts += 1
+                otp_request.save(update_fields=["attempts"])
+
+                flow_logger.info(
+                    "client_flow event=otp_invalid view=verify_client_email "
+                    "client=%s attempts=%s ip=%s",
+                    user.id, otp_request.attempts, ip_address,
+                )
+
+                if otp_request.attempts >= otp_request.max_attempts:
+                    return Response(
+                        {"success": False, "message": "Too many invalid verification code attempts."},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+                return Response(INVALID_OR_EXPIRED, status=status.HTTP_400_BAD_REQUEST)
+
+            # in-email-verification -> in-details, atomically. Fails if the
+            # row changed underneath us, so the step can't run twice.
+            if not advance_client_status(user, CS.EMAIL_VERIFICATION):
+                return Response(INVALID_OR_EXPIRED, status=status.HTTP_400_BAD_REQUEST)
 
             otp_request.is_verified = True
             otp_request.is_used = True
             otp_request.verified_at = now
-
-            otp_request.save(
-                update_fields=[
-                    "is_verified",
-                    "is_used",
-                    "verified_at",
-                ]
-            )
-
-     
+            otp_request.save(update_fields=["is_verified", "is_used", "verified_at"])
 
             user.email_verified_at = now
-            user.is_profile_completed = "in-details"
-
-            user.save(
-                update_fields=[
-                    "email_verified_at",
-                    "is_profile_completed"
-                ]
-            )
-
-      
+            user.save(update_fields=["email_verified_at"])  # status already advanced
 
             tokens = generate_client_tokens(user)
 
+        flow_logger.info(
+            "client_flow event=email_verified view=verify_client_email client=%s ip=%s",
+            user.id, ip_address,
+        )
 
         return Response(
             {
@@ -1336,10 +1232,7 @@ def verify_client_email(request):
                 "message": "Email verified successfully.",
                 "data": {
                     "id": user.id,
-
-                    "is_profile_completed": (
-                        user.is_profile_completed
-                    ),
+                    "is_profile_completed": user.is_profile_completed,
                     "access_token": tokens["access"],
                     "refresh_token": tokens["refresh"],
                 },
@@ -1347,23 +1240,20 @@ def verify_client_email(request):
             status=status.HTTP_200_OK,
         )
 
-    except Exception as e:
-
-
-
-        logger.exception(
-            "Client email verification failed unexpectedly"
+    except Exception:
+        flow_logger.exception(
+            "client_flow event=unexpected_error view=verify_client_email ip=%s",
+            ip_address,
         )
-
         return Response(
-            {
-                "success": False,
-                "message": (
-                    "Unable to verify your email at this time."
-                ),
-            },
+            {"success": False, "message": "Unable to verify your email at this time."},
             status=status.HTTP_500_INTERNAL_SERVER_ERROR,
         )
+
+        
+
+
+
 
 
 
@@ -1372,152 +1262,138 @@ def verify_client_email(request):
 @throttle_classes([ClientOTPThrottle])
 @permission_classes([AllowAny])
 def resend_client_otp(request):
-
     ip_address = get_client_ip(request)
-    user_agent = get_device_info(request)
+
+    # ---- Verification token from the Authorization header ----
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        flow_logger.info(
+            "client_flow event=token_rejected view=resend_client_otp reason=no_bearer ip=%s",
+            ip_address,
+        )
+        return Response(INVALID_OR_EXPIRED, status=status.HTTP_400_BAD_REQUEST)
+
+    raw_verification_token = auth_header[len("Bearer "):].strip()
 
     try:
-        # --------------------------------------------------
-        # EXTRACT + VALIDATE VERIFICATION TOKEN FROM HEADER
-        # --------------------------------------------------
+        # Validates the JWT's own signature/exp only. An expired OTP row is
+        # fine here, since the whole point is to issue a new one.
+        validated_token = AccessToken(raw_verification_token)
+    except TokenError:
+        flow_logger.info(
+            "client_flow event=token_rejected view=resend_client_otp reason=bad_token ip=%s",
+            ip_address,
+        )
+        return Response(INVALID_OR_EXPIRED, status=status.HTTP_400_BAD_REQUEST)
 
-        auth_header = request.headers.get("Authorization", "")
+    if validated_token.get("purpose") != "email_verification":
+        flow_logger.info(
+            "client_flow event=token_rejected view=resend_client_otp reason=wrong_purpose ip=%s",
+            ip_address,
+        )
+        return Response(INVALID_OR_EXPIRED, status=status.HTTP_400_BAD_REQUEST)
 
-        if not auth_header.startswith("Bearer "):
-            return Response(
-                INVALID_OR_EXPIRED,
-                status=status.HTTP_400_BAD_REQUEST,
-            )
+    token_client_id = validated_token.get("client_id")
+    if not token_client_id:
+        flow_logger.info(
+            "client_flow event=token_rejected view=resend_client_otp reason=missing_claims ip=%s",
+            ip_address,
+        )
+        return Response(INVALID_OR_EXPIRED_RESET, status=status.HTTP_400_BAD_REQUEST)
 
-        raw_verification_token = auth_header[len("Bearer "):].strip()
+    try:
+        with transaction.atomic():
 
-        try:
-            # Note: AccessToken() only validates the JWT's own signature/exp,
-            # not the OTP row's expires_at — this is fine to decode even if
-            # the OTP itself already expired, as long as the JWT hasn't.
-            validated_token = AccessToken(raw_verification_token)
-        except TokenError:
-            return Response(
-                INVALID_OR_EXPIRED,
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        if validated_token.get("purpose") != "email_verification":
-            return Response(
-                INVALID_OR_EXPIRED,
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        token_client_id = validated_token.get("client_id")
-
-        if not token_client_id:
-            return Response(
-                INVALID_OR_EXPIRED_RESET,
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        try:
-            client_auth = ClientAuth.objects.get(id=token_client_id)
-        except ClientAuth.DoesNotExist:
-            return Response(
-                INVALID_OR_EXPIRED_RESET,
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        # --------------------------------------------------
-        # DON'T RESEND IF ALREADY VERIFIED / COMPLETED
-        # --------------------------------------------------
-        # A stale-but-still-valid JWT shouldn't be able to spam new OTPs
-        # for an account that already finished email verification.
-
-        if client_auth.is_profile_completed != "in-email-verification":
-            return Response(
-                INVALID_OR_EXPIRED_RESET,
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        # --------------------------------------------------
-        # CREATE + SEND NEW OTP
-        # --------------------------------------------------
-
-        try:
-            with transaction.atomic():
-
-                try:
-                    otp_request, otp = create_client_otp(
-                        client=client_auth,
-                        purpose=OTP_EMAIL_VERIFICATION,
-                    )
-                except OTPCooldownError as e:
-                    return Response(
-                        {
-                            "success": False,
-                            "message": (
-                                f"Please wait {e.retry_after} seconds "
-                                "before requesting another code."
-                            ),
-                        },
-                        status=status.HTTP_429_TOO_MANY_REQUESTS,
-                    )
-
-                verification_token = generate_email_verification_token(
-                    client_auth, otp_request
+            # Lock the client row so concurrent resends are serialised and
+            # the status check below can't go stale before the OTP is created.
+            try:
+                client_auth = (
+                    ClientAuth.objects
+                    .select_for_update()
+                    .get(id=token_client_id)
                 )
-
-                transaction.on_commit(
-                    lambda: send_client_otp_email.delay(
-                        client_auth.email_address,
-                        otp,
-                        OTP_EMAIL_VERIFICATION,
-                    )
+            except ClientAuth.DoesNotExist:
+                flow_logger.info(
+                    "client_flow event=client_not_found view=resend_client_otp "
+                    "client=%s ip=%s",
+                    token_client_id, ip_address,
                 )
+                return Response(INVALID_OR_EXPIRED_RESET, status=status.HTTP_400_BAD_REQUEST)
 
-            return Response(
-                {
-                    "success": True,
-                    "message": (
-                        "A new verification code has been sent "
-                        "to your email."
-                    ),
-                    "data": {
-                        "id": client_auth.id,
-                        "requires_email_verification": True,
-                        "otp_request_id": str(otp_request.request_id),
-                        "verification_token": verification_token,
+            # Status gate. A stale-but-valid JWT must not be able to spam
+            # OTPs for an account that finished verification, is inactive
+            # or is blocked.
+            if client_auth.is_profile_completed != CS.EMAIL_VERIFICATION or not client_auth.is_active:
+                flow_logger.warning(
+                    "client_flow event=status_rejected view=resend_client_otp "
+                    "client=%s status=%s active=%s ip=%s",
+                    client_auth.id, client_auth.is_profile_completed,
+                    client_auth.is_active, ip_address,
+                )
+                return Response(INVALID_OR_EXPIRED_RESET, status=status.HTTP_400_BAD_REQUEST)
+
+            try:
+                otp_request, otp = create_client_otp(
+                    client=client_auth,
+                    purpose=OTP_EMAIL_VERIFICATION,
+                )
+            except OTPCooldownError as e:
+                # Undo anything create_client_otp may have written before
+                # raising, then return.
+                transaction.set_rollback(True)
+                flow_logger.info(
+                    "client_flow event=otp_cooldown view=resend_client_otp "
+                    "client=%s retry_after=%s ip=%s",
+                    client_auth.id, e.retry_after, ip_address,
+                )
+                return Response(
+                    {
+                        "success": False,
+                        "message": f"Please wait {e.retry_after} seconds before requesting another code.",
                     },
-                },
-                status=status.HTTP_200_OK,
+                    status=status.HTTP_429_TOO_MANY_REQUESTS,
+                )
+
+            verification_token = generate_email_verification_token(
+                client_auth, otp_request
             )
 
-        except Exception:
-            logger.exception(
-                "Resend client OTP failed for client_id=%s",
-                token_client_id,
-            )
-            return Response(
-                {
-                    "success": False,
-                    "message": (
-                        "A server error occurred. "
-                        "Please try again later."
-                    ),
-                },
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            transaction.on_commit(
+                lambda: send_client_otp_email.delay(
+                    client_auth.email_address,
+                    otp,
+                    OTP_EMAIL_VERIFICATION,
+                )
             )
 
-    except Exception:
-        logger.exception("Unexpected error in resend_client_otp")
-        return Response(
-            {
-                "success": False,
-                "message": (
-                    "A server error occurred. "
-                    "Please try again later."
-                ),
-            },
-            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        flow_logger.info(
+            "client_flow event=otp_resent view=resend_client_otp client=%s ip=%s",
+            client_auth.id, ip_address,
         )
 
+        return Response(
+            {
+                "success": True,
+                "message": "A new verification code has been sent to your email.",
+                "data": {
+                    "id": client_auth.id,
+                    "requires_email_verification": True,
+                    "otp_request_id": str(otp_request.request_id),
+                    "verification_token": verification_token,
+                },
+            },
+            status=status.HTTP_200_OK,
+        )
+
+    except Exception:
+        flow_logger.exception(
+            "client_flow event=unexpected_error view=resend_client_otp client=%s ip=%s",
+            token_client_id, ip_address,
+        )
+        return Response(
+            {"success": False, "message": "A server error occurred. Please try again later."},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
 
 
 
@@ -1888,70 +1764,89 @@ def client_logout(request):
             status=status.HTTP_200_OK,
         )
 
-@api_view(['PATCH'])
+
+
+
+@api_view(["PATCH"])
 @throttle_classes([ProfileWriteThrottle])
 @parser_classes([MultiPartParser, FormParser])
 @authentication_classes([ClientJWTAuthentication])
 @permission_classes([IsAuthenticated])
+@require_client_status(CS.DETAILS, CS.ADDRESS, CS.COMPLETED)
 def complete_profile(request):
+    client_auth = request.user
+    ip = get_client_ip(request)
 
     try:
-        # Enforce strict ownership profile isolation (RLS)
-        client = get_object_or_404(
-            ClientDetails,
-            client_profile=request.user
-        )
+        with transaction.atomic():
 
-        serializer = ClientSerializer(
-            client,
-            data=request.data,
-            partial=True,
-            context={'request': request}
-        )
+            # Ownership: the row comes from request.user, never from input.
+            client = (
+                ClientDetails.objects
+                .select_for_update()
+                .filter(client_profile=client_auth)
+                .first()
+            )
 
-        if serializer.is_valid():
+            if client is None:
+                flow_logger.warning(
+                    "client_flow event=not_found view=complete_profile client=%s ip=%s",
+                    client_auth.pk, ip,
+                )
+                return Response(
+                    {"success": False, "message": "Client not found"},
+                    status=status.HTTP_404_NOT_FOUND,
+                )
+
+            serializer = ClientSerializer(
+                client,
+                data=request.data,
+                partial=True,
+                context={"request": request},
+            )
+
+            if not serializer.is_valid():
+                # Field names only; error text can echo submitted values.
+                flow_logger.info(
+                    "client_flow event=validation_failed view=complete_profile "
+                    "client=%s fields=%s ip=%s",
+                    client_auth.pk, list(serializer.errors.keys()), ip,
+                )
+                return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
             updated_client = serializer.save()
 
-            # lifecycle state tracking
+            # in-details -> in-address only, and only once the required
+            # fields are all present. Later statuses are plain edits and
+            # must never move backwards.
             if (
-                updated_client.first_name and
-                updated_client.last_name and
-                updated_client.date_of_birth
+                client_auth.is_profile_completed == CS.DETAILS
+                and updated_client.first_name
+                and updated_client.last_name
+                and updated_client.date_of_birth
             ):
-                updated_client.client_profile.is_profile_completed = "in-address"
-                updated_client.client_profile.save(update_fields=["is_profile_completed"])
+                if not advance_client_status(client_auth, CS.DETAILS):
+                    # Double submit or second device: the details are saved
+                    # either way, so just re-read the real status.
+                    client_auth.refresh_from_db(fields=["is_profile_completed"])
 
-            return Response({
-                "success": True,
-                "data": serializer.data,
-                "profile_status": updated_client.client_profile.is_profile_completed,
-            })
-
-        return Response(
-            serializer.errors,
-            status=status.HTTP_400_BAD_REQUEST
-        )
-
-    except ClientDetails.DoesNotExist:
-        # keep frontend unchanged → same shape, just safe fallback
         return Response(
             {
-                "success": False,
-                "message": "Client not found"
+                "success": True,
+                "data": serializer.data,
+                "profile_status": client_auth.is_profile_completed,
             },
-            status=status.HTTP_404_NOT_FOUND
+            status=status.HTTP_200_OK,
         )
 
     except Exception:
-      
-        logger.exception("Error in complete_profile")
-
+        flow_logger.exception(
+            "client_flow event=unexpected_error view=complete_profile client=%s ip=%s",
+            client_auth.pk, ip,
+        )
         return Response(
-            {
-                "success": False,
-                "message": "Unexpected server error"
-            },
-            status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            {"success": False, "message": "Unexpected server error"},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
         )
     
 
@@ -2020,7 +1915,10 @@ def set_default_address(request, address_id):
 
 
 
-from rest_framework.exceptions import ValidationError
+MAX_ADDRESSES_PER_CLIENT = 10
+
+
+
 
 
 @api_view(['POST'])
@@ -2030,114 +1928,178 @@ from rest_framework.exceptions import ValidationError
 def a_add_residential_address(request):
 
     try:
-        client = get_object_or_404(
-            ClientDetails,
-            client_profile=request.user
-        )
-
-        serializer = ClientAddressWriteSerializer(
-            data=request.data,
-            context={"client": client}
-        )
-
-        if not serializer.is_valid():
-            return Response(
-                {
-                    "success": False,
-                    "message": "Address validation failed.",
-                    "errors": serializer.errors,
-                },
-                status=status.HTTP_400_BAD_REQUEST
-            )
-
-        try:
-            with transaction.atomic():
-                client_address = serializer.save()
-
-        except ValidationError as exc:
-            return Response(
-                {
-                    "success": False,
-                    "message": "Address validation failed.",
-                    "errors": exc.detail,
-                },
-                status=status.HTTP_400_BAD_REQUEST
-            )
-
-        return Response(
-            {
-                "success": True,
-                "message": "Address added successfully.",
-                "data": ClientAddressSerializerr(
-                    client_address
-                ).data,
-            },
-            status=status.HTTP_201_CREATED
-        )
-
-    except Exception:
-        logger.exception("Error adding residential address")
-
-        return Response(
-            {
-                "success": False,
-                "message": "Unable to add address at this time."
-            },
-            status=status.HTTP_500_INTERNAL_SERVER_ERROR
-        )
-
-
-@api_view(['POST'])
-@throttle_classes([ProfileWriteThrottle])
-@authentication_classes([ClientJWTAuthentication])
-@permission_classes([IsAuthenticated])
-def add_residential_address(request):
-
-    try:
-        client = get_object_or_404(
-            ClientDetails,
-            client_profile=request.user
-        )
-
-        serializer = ClientAddressWriteSerializer(
-            data=request.data,
-            context={"client": client}
-        )
-
-        if not serializer.is_valid():
-            return Response(
-                serializer.errors,
-                status=status.HTTP_400_BAD_REQUEST
-            )
-
         with transaction.atomic():
 
-            client_address = serializer.save()
-
-            client.client_profile.is_profile_completed = "completed"
-            client.client_profile.save(
-                update_fields=["is_profile_completed"]
+            # Lock the client row so concurrent requests are serialised
+            # and the count below can't go stale before the save.
+            client = (
+                ClientDetails.objects
+                .select_for_update()
+                .filter(client_profile=request.user)
+                .first()
             )
+
+            if client is None:
+                return Response(
+                    {"success": False, "message": "Client not found"},
+                    status=status.HTTP_404_NOT_FOUND,
+                )
+
+            # Adjust the related name to match your ClientAddress foreign key.
+            if client.addresses.count() >= MAX_ADDRESSES_PER_CLIENT:
+                logger.info(
+                    "Address limit reached. client=%s limit=%s",
+                    request.user.pk, MAX_ADDRESSES_PER_CLIENT,
+                )
+                return Response(
+                    {
+                        "success": False,
+                        "message": (
+                            f"You can save up to {MAX_ADDRESSES_PER_CLIENT} "
+                            "addresses. Remove one to add another."
+                        ),
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            serializer = ClientAddressWriteSerializer(
+                data=request.data,
+                context={"client": client},
+            )
+
+            if not serializer.is_valid():
+                return Response(
+                    {
+                        "success": False,
+                        "message": "Address validation failed.",
+                        "errors": serializer.errors,
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            client_address = serializer.save()
 
         return Response(
             {
                 "success": True,
                 "message": "Address added successfully.",
                 "data": ClientAddressSerializerr(client_address).data,
-                "profile_status": client.client_profile.is_profile_completed,
             },
-            status=status.HTTP_201_CREATED
+            status=status.HTTP_201_CREATED,
         )
 
-    except Exception:
-        logger.exception("Error adding residential address")
-
+    except ValidationError as exc:
         return Response(
             {
                 "success": False,
-                "message": "Unable to add address at this time."
+                "message": "Address validation failed.",
+                "errors": exc.detail,
             },
-            status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    except Exception:
+        logger.exception(
+            "Error adding residential address. client=%s", request.user.pk
+        )
+        return Response(
+            {"success": False, "message": "Unable to add address at this time."},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
+
+  
+
+
+@api_view(["POST"])
+@throttle_classes([ProfileWriteThrottle])
+@authentication_classes([ClientJWTAuthentication])
+@permission_classes([IsAuthenticated])
+@require_client_status(CS.ADDRESS, CS.COMPLETED)
+def add_residential_address(request):
+    client_auth = request.user
+    ip = get_client_ip(request)
+
+    try:
+        with transaction.atomic():
+
+            # Ownership: the row comes from request.user, never from input.
+            # The lock serialises double submits from the same client.
+            client = (
+                ClientDetails.objects
+                .select_for_update()
+                .filter(client_profile=client_auth)
+                .first()
+            )
+
+            if client is None:
+                flow_logger.warning(
+                    "client_flow event=not_found view=add_residential_address client=%s ip=%s",
+                    client_auth.pk, ip,
+                )
+                return Response(
+                    {"success": False, "message": "Client not found"},
+                    status=status.HTTP_404_NOT_FOUND,
+                )
+
+            # Cap, so the endpoint can't be used to fill the table.
+            # Adjust the related name to match your model.
+            if client.addresses.count() >= MAX_ADDRESSES_PER_CLIENT:
+                flow_logger.info(
+                    "client_flow event=address_limit view=add_residential_address client=%s ip=%s",
+                    client_auth.pk, ip,
+                )
+                return Response(
+                    {"success": False, "message": "Address limit reached."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            serializer = ClientAddressWriteSerializer(
+                data=request.data,
+                context={"client": client},
+            )
+
+            if not serializer.is_valid():
+                # Field names only; error text can echo submitted values.
+                flow_logger.info(
+                    "client_flow event=validation_failed view=add_residential_address "
+                    "client=%s fields=%s ip=%s",
+                    client_auth.pk, list(serializer.errors.keys()), ip,
+                )
+                return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+            client_address = serializer.save()
+
+            # in-address -> completed, once. Adding more addresses later
+            # is a plain create and never touches the status.
+            if client_auth.is_profile_completed == CS.ADDRESS:
+                if not advance_client_status(client_auth, CS.ADDRESS):
+                    # Concurrent request already advanced it; the address
+                    # is saved either way, so just re-read the real status.
+                    client_auth.refresh_from_db(fields=["is_profile_completed"])
+
+        flow_logger.info(
+            "client_flow event=address_added view=add_residential_address client=%s ip=%s",
+            client_auth.pk, ip,
+        )
+
+        return Response(
+            {
+                "success": True,
+                "message": "Address added successfully.",
+                "data": ClientAddressSerializerr(client_address).data,
+                "profile_status": client_auth.is_profile_completed,
+            },
+            status=status.HTTP_201_CREATED,
+        )
+
+    except Exception:
+        flow_logger.exception(
+            "client_flow event=unexpected_error view=add_residential_address client=%s ip=%s",
+            client_auth.pk, ip,
+        )
+        return Response(
+            {"success": False, "message": "Unable to add address at this time."},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
         )
 
 
@@ -3268,16 +3230,19 @@ def address_detail(request, id, format=None):
 @authentication_classes([ClientJWTAuthentication])
 @permission_classes([IsAuthenticated])
 def update_client_profile(request):
-    client = get_client_details(request)
+    try:
+        client = get_client_details(request)
 
-    serializer = ClientProfileAppUpdateSerializer(
-        client,
-        data=request.data,
-        partial=True,
-    )
+        serializer = ClientProfileAppUpdateSerializer(
+            client,
+            data=request.data,
+            partial=True,
+        )
 
-    if serializer.is_valid():
-        serializer.save()
+        serializer.is_valid(raise_exception=True)
+
+        with transaction.atomic():
+            serializer.save()
 
         return Response(
             {
@@ -3288,13 +3253,30 @@ def update_client_profile(request):
             status=status.HTTP_200_OK,
         )
 
-    return Response(
-        {
-            "success": False,
-            "errors": serializer.errors,
-        },
-        status=status.HTTP_400_BAD_REQUEST,
-    )
+    except ValidationError as exc:
+        return Response(
+            {
+                "success": False,
+                "errors": exc.detail,
+            },
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    except Exception:
+        # Log the full exception server-side; do not expose internal details.
+        import logging
+
+        logger = logging.getLogger(__name__)
+        logger.exception("Unexpected error updating client profile")
+
+        return Response(
+            {
+                "success": False,
+                "message": "Unable to update your profile at this time.",
+            },
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
+
 
     
 
@@ -3311,7 +3293,7 @@ class ClientAddressPagination(PageNumberPagination):
 def client_address_detail(request, client_id, format=None):
 
     try:
-        # 🔒 RLS: enforce ownership explicitly
+        
         client = ClientDetails.objects.get(
             client_profile__id=client_id,
             client_profile=request.user
@@ -3321,7 +3303,7 @@ def client_address_detail(request, client_id, format=None):
             ClientAddress.objects
             .select_related('address')
             .filter(client=client, is_active=True)
-            .order_by('-is_default', 'id')  # default first, stable for paging
+            .order_by('-is_default', 'id')  
         )
 
         # Old app versions send no paging params and expect a plain list.

@@ -12,33 +12,47 @@ from api.serviceProvidersDB.serializers import ClientSPProfileReadSerializer, Cl
 from api.clientsDB.serializers import AddressOnlySerializer, ClientBookingReadSerializer, ClientSerializer
 from api.clientsDB.models.models import ClientDetails, ClientAuth, Address
 from django.contrib.auth.hashers import make_password
+import re
 
+
+MAX_MESSAGE_LENGTH = 500
+# Keep \t \n \r, drop other control characters (including NUL).
+_CONTROL_CHARS = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]')
 
 
 class NegotiationRoundWriteSerializer(serializers.ModelSerializer):
+    # Optional: may be omitted, null or blank.
+    message = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        allow_null=True,
+        max_length=MAX_MESSAGE_LENGTH,
+        trim_whitespace=True,
+    )
+
     class Meta:
         model = NegotiationRound
         fields = ['negotiation', 'sender_type', 'offered_price', 'message']
         read_only_fields = ['negotiation', 'sender_type']
+
+    def validate_message(self, value):
+        return _CONTROL_CHARS.sub('', value or '').strip()
 
     def validate(self, data):
         offered_price = data.get('offered_price')
 
         if offered_price is None:
             raise serializers.ValidationError(
-                "Offered price is required."
+                {"offered_price": "Offered price is required."}
             )
-
         if offered_price <= Decimal("0"):
-            raise serializers.ValidationError({
-                "offered_price": "Offered price must be greater than 0."
-            })
-
+            raise serializers.ValidationError(
+                {"offered_price": "Offered price must be greater than 0."}
+            )
         if offered_price > Decimal("10000.00"):
-            raise serializers.ValidationError({
-                "offered_price": "Offered price cannot exceed R10,000."
-            })
-
+            raise serializers.ValidationError(
+                {"offered_price": "Offered price cannot exceed R10,000."}
+            )
         return data
 
 
@@ -929,3 +943,16 @@ class SubmitRatingSerializer(serializers.ModelSerializer):
 
         return data
     
+
+class PaymentSerializerPatch(serializers.ModelSerializer):
+    session_status = serializers.SerializerMethodField()
+ 
+    # Add "session_status" to Meta.fields (and it is already covered by read_only_fields = fields).
+ 
+    def get_session_status(self, obj):
+        return (
+            Session.objects.filter(shipment_id=obj.shipment_id)
+            .values_list("session_status", flat=True)
+            .first()
+        )
+

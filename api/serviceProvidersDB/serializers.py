@@ -1,3 +1,4 @@
+from decimal import Decimal
 import os
 from disposable_email_domains import blocklist as disposable_blocklist
 from rest_framework import serializers
@@ -395,7 +396,7 @@ class DeviceTokenWriteSerializer(serializers.ModelSerializer):
                 "email": "No service provider found with this email."
             })
 
-        token = validated_data["fcm_token"]
+        token = validated_data.pop("fcm_token")
 
         # Remove this token from any other provider
         DeviceToken.objects.exclude(
@@ -406,14 +407,11 @@ class DeviceTokenWriteSerializer(serializers.ModelSerializer):
 
         device_token, _ = DeviceToken.objects.update_or_create(
             service_provider=service_provider,
-            defaults={
-                **validated_data,
-                "fcm_token": token,
-            },
+            fcm_token=token,
+            defaults=validated_data,
         )
 
         return device_token
-
 
 
 
@@ -1353,16 +1351,17 @@ class UpdateCostOfServiceSerializer(serializers.ModelSerializer):
         ]
 
     def validate_base_price(self, value):
-        if value is not None and value < 0:
-            raise serializers.ValidationError(
-                "Base price cannot be negative."
-            )
+        if value is None:
+            return value  # partial update — field not provided, skip checks
 
-        if value is not None and value > 10000:
+        if value < Decimal("35.00"):
+            raise serializers.ValidationError(
+                "Base price cannot be less than R35."
+            )
+        if value > Decimal("10000.00"):
             raise serializers.ValidationError(
                 "Base price cannot exceed R10,000."
             )
-
         return value
 
 class DeleteProviderQualificationSerializer(serializers.ModelSerializer):

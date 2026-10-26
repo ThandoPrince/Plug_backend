@@ -314,6 +314,31 @@ class ShipmentRouteConsumer(AsyncWebsocketConsumer):
             }
         )
 
+    async def session_started(self, event):
+        await self._safe_send(
+            {
+                "type": "session_started",
+                "shipment_id": event["shipment_id"],
+                "session_id": event["session_id"],
+                "session_status": event["session_status"],
+            }
+        )
+ 
+    async def payment_updated(self, event):
+        await self._safe_send(
+            {
+                "type": "payment_updated",
+                "shipment_id": event["shipment_id"],
+                "payment_id": event["payment_id"],
+                "method": event["method"],
+                "status": event["status"],
+                "failure_reason": event["failure_reason"],
+                "amount": event["amount"],
+            }
+        )
+ 
+ 
+
 
     async def session_completed(self, event):
         logger.info(

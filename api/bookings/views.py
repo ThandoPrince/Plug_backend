@@ -1,6 +1,7 @@
-from datetime import timedelta
+from datetime import timedelta, datetime
 from decimal import Decimal
 import json
+from api.bookings.payments import payment_service as services
 import logging
 from django.core.exceptions import ObjectDoesNotExist
 from types import SimpleNamespace
@@ -17,10 +18,13 @@ from rest_framework import status
 from django.db import transaction
 from django.db.models import Q, Avg, Exists, OuterRef
 from api.bookings.events.event_base import EventBus
+from api.bookings.payments import paystack
 from api.bookings.events.negotiation_events import NegotiationRoundCreatedEvent
 from api.bookings.events.order_events import NegotiationCreatedEvent, OrderAcceptedEvent, OrderCancelledEvent, OrderCreatedEvent, OrderRescheduledEvent, ProviderDeclinedInvitationEvent, ProviderOrderCancelledEvent
-from api.bookings.events.websoket_event_emitters.shipment_event_emitters import push_session_completed, push_session_created, push_shipment_status_update
+from api.bookings.events.websoket_event_emitters.shipment_event_emitters import push_session_completed, push_session_created, push_session_started, push_shipment_status_update
 from api.bookings.events.ws_events import notify_client_booking, notify_client_negotiation_round, notify_client_negotiation_status_changed, notify_client_shipment_status, notify_provider_booking_update
+from api.bookings.payments.payment_serializer import PaymentSerializer, ProviderPaymentSerializer, SelectPaymentMethodSerializer
+from api.bookings.payments.payment_service import _select_payment_method_inner
 from api.bookings.services.calculate_distance_meters import calculate_distance_meters
 from api.bookings.services.order_status_service import OrderStatusService
 from api.bookings.services.shipment_transition_function import InvalidShipmentTransition, transition_shipment
@@ -30,11 +34,11 @@ from api.clientsDB.notifications.services.notification_service import Notificati
 from api.clientsDB.services.jwt_client_authentication import ClientJWTAuthentication
 from api.serviceProvidersDB.models import ProviderService, ServiceProvider
 from api.serviceProvidersDB.services.sp_jwt_authentication import SPJWTAuthentication
-from plug_backend.helpers.auth_helpers import get_client_details, get_sp_profile
+from plug_backend.helpers.auth_helpers import get_client_auth, get_client_details, get_sp_profile
 from plug_backend.throttles import BookingLikeWriteThrottle, HeavyReadThrottle, ProfileWriteThrottle, UserReadThrottle
 from channels.layers import get_channel_layer
 from asgiref.sync import async_to_sync
-from .models import BookingItem, NegotiationRound, OrderService, Negotiation, Rating, Session, SessionLocationPing, SessionToken, Shipment, ShipmentHistory, ShipmentRoute
+from .models import BookingItem, NegotiationRound, OrderService, Negotiation, Payment, Rating, Session, SessionLocationPing, SessionToken, Shipment, ShipmentHistory, ShipmentRoute
 from .serializers import (
     ROUNDS_PAGE_SIZE,
     CancelOrderSerializer,
@@ -67,7 +71,7 @@ from .serializers import (
     ShipmentRouteWriteSerializer,
     SubmitRatingSerializer,
 )
-from rest_framework.permissions import IsAuthenticated
+from rest_framework.permissions import AllowAny, IsAuthenticated
 
 
 # ---------------- OrderService ----------------
@@ -586,16 +590,16 @@ def _send_status_changed(negotiation, order):
 def negotiations_by_order(request, order_id):
 
     try:
-        client = get_client_details(request)
+        client = get_client_auth(request)
 
         # 🔒 RLS: ensure order belongs to this client
         order = get_object_or_404(
             OrderService,
             pk=order_id,
-            client=client   # or client_fk depending on schema
+            client__client_profile_id=client   
         )
 
-        allowed_statuses = ['pending', 'in-negotiation','rescheduled']
+        allowed_statuses = ['pending', 'in-negotiation','rescheduled','overdue']
 
         if order.status not in allowed_statuses:
             return Response(
@@ -848,7 +852,7 @@ def cancel_order(request):
     try:
         OrderStatusService.set_status(order, "canceled")
         return Response(
-            {"success": True, "message": "Order cancelled successfully."},
+            {"success": True, "message": "Order canceled successfully."},
             status=status.HTTP_200_OK
         )
     except Exception as engine_error:
@@ -916,55 +920,50 @@ def pending_orders_by_client_id(request, client_id):
 @permission_classes([IsAuthenticated])
 @throttle_classes([HeavyReadThrottle])
 def remove_from_invited_providers(request, order_id):
-    """
-    Allows the authenticated provider to remove themselves
-    from an order's invited providers list.
-
-    If no invited providers remain, the order is automatically cancelled.
-    """
-
-    order = get_object_or_404(OrderService, pk=order_id)
-
     serializer = RemoveInvitedProviderSerializer(data=request.data)
     serializer.is_valid(raise_exception=True)
 
     provider = request.user
 
-    if not order.invited_providers.filter(pk=provider.pk).exists():
-        return Response(
-            {
-                "error": "You are not an invited provider for this order."
-            },
-            status=status.HTTP_400_BAD_REQUEST,
+    with transaction.atomic():
+        # Row lock: a second decline on this order waits here until this
+        # transaction commits, then sees the up-to-date invited list.
+        order = get_object_or_404(
+            OrderService.objects.select_for_update(),
+            pk=order_id,
         )
 
-    with transaction.atomic():
-        # Remove the provider
+        if not order.invited_providers.filter(pk=provider.pk).exists():
+            return Response(
+                {"error": "You are not an invited provider for this order."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
         order.invited_providers.remove(provider)
         order_cancelled = False
 
-        # Cancel the order if nobody is left to invite
         if not order.invited_providers.exists():
-            order.status = "cancelled"
+            order.status = "canceled"
             order.save(update_fields=["status"])
             order_cancelled = True
 
-
+        provider_id = provider.id
         payload = OrderServiceReadSerializer(order).data
 
         transaction.on_commit(
             lambda: notify_provider_booking_update(
-                provider_id=provider.id,
+                provider_id=provider_id,
                 payload=payload,
             )
         )
+
         EventBus.emit(
-        ProviderDeclinedInvitationEvent({
-            "order": order,
-            "provider": provider,
-            "order_cancelled": order_cancelled,
-        })
-    )
+            ProviderDeclinedInvitationEvent({
+                "order": order,
+                "provider": provider,
+                "order_cancelled": order_cancelled,
+            })
+        )
 
     return Response(
         {
@@ -973,7 +972,12 @@ def remove_from_invited_providers(request, order_id):
         },
         status=status.HTTP_200_OK,
     )
+
+
+    
 MIN_OFFER_RATIO = Decimal("0.60") 
+
+
 
 @api_view(['POST'])
 @authentication_classes([SPJWTAuthentication])
@@ -994,7 +998,7 @@ def provider_start_round(request, negotiation_id):
         )
 
     # Prevent negotiation if order or negotiation is already finalized
-    if order.status in ['accepted', 'cancelled'] or negotiation.status in ['accepted', 'cancelled']:
+    if order.status in ['accepted', 'canceled'] or negotiation.status in ['accepted', 'canceled']:
         return Response(
             {"error": f"Negotiation cannot continue. This order is {order.status} and negotiation is {negotiation.status}."},
             status=status.HTTP_400_BAD_REQUEST
@@ -1120,12 +1124,17 @@ def provider_start_round(request, negotiation_id):
 from django.core.cache import cache
 
 PRICE_PATCH_COOLDOWN_SECONDS = 300  # 5 minutes
+def price_is_locked(order_id: int) -> bool:
+    return Payment.objects.filter(order_id=order_id).filter(
+        Q(status__in=[Payment.Status.SUCCEEDED, Payment.Status.CASH_CONFIRMED])
+        | (Q(status=Payment.Status.PENDING) & ~Q(vendor_reference=""))
+    ).exists()
 
 
 @api_view(['PATCH'])
 @authentication_classes([ClientJWTAuthentication])
 @permission_classes([IsAuthenticated])
-@throttle_classes([HeavyReadThrottle])
+@throttle_classes([BookingLikeWriteThrottle])
 def patch_order_final_price(request, order_id):
     order = OrderService.objects.filter(order_id=order_id).first()
 
@@ -1140,6 +1149,11 @@ def patch_order_final_price(request, order_id):
         return Response(
             {"detail": "You do not have permission to modify this order."},
             status=status.HTTP_403_FORBIDDEN
+        )
+    if price_is_locked(order.order_id):
+        return Response(
+            {"detail": "The price can't be changed once payment has started."},
+            status=status.HTTP_409_CONFLICT,
         )
 
     # ---------------- RATE LIMIT (5 MIN PER ORDER) ----------------
@@ -1241,19 +1255,19 @@ def negotiation_rounds_by_negotiation(request, negotiation_id):
 @api_view(['POST'])
 @authentication_classes([ClientJWTAuthentication])
 @permission_classes([IsAuthenticated])
-@throttle_classes([HeavyReadThrottle])
+@throttle_classes([BookingLikeWriteThrottle])
 def client_start_round(request, negotiation_id):
     try:
-        client = get_client_details(request)
+        client = get_client_auth(request)
 
         negotiation = get_object_or_404(
             Negotiation.objects.select_related("service_order"),
             pk=negotiation_id,
-            service_order__client=client,
+            service_order__client__client_profile_id=client
         )
         order = negotiation.service_order
 
-        if order.status in ['accepted', 'cancelled'] or negotiation.status in ['accepted', 'cancelled']:
+        if order.status in ['accepted', 'canceled'] or negotiation.status in ['accepted', 'canceled']:
             return Response(
                 {"detail": "Negotiation cannot continue in current state."},
                 status=status.HTTP_400_BAD_REQUEST,
@@ -1262,7 +1276,7 @@ def client_start_round(request, negotiation_id):
         serializer = NegotiationRoundWriteSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         offered_price = serializer.validated_data['offered_price']
-        message = serializer.validated_data.get('message', '')
+        message = serializer.validated_data.get('message') or ''
 
         if order.proposal_price is not None:
             min_allowed = (order.proposal_price * MIN_OFFER_RATIO).quantize(Decimal("0.01"))
@@ -1276,7 +1290,6 @@ def client_start_round(request, negotiation_id):
                 )
 
         with transaction.atomic():
-            # Lock so concurrent sends can't both slip past the round limit.
             locked = Negotiation.objects.select_for_update().get(pk=negotiation.pk)
 
             if locked.round_count >= locked.max_rounds:
@@ -1310,7 +1323,7 @@ def client_start_round(request, negotiation_id):
             status=status.HTTP_404_NOT_FOUND,
         )
     except ValidationError:
-        raise  # let DRF return the field errors as 400
+        raise
     except Exception:
         logger.exception("Client counter offer failed")
         return Response(
@@ -1399,8 +1412,13 @@ class ShipmentsPagination(PageNumberPagination):
     max_page_size = 30
 
 
-ACTIVE_SHIPMENT_STATUSES = ["Pending", "in_transit", "arrived", "delivered", "in_session"]
-FILTERABLE_STATUSES = {"pending", "in_transit", "arrived", "in_session", "delivered"}
+from django.db.models import Case, CharField, Q, Value, When
+from django.db.models.functions import Lower
+
+ORDER_IN_SESSION = "in_session"  
+
+# Effective statuses (lowercase). "in_session" comes from the order, the rest from the shipment.
+ACTIVE_STATUSES = {"pending", "in_transit", "arrived", "delivered", "in_session","rescheduled","awaiting_payment"}
 
 
 @api_view(['GET'])
@@ -1411,6 +1429,7 @@ def get_shipments_by_provider(request):
     """
     Returns a page of active shipments for the authenticated provider.
     Optional query params: page, page_size, status.
+    A shipment counts as "in_session" when its order status is in_session.
     """
     try:
         profile = get_sp_profile(request)
@@ -1419,26 +1438,29 @@ def get_shipments_by_provider(request):
         shipments = (
             Shipment.objects
             .filter(
-                # Same result as the chained provider_services -> orders ->
-                # booking_items subqueries, as one join.
                 service_ordered__order__provider_for_service__provider=provider,
-                shipment_status__in=ACTIVE_SHIPMENT_STATUSES,
             )
-            # Extend to everything ShipmentReadSerializer touches.
             .select_related("service_ordered__order")
-            .order_by("-created_at", "-pk")  # stable order for paging
+            .annotate(
+                effective_status=Case(
+                    When(
+                        service_ordered__order__status=ORDER_IN_SESSION,
+                        then=Value("in_session"),
+                    ),
+                    default=Lower("shipment_status"),  # "Pending" is stored capitalised
+                    output_field=CharField(),
+                )
+            )
+            .filter(effective_status__in=ACTIVE_STATUSES)
+            .order_by("-created_at", "-pk")
         )
 
         raw_status = request.query_params.get("status", "")
         requested = {s.strip().lower() for s in raw_status.split(",") if s.strip()}
-        valid_statuses = requested & FILTERABLE_STATUSES
+        valid_statuses = requested & ACTIVE_STATUSES
 
         if valid_statuses:
-            # iexact because "Pending" is stored capitalised, the rest lowercase.
-            status_q = Q()
-            for s in valid_statuses:
-                status_q |= Q(shipment_status__iexact=s)
-            shipments = shipments.filter(status_q)
+            shipments = shipments.filter(effective_status__in=valid_statuses)
 
         paginator = ShipmentsPagination()
         page = paginator.paginate_queryset(shipments, request)
@@ -1446,8 +1468,6 @@ def get_shipments_by_provider(request):
         return paginator.get_paginated_response(serializer.data)
 
     except APIException:
-        # Let DRF handle its own errors. Without this, the catch-all below
-        # turns "invalid page" (404) into a 500.
         raise
 
     except ObjectDoesNotExist as e:
@@ -1482,6 +1502,16 @@ def get_shipments_by_client(request, client_id):
                     "data": []
                 },
                 status=status.HTTP_200_OK
+            )
+        if request.user.is_profile_completed != "completed":
+            return Response(
+                {
+                    "success": False,
+                    "code": "profile_incomplete",
+                    "message": "Complete your profile to view shipments.",
+                    "profile_status": request.user.is_profile_completed,
+                },
+                status=status.HTTP_400_BAD_REQUEST,
             )
 
         # 2️⃣ Booking items
@@ -1525,13 +1555,13 @@ def get_shipments_by_client(request, client_id):
     
 
 
+MAX_EARLY_HOURS = 12  #
+
 @api_view(["POST"])
 @throttle_classes([BookingLikeWriteThrottle])
 @authentication_classes([SPJWTAuthentication])
 @permission_classes([IsAuthenticated])
 def change_shipment_status(request, shipment_id):
-    shipment = get_object_or_404(Shipment, pk=shipment_id)
-
     new_status = request.data.get("status")
     provider = request.user
 
@@ -1556,20 +1586,56 @@ def change_shipment_status(request, shipment_id):
             status=status.HTTP_200_OK
         )
 
+    # ── NEW: block early "in_transit" using the ORDER's requested time ──
+    if new_status == "in_transit":
+        order = shipment.service_ordered.order
+
+        if not order.requested_date or not order.requested_date_time:
+            return Response(
+                {"error": "This order has no requested date/time set."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        requested_datetime = timezone.make_aware(
+            datetime.combine(order.requested_date, order.requested_date_time),
+            timezone=timezone.get_current_timezone(),
+        )
+        time_until_requested = requested_datetime - timezone.now()
+
+        if time_until_requested > timedelta(hours=MAX_EARLY_HOURS):
+            return Response(
+                {
+                    "error": (
+                        "You cannot mark this shipment as in-transit yet. "
+                        "The requested time is more than "
+                        f"{MAX_EARLY_HOURS} hours away."
+                    ),
+                    "requested_datetime": requested_datetime.isoformat(),
+                    "allowed_from": (
+                        requested_datetime - timedelta(hours=MAX_EARLY_HOURS)
+                    ).isoformat(),
+                },
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
     try:
         transition_shipment(shipment, new_status)
     except InvalidShipmentTransition as e:
         return Response({"error": str(e)}, status=400)
 
     order = shipment.service_ordered.order
+    client_profile_id = order.client.client_profile.id
+    payload = {
+        "shipment_id": shipment.shipment_id,
+        "order_id": order.order_id,
+        "status": shipment.shipment_status,
+    }
 
-    notify_client_shipment_status(
-        client_id=order.client.client_profile.id,
-        payload={
-            "shipment_id": shipment.shipment_id,
-            "order_id": order.order_id,
-            "status": shipment.shipment_status,
-        },
+    transaction.on_commit(
+        lambda: notify_client_shipment_status(
+            client_id=client_profile_id,
+            payload=payload,
+        )
     )
 
     return Response(
@@ -1673,6 +1739,15 @@ def shipment_routes_view(request, shipment_id):
     )
 
 
+
+def _qr_belongs_to_open_booking(expected_shipment_id, token_shipment_id) -> bool:
+    """True when the app didn't say which booking it has open (older app builds), or when it did
+    and the QR's booking matches. Make `expected` mandatory once the app update is out."""
+    if expected_shipment_id in (None, ""):
+        return True
+    return str(expected_shipment_id) == str(token_shipment_id)
+ 
+
     
 @api_view(["POST"])
 @throttle_classes([BookingLikeWriteThrottle])
@@ -1681,7 +1756,7 @@ def shipment_routes_view(request, shipment_id):
 def confirm_shipment(request, shipment_id):
 
     try:
-        # 🔒 RLS: only the owner of the order may confirm the shipment
+       
         shipment = Shipment.objects.select_related(
             "service_ordered__order__client"
         ).get(
@@ -1736,7 +1811,7 @@ def get_checkin_token(request, shipment_id):
     """
 
     try:
-        # 🔒 RLS: Shipment must belong to the authenticated client
+       
         shipment = Shipment.objects.select_related(
             "service_ordered__order__client"
         ).get(
@@ -1794,94 +1869,155 @@ def get_checkin_token(request, shipment_id):
 
 
 
+def _qr_belongs_to_open_booking(expected_shipment_id, token_shipment_id) -> bool:
+    """True when the app didn't say which booking it has open (older app builds), or when it did
+    and the QR's booking matches. Make `expected` mandatory once the app update is out."""
+    if expected_shipment_id in (None, ""):
+        return True
+    return str(expected_shipment_id) == str(token_shipment_id)
+ 
+ 
 @api_view(["POST"])
 @throttle_classes([BookingLikeWriteThrottle])
 @authentication_classes([SPJWTAuthentication])
 @permission_classes([IsAuthenticated])
-@transaction.atomic
 def confirm_checkin(request):
-
     try:
-        serializer = ConfirmCheckinSerializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-
-       
-        if "expired_token" in serializer.validated_data:
-            old_token = serializer.validated_data["expired_token"]
-
-            # 🔒 RLS
-            if old_token.shipment.service_provider.sp_profile != request.user:
-                return Response(
-                    {"detail": "You do not have permission to use this token."},
-                    status=status.HTTP_403_FORBIDDEN
+        with transaction.atomic():
+            expected_shipment_id = request.data.get("shipment_id")
+            raw_token = str(request.data.get("checkin_token", ""))
+            # _dbg(
+            #     f"VIEW checkin START provider_user_pk={request.user.pk} "
+            #     f"open_booking={expected_shipment_id} token={raw_token[:8]}..."
+            # )
+ 
+            serializer = ConfirmCheckinSerializer(data=request.data)
+            serializer.is_valid(raise_exception=True)
+ 
+            if "expired_token" in serializer.validated_data:
+                old_token = serializer.validated_data["expired_token"]
+                _dbg(f"VIEW checkin: token EXPIRED, belongs to shipment={old_token.shipment_id}")
+ 
+                if not _qr_belongs_to_open_booking(expected_shipment_id, old_token.shipment_id):
+                    _dbg("VIEW checkin REFUSED: expired QR is for a different booking")
+                    return Response(
+                        {"detail": "This QR code belongs to a different booking."},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+ 
+                if old_token.shipment.service_provider.sp_profile != request.user:
+                    return Response(
+                        {"detail": "You do not have permission to use this token."},
+                        status=status.HTTP_403_FORBIDDEN,
+                    )
+ 
+                new_token = SessionToken.create_new(
+                    shipment=old_token.shipment,
+                    session=old_token.session,
                 )
-
-            new_token = SessionToken.create_new(
-                shipment=old_token.shipment,
-                session=old_token.session
+                return Response(
+                    {
+                        "detail": "Token expired.",
+                        "new_token": str(new_token.checkin_token),
+                        "expires_at": new_token.token_expiry,
+                    },
+                    status=status.HTTP_409_CONFLICT,
+                )
+ 
+            token = serializer.validated_data["token_instance"]
+            shipment = token.shipment
+            _dbg(f"VIEW checkin: token is for shipment={shipment.shipment_id}")
+ 
+            # The QR must belong to the booking this provider has open in the app.
+            # (A provider can have several bookings, so ownership alone is not enough.)
+            if not _qr_belongs_to_open_booking(expected_shipment_id, shipment.shipment_id):
+                _dbg(
+                    f"VIEW checkin REFUSED: QR is for shipment {shipment.shipment_id}, "
+                    f"app has {expected_shipment_id} open"
+                )
+                return Response(
+                    {"detail": "This QR code belongs to a different booking."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+ 
+            # RLS
+            if shipment.service_ordered.order.provider_for_service.provider.sp_profile != request.user:
+                _dbg("VIEW checkin REFUSED: provider does not own this shipment")
+                return Response(
+                    {"detail": "You do not have permission to check in for this shipment."},
+                    status=status.HTTP_403_FORBIDDEN,
+                )
+ 
+            # The client must have picked cash or card. Checked BEFORE the token is burned.
+            payment = (
+                Payment.objects.select_for_update()
+                .filter(shipment=shipment)
+                .exclude(status__in=[Payment.Status.FAILED, Payment.Status.REFUNDED])
+                .first()
             )
-
-            return Response(
-                {
-                    "detail": "Token expired.",
-                    "new_token": str(new_token.checkin_token),
-                    "expires_at": new_token.token_expiry,
+            _dbg(
+                "VIEW checkin payment: "
+                + (f"id={payment.pk} method={payment.method} status={payment.status}" if payment else "none")
+            )
+            if payment is None:
+                return Response(
+                    {
+                        "detail": (
+                            "The client has not chosen a payment type yet. "
+                            "Ask them to open the payment screen, then scan again."
+                        )
+                    },
+                    status=status.HTTP_409_CONFLICT,
+                )
+ 
+            card_unpaid = (
+                payment.method == Payment.Method.CARD
+                and payment.status != Payment.Status.SUCCEEDED
+            )
+            initial_status = "awaiting_payment" if card_unpaid else "in_session"
+ 
+            checkin_location = serializer.validated_data["checkin_location"]
+ 
+            session, created = Session.objects.get_or_create(
+                shipment=shipment,
+                defaults={
+                    "checkin_location": checkin_location,
+                    "checkin_time": timezone.now(),
+                    "session_status": initial_status,
                 },
-                status=status.HTTP_409_CONFLICT
             )
-
-        # ✅ Valid token
-        token = serializer.validated_data["token_instance"]
-        shipment = token.shipment
-
-        # 🔒 RLS
-        if shipment.service_ordered.order.provider_for_service.provider.sp_profile != request.user:
-            return Response(
-                {
-                    "detail": "You do not have permission to check in for this shipment."
-                },
-                status=status.HTTP_403_FORBIDDEN
+            _dbg(
+                f"VIEW checkin session={session.pk} created={created} "
+                f"status={session.session_status} (wanted {initial_status})"
             )
-
-        checkin_location = serializer.validated_data["checkin_location"]
-
-        session, created = Session.objects.get_or_create(
-            shipment=shipment,
-            defaults={
-                "checkin_location": checkin_location,
-                "checkin_time": timezone.now(),
-                "session_status": "in_session",
-            }
-        )
-
-        if not created and not session.checkin_location:
-            session.checkin_location = checkin_location
-            session.save(update_fields=["checkin_location"])
-
-        token.session = session
-        token.token_expiry = timezone.now()  # burn token
-        token.save(update_fields=["session", "token_expiry"])
-
-        if created:
-            push_session_created(
-        shipment.shipment_id,
-        session,
-    )
-
-        return Response(
-            ConfirmCheckinResponseSerializer(session).data,
-            status=status.HTTP_200_OK
-        )
-
+ 
+            if not created and not session.checkin_location:
+                session.checkin_location = checkin_location
+                session.save(update_fields=["checkin_location"])
+ 
+            token.session = session
+            token.token_expiry = timezone.now()  # burn token
+            token.save(update_fields=["session", "token_expiry"])
+ 
+            if created and session.session_status == "in_session":
+                transaction.on_commit(
+                    lambda: push_session_created(shipment.shipment_id, session)
+                )
+ 
+            body = dict(ConfirmCheckinResponseSerializer(session).data)
+            body["session_status"] = session.session_status
+            _dbg(f"VIEW checkin DONE -> 200 session_status={session.session_status}")
+            return Response(body, status=status.HTTP_200_OK)
+ 
+    except APIException:
+        raise  # validation errors, auth errors: keep their proper status codes
     except Exception:
         logger.exception("Error confirming provider check-in")
-
         return Response(
-            {
-                "detail": "Unable to confirm check-in at this time."
-            },
-            status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            {"detail": "Unable to confirm check-in at this time."},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
         )
+
     
 @api_view(["GET"])
 @authentication_classes([ClientJWTAuthentication])
@@ -2164,7 +2300,7 @@ def provider_cancel_shipment(request, shipment_id):
     ]:
         return Response(
             {
-                "detail": "This booking has already started and can no longer be cancelled."
+                "detail": "This session has already started and can no longer be cancelled."
             },
             status=status.HTTP_400_BAD_REQUEST,
         )
@@ -2315,10 +2451,7 @@ def reschedule_shipment(request, shipment_id):
         "updated_date"
     ])
 
-    # --------------------------------------------
-    # Update order
-    # --------------------------------------------
-    OrderStatusService.set_status(order, "rescheduled")
+    
 
     # --------------------------------------------
     # History tracking
@@ -2355,7 +2488,7 @@ def reschedule_shipment(request, shipment_id):
             "success": True,
             "message": "Shipment rescheduled successfully",
             "data": {
-                "order_status": order.status,
+                "order_status": shipment.shipment_status,
             }
         },
         status=status.HTTP_200_OK
@@ -2783,3 +2916,149 @@ def check_session_status(request, session_id):
             {"error": "Unexpected server error."},
             status=status.HTTP_500_INTERNAL_SERVER_ERROR
         )
+
+def _error(exc: services.PaymentError):
+    return Response({"detail": exc.message}, status=exc.code)
+
+
+
+
+from django.views.decorators.csrf import csrf_exempt
+
+ 
+def _dbg(msg):
+    services._dbg(msg)
+ 
+ 
+@api_view(["POST"])
+@throttle_classes([BookingLikeWriteThrottle])
+@authentication_classes([ClientJWTAuthentication])
+@permission_classes([IsAuthenticated])
+def select_payment_method(request):
+    """Client taps Cash or Card. Creates or updates the Payment row for the shipment."""
+    _dbg(f"VIEW select_method user_pk={request.user.pk} body={dict(request.data)}")
+ 
+    serializer = SelectPaymentMethodSerializer(data=request.data)
+    serializer.is_valid(raise_exception=True)
+ 
+    try:
+        payment = services.select_payment_method(
+            user=request.user,
+            shipment_id=serializer.validated_data["shipment_id"],
+            method=serializer.validated_data["method"],
+        )
+    except services.PaymentError as exc:
+        _dbg(f"VIEW select_method -> {exc.code} {exc.message}")
+        return _error(exc)
+ 
+    _dbg(f"VIEW select_method -> 200 payment={payment.pk} status={payment.status}")
+    return Response(PaymentSerializer(payment).data, status=status.HTTP_200_OK)
+ 
+ 
+def _latest_payment(shipment_id):
+    """Newest non-failed payment, falling back to the newest failed one."""
+    qs = Payment.objects.select_related("order", "shipment").filter(shipment_id=shipment_id)
+    return qs.exclude(status=Payment.Status.FAILED).order_by("-created_at").first() \
+        or qs.order_by("-created_at").first()
+ 
+ 
+@api_view(["GET"])
+@authentication_classes([ClientJWTAuthentication])
+@permission_classes([IsAuthenticated])
+def payment_for_shipment_client(request, shipment_id):
+    """Client app: payment status for a booking, including checkout details once initiated."""
+    payment = _latest_payment(shipment_id)
+    if not payment or not services._is_order_client(request.user, payment.order):
+        _dbg(f"VIEW client poll shipment={shipment_id} -> 404 (payment={'yes' if payment else 'none'})")
+        return Response({"detail": "No payment for this booking."}, status=404)
+
+    data = PaymentSerializer(payment).data
+    _dbg(
+        f"VIEW client poll shipment={shipment_id} -> 200 "
+        f"status={payment.status} session_status={data.get('session_status')}"
+    )
+    return Response(data)
+ 
+ 
+@api_view(["GET"])
+@authentication_classes([SPJWTAuthentication])
+@permission_classes([IsAuthenticated])
+def payment_for_shipment_provider(request, shipment_id):
+    """Provider app: payment status only. No checkout details."""
+    payment = _latest_payment(shipment_id)
+    if (
+        not payment
+        or payment.order.provider_for_service.provider.sp_profile != request.user
+    ):
+        _dbg(f"VIEW provider poll shipment={shipment_id} -> 404 (payment={'yes' if payment else 'none'})")
+        return Response({"detail": "No payment for this booking."}, status=404)
+
+    data = ProviderPaymentSerializer(payment).data
+    _dbg(
+        f"VIEW provider poll shipment={shipment_id} -> 200 "
+        f"status={payment.status} session_status={data.get('session_status')}"
+    )
+    return Response(data)
+ 
+ 
+@api_view(["POST"])
+@authentication_classes([ClientJWTAuthentication])
+@throttle_classes([BookingLikeWriteThrottle])
+@permission_classes([IsAuthenticated])
+def initiate_card_payment(request, payment_id):
+    """Client app calls this after receiving the 'provider scanned' socket event."""
+    _dbg(f"VIEW initiate payment={payment_id} user_pk={request.user.pk}")
+    try:
+        payment = services.initiate_card_payment(user=request.user, payment_id=payment_id)
+    except services.PaymentError as exc:
+        _dbg(f"VIEW initiate -> {exc.code} {exc.message}")
+        return _error(exc)
+    return Response(PaymentSerializer(payment).data)
+ 
+ 
+@csrf_exempt
+@api_view(["POST"])
+@authentication_classes([])
+@throttle_classes([])
+@permission_classes([AllowAny])
+def paystack_webhook(request):
+    # Read the raw body BEFORE touching request.data, signature is over the exact bytes.
+    raw = request.body
+    signature = request.headers.get("x-paystack-signature", "")
+ 
+    if not paystack.verify_signature(raw, signature):
+        _dbg(f"VIEW webhook REJECTED: bad or missing signature (signature_present={bool(signature)})")
+        return Response(status=status.HTTP_401_UNAUTHORIZED)
+ 
+    try:
+        payload = json.loads(raw)
+    except ValueError:
+        return Response(status=status.HTTP_400_BAD_REQUEST)
+ 
+    try:
+        services.handle_webhook_event(payload)
+    except Exception:
+        logger.exception("Paystack webhook processing failed")
+        # 500 makes Paystack retry. The event row was rolled back, so reprocessing is safe.
+        return Response(status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+ 
+    return Response(status=status.HTTP_200_OK)
+ 
+ 
+
+
+ 
+
+@api_view(["POST"])
+@authentication_classes([SPJWTAuthentication])
+@throttle_classes([BookingLikeWriteThrottle])
+@permission_classes([IsAuthenticated])
+def confirm_cash_received(request, shipment_id):
+    """Provider app: the client paid in cash."""
+    _dbg(f"VIEW confirm_cash shipment={shipment_id} user_pk={request.user.pk}")
+    try:
+        payment = services.confirm_cash_received(user=request.user, shipment_id=shipment_id)
+    except services.PaymentError as exc:
+        _dbg(f"VIEW confirm_cash -> {exc.code} {exc.message}")
+        return _error(exc)
+    return Response(ProviderPaymentSerializer(payment).data)

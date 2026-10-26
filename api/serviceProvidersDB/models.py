@@ -140,6 +140,10 @@ class ServiceKeyword(models.Model):
     is_prohibited = models.BooleanField(default=False, db_index=True)
     is_active = models.BooleanField(default=True, db_index=True)
 
+    indexes = [
+                models.Index(fields=["is_prohibited","is_active"]),
+            ]
+
     def __str__(self):
         return f"{self.keyword} ({self.risk_level})"
     

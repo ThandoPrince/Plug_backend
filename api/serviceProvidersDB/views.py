@@ -6,6 +6,13 @@ import json
 import os
 import secrets
 import time
+from django.db.models import Q, Count
+from django.db.models import (
+    Case, Count, ExpressionWrapper, F, FloatField, IntegerField,
+    OuterRef, Q, Subquery, Value, When,
+)
+from django.db.models.functions import Cast, Coalesce, Greatest, Least
+from django.db.models.functions import ACos, Cos, Radians, Sin
 
 from rest_framework_simplejwt.tokens import AccessToken, RefreshToken
 from tokenize import TokenError
@@ -397,8 +404,8 @@ def verify_sp_login_otp(request):
 @authentication_classes([SPJWTAuthentication])
 @permission_classes([IsAuthenticated])
 def sp_update_profile(request):
-    print("FILES RECEIVED:", request.FILES)
-    print("POST DATA:", request.data)
+    # print("FILES RECEIVED:", request.FILES)
+    # print("POST DATA:", request.data)
 
     try:
         service_provider = ServiceProvider.objects.get(
@@ -1754,6 +1761,8 @@ def patch_sp_profile(request):
     
 
 
+from django.db.models import Q
+
 @api_view(["GET"])
 @authentication_classes([SPJWTAuthentication])
 @throttle_classes([HeavyReadThrottle])
@@ -1761,44 +1770,47 @@ def patch_sp_profile(request):
 def approved_services_list(request):
     """
     Return only APPROVED services.
+    Supports ?search= for name + active non-prohibited keywords.
     """
     try:
-        services = Service.objects.filter(
-            review_status="APPROVED"
-        ).select_related("service_group")
+        search = request.query_params.get("search", "").strip()
 
+        qs = (
+            Service.objects.filter(review_status="APPROVED")
+            .select_related("service_group")
+        )
+
+        if search:
+            qs = qs.filter(
+                Q(service_name__icontains=search)
+                | Q(
+                    keywords__keyword__icontains=search,
+                    keywords__is_active=True,
+                    keywords__is_prohibited=False,
+                )
+            ).distinct()
+
+        services = qs.order_by("service_name")
         serializer = ServiceReadSerializer(services, many=True)
 
-        return Response(
-            serializer.data,
-            status=status.HTTP_200_OK
-        )
+        return Response(serializer.data, status=status.HTTP_200_OK)
 
     except DatabaseError as e:
         logger.error(f"DB error fetching approved services: {str(e)}")
-
         return Response(
-            {
-                "success": False,
-                "message": "Unable to fetch services at the moment."
-            },
-            status=status.HTTP_503_SERVICE_UNAVAILABLE
+            {"success": False, "message": "Unable to fetch services at the moment."},
+            status=status.HTTP_503_SERVICE_UNAVAILABLE,
         )
-
     except Exception as e:
         logger.error(f"Unexpected error in approved_services_list: {str(e)}")
-
         return Response(
-            {
-                "success": False,
-                "message": "Something went wrong while processing your request."
-            },
-            status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            {"success": False, "message": "Something went wrong while processing your request."},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
         )
 
 
 
-
+    
 
 
 @api_view(["POST"])
@@ -2301,7 +2313,7 @@ def upload_provider_service_affidavit(request, provider_service_id):
     provider_service=provider_service,
 )
         if existing_affidavits.exists():
-            print(f"Removing {existing_affidavits.count()} existing affidavit(s).")
+   
             existing_affidavits.delete()     
         
         
@@ -2422,7 +2434,7 @@ def upload_provider_qualification(request, service_id):
     )
 
     if not serializer.is_valid():
-        print("Serializer errors:", serializer.errors)
+        
         return Response(
             {
                 "success": False,
@@ -2503,6 +2515,9 @@ def update_cost_of_service(request, service_id):
                         status=status.HTTP_400_BAD_REQUEST)
     if base_price < 0:
         return Response({"error": "Base price cannot be negative."},
+                        status=status.HTTP_400_BAD_REQUEST)
+    if base_price < Decimal("35.00"):
+        return Response({"error": "Base price cannot be less than R35."},
                         status=status.HTTP_400_BAD_REQUEST)
     if base_price > Decimal("10000.00"):
         return Response({"error": "Base price cannot exceed R10,000."},
@@ -2639,6 +2654,9 @@ def a_update_cost_of_service(request, service_id):
                         status=status.HTTP_400_BAD_REQUEST)
     if base_price < 0:
         return Response({"error": "Base price cannot be negative."},
+                        status=status.HTTP_400_BAD_REQUEST)
+    if base_price < Decimal("35.00"):
+        return Response({"error": "Base price cannot be less than R35."},
                         status=status.HTTP_400_BAD_REQUEST)
     if base_price > Decimal("10000.00"):
         return Response({"error": "Base price cannot exceed R10,000."},
@@ -3435,44 +3453,115 @@ def service_group_detail(request, group_id):
 
 # -------- Service --------
 
+
+INITIAL_RADIUS_KM = 30.0
+MAX_RADIUS_KM = 50.0
+EARTH_RADIUS_KM = 6371.0
+
+def _distance_expression(client_lat, client_lon):
+    lat = Radians(Cast(F("latitude"), FloatField()))
+    lon = Radians(Cast(F("longitude"), FloatField()))
+    cos_angle = (
+        Sin(Radians(Value(client_lat))) * Sin(lat)
+        + Cos(Radians(Value(client_lat))) * Cos(lat)
+        * Cos(lon - Radians(Value(client_lon)))
+    )
+    # Clamp: float error can push this just past 1 when the provider is at the
+    # client's exact spot, and ACos would then raise a DB error.
+    clamped = Least(Value(1.0), Greatest(Value(-1.0), cos_angle))
+    return ExpressionWrapper(ACos(clamped) * EARTH_RADIUS_KM, output_field=FloatField())
+
+
+def _nearby_provider_count(distance_expr, radius_km):
+    """Distinct active providers with a live location within radius, per service."""
+    sub = (
+        SPLiveLocation.objects
+        .filter(
+            provider__is_active=True,
+            provider__provider_services__is_active=True,
+            provider__provider_services__service=OuterRef("pk"),
+        )
+        .alias(distance_km=distance_expr)
+        .filter(distance_km__lte=radius_km)
+        .values("provider__provider_services__service")
+        .annotate(c=Count("provider", distinct=True))
+        .values("c")
+    )
+    return Coalesce(Subquery(sub, output_field=IntegerField()), 0)
+
+
 @api_view(['GET'])
 @throttle_classes([UserReadThrottle])
 @authentication_classes([ClientJWTAuthentication])
 @permission_classes([IsAuthenticated])
 def service_list(request):
-
     try:
-        services = (
-            Service.objects.filter(
-                review_status="APPROVED"
+        if request.user.is_profile_completed != "completed":
+            return Response(
+                {
+                    "success": False,
+                    "code": "profile_incomplete",
+                    "message": "Complete your profile to view services.",
+                    "profile_status": request.user.is_profile_completed,
+                },
+                status=status.HTTP_400_BAD_REQUEST,
             )
-            .select_related("service_group")
-            .annotate(
+        search = request.query_params.get("search", "").strip()
+
+        qs = Service.objects.filter(review_status="APPROVED").select_related("service_group")
+
+        # One query, done once (not per service).
+        addr = (
+            ClientAddress.objects.select_related("address")
+            .filter(client__client_profile=request.user, is_default=True, is_active=True)
+            .first()
+        )
+
+        if addr:
+            dist = _distance_expression(
+                float(addr.address.latitude), float(addr.address.longitude)
+            )
+            qs = qs.annotate(
+                _near_30=_nearby_provider_count(dist, INITIAL_RADIUS_KM),
+                _near_50=_nearby_provider_count(dist, MAX_RADIUS_KM),
+            ).annotate(
+                # Same rule as the live-location endpoint: 30 km first,
+                # widen to 50 km only if nothing is within 30.
+                active_provider_count=Case(
+                    When(_near_30__gt=0, then=F("_near_30")),
+                    default=F("_near_50"),
+                    output_field=IntegerField(),
+                )
+            )
+        else:
+            # No default address: keep the old non-location count.
+            qs = qs.annotate(
                 active_provider_count=Count(
                     "service_providers__provider",
                     filter=Q(service_providers__provider__is_active=True),
-                    distinct=True
+                    distinct=True,
                 )
             )
-            .order_by("service_name")  # 🔥 deterministic ordering
-        )
 
-        serializer = ServiceSerializer(services, many=True)
+        if search:
+            qs = qs.filter(
+                Q(service_name__icontains=search)
+                | Q(
+                    keywords__keyword__icontains=search,
+                    keywords__is_active=True,
+                    keywords__is_prohibited=False,
+                )
+            ).distinct()
 
+        serializer = ServiceSerializer(qs.order_by("service_name"), many=True)
         return Response(serializer.data, status=status.HTTP_200_OK)
 
     except Exception:
         logger.exception("Unexpected error in service_list")
-
         return Response(
-            {
-                "success": False,
-                "message": "Unexpected server error."
-            },
-            status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            {"success": False, "message": "Unexpected server error."},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
         )
-
-
 # @api_view(['GET', 'PUT', 'PATCH', 'DELETE'])
 # @throttle_classes([UserReadThrottle])
 # @authentication_classes([SPJWTAuthentication])
@@ -3567,7 +3656,7 @@ def service_provider_list_service(request):
 
         except ClientAddress.DoesNotExist:
 
-            print("[CLIENT LOCATION] No default address found")
+           
 
             return Response(
                 [],
@@ -3578,8 +3667,8 @@ def service_provider_list_service(request):
         # DISTANCE CALCULATION
         # --------------------------------------------------
 
-        INITIAL_RADIUS_KM = 50.0
-        MAX_RADIUS_KM = 200.0
+        INITIAL_RADIUS_KM = 30.0
+        MAX_RADIUS_KM = 50.0
         EARTH_RADIUS_KM = 6371.0
 
         distance_expression = ExpressionWrapper(
@@ -3647,10 +3736,7 @@ def service_provider_list_service(request):
                 )
             )
 
-        print(
-            f"[PRE FILTER COUNT] "
-            f"{live_locations.count()}"
-        )
+        
 
         providers = list(
             live_locations
@@ -3658,9 +3744,7 @@ def service_provider_list_service(request):
             .order_by('distance_km')[:limit]
         )
 
-        print(
-            f"[50KM RESULTS] {len(providers)}"
-        )
+      
 
         if not providers:
 
@@ -3670,13 +3754,10 @@ def service_provider_list_service(request):
                 .order_by('distance_km')[:limit]
             )
 
-            print(
-                f"[200KM RESULTS] {len(providers)}"
-            )
-
+    
         if not providers:
 
-            print("[RESULT] No providers found")
+         
 
             return Response(
                 [],
@@ -3688,9 +3769,7 @@ def service_provider_list_service(request):
             for item in providers
         ]
 
-        print(
-            f"[PROVIDER IDS] {provider_ids}"
-        )
+        
 
         ordered_providers = [
             item.provider
@@ -3702,10 +3781,7 @@ def service_provider_list_service(request):
             many=True
         )
 
-        print(
-            f"[SUCCESS] Returning "
-            f"{len(ordered_providers)} providers"
-        )
+        
 
         return Response(
             serializer.data,
@@ -3782,7 +3858,7 @@ def upload_cost_of_service_image(request, cost_id):
 
     except ObjectDoesNotExist:
         if not serializer.is_valid():
-            print(serializer.errors)
+            
             return Response(
                 {
                     "success": False,
@@ -4426,7 +4502,7 @@ def fetch_sp_addresses_by_service(request, service_id):
 @permission_classes([IsAuthenticated])
 @throttle_classes([LiveLocationReadThrottle])
 def fetch_sp_live_locations_by_service(request, service_id):
-    print(f"\n=== [DEBUG START] Fetching locations for Service ID: {service_id} ===")
+
     try:
         # 1. Dynamic Limit Resolution
         try:
@@ -4454,8 +4530,8 @@ def fetch_sp_live_locations_by_service(request, service_id):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        INITIAL_RADIUS_KM = 50.0
-        MAX_RADIUS_KM = 200.0
+        INITIAL_RADIUS_KM = 30.0
+        MAX_RADIUS_KM = 50.0
         EARTH_RADIUS_KM = 6371.0
 
         distance_expression = ExpressionWrapper(

@@ -3,9 +3,9 @@ from django.forms import ValidationError
 from django.utils import timezone
 import uuid
 from django.conf import settings
-from django.db import models
+from django.db import models, transaction
 from api.bookings.events.event_base import EventBus
-from api.bookings.events.order_events import OrderArrivedEvent, OrderInTransitEvent, OrderRescheduledEvent
+from api.bookings.events.order_events import OrderArrivedEvent, OrderInTransitEvent, OrderRescheduledEvent, ShipmentNoShowEvent
 from api.bookings.events.websoket_event_emitters.shipment_event_emitters import push_shipment_status_update
 from api.bookings.events.ws_events import notify_provider_booking_invite, notify_provider_booking_update, notify_client_booking
 from api.bookings.services.order_status_service import OrderStatusService
@@ -141,6 +141,8 @@ class OrderService(models.Model):
         if not is_new and old_status != self.status:
             if self.status in ('canceled', 'expired'):
                 self._cascade_negotiation_cancellation()
+            if self.status == 'expired':
+                self._clear_invited_providers()
             self._log_order_history(old_status=old_status, new_status=self.status)
 
     RESCHEDULABLE_STATUSES = ["pending", "rescheduled", "overdue"]
@@ -157,6 +159,9 @@ class OrderService(models.Model):
             self.overdue_at = None
             return True
         return False
+
+    def _clear_invited_providers(self):
+        self.invited_providers.clear()
 
     def apply_auto_reschedule(self):
         """Mutates the instance in memory. Returns True if anything changed."""
@@ -394,7 +399,7 @@ class BookingItem(models.Model):
 
 
 
-
+NO_SHOW_STATUSES = ("pending", "rescheduled")
 class Shipment(models.Model):
     shipment_id = models.AutoField(primary_key=True)
     shipment_schedule_date = models.DateField()
@@ -405,6 +410,26 @@ class Shipment(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     updated_date = models.DateField( auto_now=True, null=True)
 
+    def mark_no_show(self):
+        if (self.shipment_status or "").lower() not in NO_SHOW_STATUSES:
+            return False
+
+        order = self.service_ordered.order
+
+        self._history_notes = "No-show: provider did not arrive."
+        self.shipment_status = "cancelled"
+        self.save(update_fields=["shipment_status", "updated_date"])
+
+        if order.status not in ("canceled", "completed", "expired"):
+            order.status = "canceled"
+            order.save(update_fields=["status"])
+            # OrderService.save() now logs OrderHistory and cancels open negotiations
+
+        EventBus.emit(ShipmentNoShowEvent({
+            "shipment_id": self.shipment_id,
+            "order_id": order.order_id,
+        }))
+        return True
 
 
 
@@ -424,13 +449,9 @@ class Shipment(models.Model):
             ShipmentHistory.objects.create(
     shipment=self,
     previous_status=old_status,
-    new_status=self.shipment_status
-)
-
+    new_status=self.shipment_status,
+    notes=getattr(self, "_history_notes", ""),)
             order = self.service_ordered.order
-
-
-
             if self.shipment_status == "in_transit":
                 
                 OrderStatusService.set_status(order, "in_delivery")
@@ -442,19 +463,20 @@ class Shipment(models.Model):
 )
 
             elif self.shipment_status == "arrived":
-                
                 OrderStatusService.set_status(order, "awaiting_confirmation")
-                EventBus.emit(
-        OrderArrivedEvent({
-            "shipment_id": self.shipment_id,
-            "order_id": order.order_id,
-        })
-    )
-                print("STATUS CHANGED → EMITTING WS EVENT")
-                push_shipment_status_update(
-        self.shipment_id,
-        "arrived"
-    )
+                EventBus.emit(OrderArrivedEvent({
+                    "shipment_id": self.shipment_id,
+                    "order_id": order.order_id,
+                }))
+                shipment_id = self.shipment_id
+                transaction.on_commit(
+                    lambda: push_shipment_status_update(shipment_id, "arrived")
+                )
+            elif self.shipment_status == "cancelled":        # new branch, same pattern as "arrived"
+                shipment_id = self.shipment_id
+                transaction.on_commit(
+                    lambda: push_shipment_status_update(shipment_id, "cancelled")
+                )
 
             elif self.shipment_status == "delivered":
                 OrderStatusService.set_status(order, "awaiting_confirmation")   
@@ -627,6 +649,33 @@ class Session(models.Model):
     )
 
     date_created = models.DateTimeField(auto_now_add=True)
+    MAX_SESSION_DURATION = timedelta(hours=8)  
+
+    def is_expired(self):
+        if self.session_status != "in_session":
+            return False
+        return self.checkin_time <= timezone.now() - self.MAX_SESSION_DURATION
+
+    def auto_complete(self):
+        """
+        Cap the session at MAX_SESSION_DURATION. Idempotent.
+        Relies on save() to cascade the order status to 'completed'.
+        """
+        if not self.is_expired():
+            return False
+
+        self.checkout_time = self.checkin_time + self.MAX_SESSION_DURATION  # cap at 8h
+        self.checkout_location = self.checkout_location or {"auto_completed": True}
+        self.session_status = "completed"
+        self.save()
+        return True
+
+    def duration(self):
+        end = self.checkout_time or timezone.now()
+        # never report more than the cap, even between check-in and the next sweep
+        elapsed = end - self.checkin_time
+        return min(elapsed, self.MAX_SESSION_DURATION)
+    
 
     def save(self, *args, **kwargs):
         is_new = self.pk is None
@@ -637,7 +686,7 @@ class Session(models.Model):
 
         super().save(*args, **kwargs)
 
-    # ✅ Propagate session status to Order even on new sessions
+    #
         order = self.shipment.service_ordered.order
         if order:
             if is_new or old_status != self.session_status:
@@ -841,3 +890,55 @@ class Rating(models.Model):
     def __str__(self):
         rater = self.rater_client or self.rater_provider
         return f"Rating {self.score}/5 | Session {self.session.session_id} | By {rater}"
+
+
+class Payment(models.Model):
+    class Method(models.TextChoices):
+        CASH = "cash"
+        CARD = "card"
+
+    class Status(models.TextChoices):
+        PENDING = "pending"            # card: created, awaiting client
+        SUCCEEDED = "succeeded"
+        FAILED = "failed"
+        CASH_PENDING = "cash_pending"  # cash: not yet confirmed received
+        CASH_CONFIRMED = "cash_confirmed"
+        REFUNDED = "refunded"
+
+    payment_id = models.AutoField(primary_key=True)
+    order = models.ForeignKey(OrderService, on_delete=models.PROTECT, related_name="payments")
+    shipment = models.ForeignKey(Shipment, on_delete=models.PROTECT, related_name="payments")
+    method = models.CharField(max_length=10, choices=Method.choices)
+    status = models.CharField(max_length=20, choices=Status.choices)
+    amount_cents = models.PositiveIntegerField()          # snapshot of final_price
+    platform_fee_cents = models.PositiveIntegerField(default=0)
+    vendor = models.CharField(max_length=30, blank=True)
+    vendor_access_code = models.CharField(max_length=128, blank=True, default="")
+    vendor_checkout_url = models.URLField(max_length=500, blank=True, default="")
+    vendor_reference = models.CharField(max_length=128, blank=True, db_index=True)
+    idempotency_key = models.UUIDField(default=uuid.uuid4, unique=True)
+    failure_reason = models.CharField(max_length=255, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    paid_at = models.DateTimeField(null=True, blank=True)
+
+
+class Payout(models.Model):
+    class Status(models.TextChoices):
+        SCHEDULED = "scheduled"
+        ON_HOLD = "on_hold"      # dispute raised
+        PROCESSING = "processing"
+        PAID = "paid"
+        FAILED = "failed"
+
+    payment = models.OneToOneField(Payment, on_delete=models.PROTECT, related_name="payout")
+    provider = models.ForeignKey("serviceProvidersDB.ServiceProvider", on_delete=models.PROTECT)
+    amount_cents = models.PositiveIntegerField()           # amount minus platform fee
+    release_at = models.DateTimeField(db_index=True)       # completed_at + 5h
+    status = models.CharField(max_length=20, choices=Status.choices, default=Status.SCHEDULED)
+    vendor_reference = models.CharField(max_length=128, blank=True)
+
+
+class PaymentEvent(models.Model):   # append-only audit log + webhook dedupe
+    vendor_event_id = models.CharField(max_length=128, unique=True)
+    payload = models.JSONField()
+    received_at = models.DateTimeField(auto_now_add=True)

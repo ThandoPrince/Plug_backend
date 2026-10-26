@@ -1,4 +1,5 @@
 from disposable_email_domains import blocklist
+from django.core.files.storage import default_storage
 from rest_framework import serializers
 from django.contrib.auth.hashers import make_password
 from django.contrib.auth.password_validation import validate_password
@@ -10,6 +11,7 @@ from api.clientsDB.services.sa_phone_number_helper import normalize_sa_mobile
 from api.serviceProvidersDB.services.sa_id_validator import SouthAfricanIDValidator
 from .models.models import AddressSuperUserVerification, ClientAuth, Address, ClientDetails, ClientAddress, ClientLoginHistory, ClientNotification, DeviceToken
 import re
+from PIL import Image, UnidentifiedImageError
 from django.db.models import Q
 from django.contrib.auth.hashers import check_password
 import phonenumbers
@@ -320,48 +322,92 @@ class ClientBookingReadSerializer(serializers.ModelSerializer):
         ]
 
 class ClientSerializer(serializers.ModelSerializer):
-    client_profile = ClientProfileSerializer(read_only=True)  # Lock nested profiles from modifications here
+    client_profile = ClientProfileSerializer(read_only=True)
     client_pp = serializers.ImageField(required=False, allow_null=True)
+
+    MAX_PP_BYTES = 5 * 1024 * 1024
+    ALLOWED_PP_TYPES = {"image/jpeg", "image/png", "image/webp"}
+    NULL_STRINGS = {"null", "none", ""}
+    CANNOT_CLEAR = ("first_name", "last_name", "date_of_birth")
 
     class Meta:
         model = ClientDetails
-        fields = '__all__'
+ 
+        fields = [
+            "client_ID",
+            "client_profile",
+            "first_name",
+            "last_name",
+            "date_of_birth",
+            "client_pp",
+     
+        ]
+        read_only_fields = ["id", "client_profile"]
 
     def to_internal_value(self, data):
-        """
-        Interceptors to patch incoming multi-part data behavior.
-        Fixes errors where clients pass raw JSON string arrays or null representations.
-        """
-       
-        mutable_data = data.copy()
-        for field in ['date_of_birth', 'client_pp']:
-            if field in mutable_data and (mutable_data[field] in ['null', 'None', '']):
-                mutable_data[field] = None
-                
-        return super().to_internal_value(mutable_data)
+        # Plain dict, NOT data.copy(): copying a QueryDict deep-copies
+        # uploaded files, which fails for large temp-file uploads.
+        cleaned = {key: data.get(key) for key in data.keys()}
+
+        for field in ("date_of_birth", "client_pp"):
+            value = cleaned.get(field)
+            if isinstance(value, str) and value.strip().lower() in self.NULL_STRINGS:
+                cleaned[field] = None
+
+        return super().to_internal_value(cleaned)
 
     def validate_date_of_birth(self, value):
-        if value:
-            if value > date.today():
-                raise serializers.ValidationError("Date of birth cannot be in the future.")
-            
-            # Precise age math calculation
-            age = (date.today() - value).days // 365
-            if age < 18:
-                raise serializers.ValidationError("Client must be at least 18 years old.")
+        if value is None:
+            return value
+
+        today = timezone.localdate()
+
+        if value > today:
+            raise serializers.ValidationError("Date of birth cannot be in the future.")
+
+        age = today.year - value.year - ((today.month, today.day) < (value.month, value.day))
+
+        if age < 18:
+            raise serializers.ValidationError("Client must be at least 18 years or older.")
+        if age > 120:
+            raise serializers.ValidationError("Please enter a valid date of birth.")
+
         return value
 
+    def validate_client_pp(self, value):
+        if value is None:
+            return value
+
+        if value.size > self.MAX_PP_BYTES:
+            raise serializers.ValidationError("Profile photo must be 5 MB or smaller.")
+
+        # DRF's ImageField has already decoded the file with Pillow, so
+        # content_type reflects the real format, not the filename.
+        if getattr(value, "content_type", None) not in self.ALLOWED_PP_TYPES:
+            raise serializers.ValidationError("Use a JPEG, PNG or WebP image.")
+
+        return value
+
+    def validate(self, attrs):
+        # Once a required field has a value, it can be changed but not cleared.
+        if self.instance is not None:
+            for field in self.CANNOT_CLEAR:
+                if field in attrs and not attrs[field] and getattr(self.instance, field, None):
+                    raise serializers.ValidationError({field: "This field cannot be cleared."})
+        return attrs
+
     def update(self, instance, validated_data):
-        # Explicit protection: Remove client_profile variations to prevent write manipulation
-        validated_data.pop('client_profile', None)
+        old_name = instance.client_pp.name if instance.client_pp else None
 
-        if 'client_pp' in validated_data:
-            instance.client_pp = validated_data.pop('client_pp')
+        instance = super().update(instance, validated_data)
 
-        for attr, value in validated_data.items():
-            setattr(instance, attr, value)
+        # Delete the replaced photo after the transaction commits, so a
+        # rollback never leaves the row pointing at a deleted file.
+        if "client_pp" in validated_data and old_name:
+            new_name = instance.client_pp.name if instance.client_pp else None
+            if new_name != old_name:
+                transaction.on_commit(lambda: default_storage.delete(old_name))
 
-        instance.save()
         return instance
     
 class AddressWriteSerializer(serializers.ModelSerializer):
@@ -911,8 +957,135 @@ class ClientProfileUpdateSerializer(serializers.ModelSerializer):
             setattr(instance, attr, value)
         instance.save()
         return instance
+
+
+
+
+class ClientProfileSecurityMixin:
+    MAX_PP_BYTES = 5 * 1024 * 1024
+    ALLOWED_PP_FORMATS = {"JPEG", "PNG", "WEBP"}
+    NULL_STRINGS = {"null", "none", ""}
+    CANNOT_CLEAR = ("first_name", "last_name", "date_of_birth")
+
+    def to_internal_value(self, data):
+        # Avoid deep-copying QueryDict objects containing uploaded files.
+        cleaned = {key: data.get(key) for key in data.keys()}
+
+        for field in ("date_of_birth", "client_pp"):
+            value = cleaned.get(field)
+
+            if isinstance(value, str) and value.strip().lower() in self.NULL_STRINGS:
+                cleaned[field] = None
+
+        return super().to_internal_value(cleaned)
+
+    def validate_date_of_birth(self, value):
+        if value is None:
+            return value
+
+        today = timezone.localdate()
+
+        if value > today:
+            raise serializers.ValidationError(
+                "Date of birth cannot be in the future."
+            )
+
+        age = (
+            today.year
+            - value.year
+            - ((today.month, today.day) < (value.month, value.day))
+        )
+
+        if age < 18:
+            raise serializers.ValidationError(
+                "You must be at least 18 years old to use Plug."
+            )
+
+        if age > 120:
+            raise serializers.ValidationError(
+                "Please enter a valid date of birth."
+            )
+
+        return value
+
+    def validate_client_pp(self, value):
+        if value is None:
+            return value
+
+        if value.size > self.MAX_PP_BYTES:
+            raise serializers.ValidationError(
+                "Profile photo must be 5 MB or smaller."
+            )
+
+        # Check the decoded image format, not just the supplied MIME type
+        # or filename extension.
+        try:
+            value.seek(0)
+
+            with Image.open(value) as image:
+                image_format = image.format
+                image.verify()
+
+            value.seek(0)
+
+        except (UnidentifiedImageError, OSError, ValueError):
+            raise serializers.ValidationError(
+                "Upload a valid JPEG, PNG or WebP image."
+            )
+
+        if image_format not in self.ALLOWED_PP_FORMATS:
+            raise serializers.ValidationError(
+                "Use a JPEG, PNG or WebP image."
+            )
+
+        return value
+
+    def validate(self, attrs):
+        if self.instance is not None:
+            for field in self.CANNOT_CLEAR:
+                if (
+                    field in attrs
+                    and not attrs[field]
+                    and getattr(self.instance, field, None)
+                ):
+                    raise serializers.ValidationError({
+                        field: "This field cannot be cleared."
+                    })
+
+        return attrs
+
+    def update(self, instance, validated_data):
+        old_name = (
+            instance.client_pp.name
+            if instance.client_pp
+            else None
+        )
+
+        instance = super().update(instance, validated_data)
+
+        # Delete the old file only after the database transaction commits.
+        if "client_pp" in validated_data and old_name:
+            new_name = (
+                instance.client_pp.name
+                if instance.client_pp
+                else None
+            )
+
+            if new_name != old_name:
+                transaction.on_commit(
+                    lambda: default_storage.delete(old_name)
+                )
+
+        return instance
+
+
+
     
-class ClientProfileAppUpdateSerializer(serializers.ModelSerializer):
+
+class ClientProfileAppUpdateSerializer(
+    ClientProfileSecurityMixin,
+    serializers.ModelSerializer,
+):
     class Meta:
         model = ClientDetails
         fields = [
@@ -923,32 +1096,8 @@ class ClientProfileAppUpdateSerializer(serializers.ModelSerializer):
             "last_updated",
         ]
 
-        read_only_fields = [
-            "last_updated",
-        ]
+        read_only_fields = ["last_updated"]
 
-    def update(self, instance, validated_data):
-        instance.first_name = validated_data.get(
-            "first_name",
-            instance.first_name,
-        )
-
-        instance.last_name = validated_data.get(
-            "last_name",
-            instance.last_name,
-        )
-
-        instance.date_of_birth = validated_data.get(
-            "date_of_birth",
-            instance.date_of_birth,
-        )
-
-        if "client_pp" in validated_data:
-            instance.client_pp = validated_data["client_pp"]
-
-        instance.save()
-
-        return instance
     
 
 

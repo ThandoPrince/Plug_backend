@@ -294,6 +294,8 @@ path(
         booking_views.reschedule_shipment,
         name="reschedule-shipment"
     ),
+        path("api/payments/sp/shipment/<int:shipment_id>/confirm-cash/",
+         booking_views.confirm_cash_received, name="confirm_cash_received"),
 
     path(
         "api/bookings/shipment/<int:shipment_id>/cancel/",
@@ -347,6 +349,13 @@ path(
         booking_views.reject_negotiation,
         name='reject_negotiation',
     ),
+
+    path("api/payments/select-method/", booking_views.select_payment_method, name="select_payment_method"),
+    path("api/payments/shipment/<int:shipment_id>/", booking_views.payment_for_shipment_client, name="payment_for_shipment_client"),
+path("api/payments/sp/shipment/<int:shipment_id>/", booking_views.payment_for_shipment_provider, name="payment_for_shipment_provider"),
+    path("api/payments/<int:payment_id>/initiate/", booking_views.initiate_card_payment, name="initiate_card_payment"),
+    path("api/payments/webhook/paystack/", booking_views.paystack_webhook, name="paystack_webhook"),
+
     path("media-debug/", media_debug),
 
   

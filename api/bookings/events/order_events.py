@@ -16,6 +16,9 @@ class OrderAcceptedEvent(Event):
 class OrderInTransitEvent(Event):
     name = "order.in_transit"
 
+class ShipmentNoShowEvent(Event):
+    name = "shipment.no_show"
+
 
 class OrderArrivedEvent(Event):
     name = "order.arrived"

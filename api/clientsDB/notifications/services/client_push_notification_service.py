@@ -34,9 +34,7 @@ def send_push_to_client(client, title, body, data=None):
         )
     )
 
-    if not devices:
-        print(f"[Push] No devices for client {client}")
-        return
+
 
     firebase_tokens = []
     huawei_tokens = []
@@ -57,10 +55,7 @@ def send_push_to_client(client, title, body, data=None):
         elif provider == "huawei":
             huawei_tokens.append(token)
 
-        else:
-            print(f"[Push] Unknown provider '{device.provider}' → skipped")
-
-    print(f"[Push] Firebase: {len(firebase_tokens)} | Huawei: {len(huawei_tokens)}")
+     
 
     with ThreadPoolExecutor(max_workers=2) as executor:
         if firebase_tokens:

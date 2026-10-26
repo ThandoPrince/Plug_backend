@@ -48,6 +48,7 @@ EMAIL_TIMEOUT = 10
 AI_API_KEY = get_env("AI_API_KEY")
 AI_KYC_API_URL = get_env("AI_KYC_API_URL")
 GOOGLE_MAPS_API_KEY = os.getenv("GOOGLE_MAPS_API_KEY")
+PAYSTACK_SECRET_KEY = get_env("PAYSTACK_SECRET_KEY")
 
 ALLOWED_HOSTS = [
     host.strip()
@@ -238,7 +239,7 @@ SECURE_SSL_REDIRECT = not DEBUG
 SECURE_HSTS_SECONDS = 31536000 if not DEBUG else 0
 SECURE_CONTENT_TYPE_NOSNIFF = True
 
-SESSION_GEOFENCE_RADIUS_METERS = int(get_env("SESSION_GEOFENCE_RADIUS_METERS", "45"))
+SESSION_GEOFENCE_RADIUS_METERS = int(get_env("SESSION_GEOFENCE_RADIUS_METERS", "55"))
 SESSION_GEOFENCE_GRACE_SECONDS = int(get_env("SESSION_GEOFENCE_GRACE_SECONDS", "120"))
 SESSION_GEOFENCE_PING_INTERVAL_SECONDS = int(get_env("SESSION_GEOFENCE_PING_INTERVAL_SECONDS", "20"))
 
@@ -262,12 +263,20 @@ CELERY_TIMEZONE = "Africa/Johannesburg"
 
 CELERY_BEAT_SCHEDULE = {
     "auto-reschedule-orders": {
-        "task": "bookings.tasks.auto_reschedule_orders",
-        "schedule": 60.0,
+        "task": "api.bookings.services.celery_task.auto_reschedule_orders",
+        "schedule": 1500.0,
     },
     "expire-overdue-orders": {
-        "task": "bookings.tasks.expire_overdue_orders",
-        "schedule": 300.0,   # every 5 minutes is plenty for a 1-day window
+        "task": "api.bookings.services.celery_task.expire_overdue_orders",
+        "schedule": 3000.0,
+    },
+    "auto-complete-expired-sessions": {
+        "task": "api.bookings.services.celery_task.auto_complete_expired_sessions",
+        "schedule": 900.0,
+    },
+    "cancel-no-show-shipments": {
+        "task": "api.bookings.services.celery_task.cancel_no_show_shipments",
+        "schedule": 300.0,  # every 5 minutes
     },
 }
 
