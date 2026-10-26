@@ -114,6 +114,7 @@ class ClientAuth(models.Model):
     blank=True,
     db_index=True
 )
+    is_number_verified = models.BooleanField(default=False,db_index=True)
     email_verified_at = models.DateTimeField(
         null=True,
         blank=True,

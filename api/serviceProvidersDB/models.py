@@ -229,6 +229,7 @@ class SPProfile(models.Model):
     null=True,
     blank=True
 )
+    is_number_verified = models.BooleanField(default=False,db_index=True)
     is_profile_completed = models.CharField(default="in-details", choices=Profile_CHOICES, max_length= 50, db_index=True)
     is_active = models.BooleanField(default=True, db_index=True)
     class Meta:

@@ -280,6 +280,9 @@ CELERY_BEAT_SCHEDULE = {
     },
 }
 
+DEMO_BYPASS_EMAIL = get_env("DEMO_BYPASS_EMAIL")
+DEMO_BYPASS_OTP = get_env("DEMO_BYPASS_OTP")
+
 
 # ============================================================================
 # Content Security Policy (CSP)

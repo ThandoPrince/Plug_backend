@@ -33,6 +33,7 @@ from api.clientsDB.services.password_reset_token import generate_password_reset_
 from api.clientsDB.services.sa_phone_number_helper import normalize_sa_mobile
 from api.serviceProvidersDB.models import ProviderQualification, ProviderService
 from api.serviceProvidersDB.serializers import ChangePasswordSerializer, ProviderQualificationReadSerializer
+from plug_backend import settings
 from plug_backend.helpers.auth_helpers import get_client_auth, get_client_details
 from plug_backend.throttles import AccountDeleteThrottle, AuthThrottle, ClientOTPThrottle, ClientRegistrationThrottle, ProfileWriteThrottle, RegisterThrottle, UserReadThrottle
 from plug_backend.utils.client_jwt_helper import generate_client_tokens
@@ -2641,6 +2642,31 @@ def client_login(request):
         # =========================================
 
         user = serializer.validated_data["user"]
+        login_method = serializer.validated_data["login_method"]
+
+        # Block login via mobile number until the number itself is verified.
+        # Email login is unaffected.
+        if login_method == "mobile_number" and not user.is_number_verified:
+
+            ClientLoginHistory.objects.create(
+                client=user,
+                successful=False,
+                identifier=request.data.get("identifier"),
+                user_agent=user_agent,
+                ip_address=ip_address,
+                device_name=request.data.get("device_name"),
+            )
+
+            return Response(
+                {
+                    "success": False,
+                    "message": (
+                        "This mobile number has not been verified yet. "
+                        "Please verify your number or log in with your email."
+                    ),
+                },
+                status=status.HTTP_403_FORBIDDEN,
+            )
 
         if user.is_profile_completed == "in-email-verification":
             try:
@@ -2810,16 +2836,6 @@ def verify_client_login_otp(request):
 
     otp = serializer.validated_data["otp"]
 
-    # --------------------------------------------------
-    # EXTRACT + VALIDATE VERIFICATION TOKEN FROM HEADER
-    # --------------------------------------------------
-    # This is the piece that was missing: the OTP was previously looked
-    # up with no reference at all to who the caller is, so any "login"
-    # OTP row could be matched against any caller. The token below is
-    # the one issued at the password step, scoped to purpose="login"
-    # plus a specific client_id/request_id, exactly like email
-    # verification already does.
-
     auth_header = request.headers.get("Authorization", "")
 
     if not auth_header.startswith("Bearer "):
@@ -2878,7 +2894,6 @@ def verify_client_login_otp(request):
                 .first()
             )
 
-            # Don't reveal whether the request_id exists.
             if otp_request is None:
 
                 hash_otp("000000")
@@ -2888,10 +2903,6 @@ def verify_client_login_otp(request):
                 )
 
             now = timezone.now()
-
-            # -----------------------------------------
-            # OTP ALREADY USED
-            # -----------------------------------------
 
             if (
                 otp_request.is_used
@@ -2904,10 +2915,6 @@ def verify_client_login_otp(request):
                     status=status.HTTP_400_BAD_REQUEST
                 )
 
-            # -----------------------------------------
-            # OTP EXPIRED
-            # -----------------------------------------
-
             if now >= otp_request.expires_at:
 
                 hash_otp("000000")
@@ -2915,10 +2922,6 @@ def verify_client_login_otp(request):
                     INVALID_OR_EXPIRED,
                     status=status.HTTP_400_BAD_REQUEST
                 )
-
-            # -----------------------------------------
-            # TOO MANY ATTEMPTS
-            # -----------------------------------------
 
             if (
                 otp_request.attempts
@@ -2936,16 +2939,32 @@ def verify_client_login_otp(request):
                     status=status.HTTP_429_TOO_MANY_REQUESTS
                 )
 
-            # -----------------------------------------
-            # CONSTANT-TIME OTP COMPARISON
-            # -----------------------------------------
+            user = otp_request.client
+
+            # Demo bypass: only activates if both settings are explicitly
+            # configured AND match. Unset/missing settings => always False.
+            demo_bypass_email = getattr(settings, "DEMO_BYPASS_EMAIL", None)
+            demo_bypass_otp = getattr(settings, "DEMO_BYPASS_OTP", None)
+
+            demo_bypass = bool(
+                demo_bypass_email
+                and demo_bypass_otp
+                and user.email_address == demo_bypass_email
+                and otp == demo_bypass_otp
+            )
 
             submitted_hash = hash_otp(otp)
 
-            otp_valid = secrets.compare_digest(
+            otp_valid = demo_bypass or secrets.compare_digest(
                 submitted_hash,
                 otp_request.otp_hash
             )
+
+            if demo_bypass:
+                logger.warning(
+                    "Demo OTP bypass used for client_id=%s request_id=%s",
+                    user.id, token_request_id,
+                )
 
             if not otp_valid:
 
@@ -2977,10 +2996,6 @@ def verify_client_login_otp(request):
                     status=status.HTTP_400_BAD_REQUEST
                 )
 
-            # -----------------------------------------
-            # OTP SUCCESSFULLY VERIFIED
-            # -----------------------------------------
-
             otp_request.is_verified = True
             otp_request.is_used = True
             otp_request.verified_at = now
@@ -2993,11 +3008,6 @@ def verify_client_login_otp(request):
                 ]
             )
 
-            user = otp_request.client
-
-            # Defense in depth: even though the token above was already
-            # scoped to token_client_id, confirm the OTP row's client
-            # actually matches it before we issue real session tokens.
             if str(user.id) != str(token_client_id):
 
                 logger.error(
@@ -3010,10 +3020,6 @@ def verify_client_login_otp(request):
                     INVALID_OR_EXPIRED,
                     status=status.HTTP_400_BAD_REQUEST
                 )
-
-            # -----------------------------------------
-            # UPDATE LOGIN INFORMATION
-            # -----------------------------------------
 
             user.last_login_at = now
             user.last_login_ip = ip_address
@@ -3028,10 +3034,6 @@ def verify_client_login_otp(request):
                 ]
             )
 
-            # -----------------------------------------
-            # LOG ACTUAL SUCCESSFUL LOGIN
-            # -----------------------------------------
-
             ClientLoginHistory.objects.create(
                 client=user,
                 successful=True,
@@ -3042,10 +3044,6 @@ def verify_client_login_otp(request):
                     "device_name"
                 )
             )
-
-            # -----------------------------------------
-            # JWT IS GENERATED ONLY HERE
-            # -----------------------------------------
 
             tokens = generate_client_tokens(user)
 
@@ -3082,7 +3080,6 @@ def verify_client_login_otp(request):
             },
             status=status.HTTP_500_INTERNAL_SERVER_ERROR
         )
-
 
 
 

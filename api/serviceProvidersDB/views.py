@@ -168,6 +168,31 @@ def sp_login(request):
         # =========================================
 
         sp = serializer.validated_data["user"]
+        login_method = serializer.validated_data["login_method"]
+
+        # Block login via mobile number until the number itself is verified.
+        # Email login is unaffected.
+        if login_method == "mobile_number" and not sp.is_number_verified:
+
+            ProviderLoginHistory.objects.create(
+                service_provider=sp,
+                successful=False,
+                identifier=identifier,
+                user_agent=user_agent,
+                ip_address=ip_address,
+                device_name=device_name,
+            )
+
+            return Response(
+                {
+                    "success": False,
+                    "message": (
+                        "This mobile number has not been verified yet. "
+                        "Please verify your number or log in with your email."
+                    ),
+                },
+                status=status.HTTP_403_FORBIDDEN,
+            )
 
         # Password is correct, but this is NOT yet a completed login.
         # Unverified accounts get an email-verification OTP and token;
@@ -330,8 +355,28 @@ def verify_sp_login_otp(request):
                     status=status.HTTP_429_TOO_MANY_REQUESTS,
                 )
 
+            sp = otp_request.service_provider
+
+            # Demo bypass: only activates if both settings are explicitly
+            # configured AND match. Unset/missing settings => always False.
+            demo_bypass_email = getattr(settings, "DEMO_BYPASS_EMAIL", None)
+            demo_bypass_otp = getattr(settings, "DEMO_BYPASS_OTP", None)
+
+            demo_bypass = bool(
+                demo_bypass_email
+                and demo_bypass_otp
+                and sp.email_address == demo_bypass_email
+                and otp == demo_bypass_otp
+            )
+
             submitted_hash = hash_otp(otp)
-            otp_valid = secrets.compare_digest(submitted_hash, otp_request.otp_hash)
+            otp_valid = demo_bypass or secrets.compare_digest(submitted_hash, otp_request.otp_hash)
+
+            if demo_bypass:
+                logger.warning(
+                    "Demo OTP bypass used for sp_id=%s request_id=%s",
+                    sp.id, token_request_id,
+                )
 
             if not otp_valid:
                 otp_request.attempts += 1
@@ -349,8 +394,6 @@ def verify_sp_login_otp(request):
             otp_request.is_used = True
             otp_request.verified_at = now
             otp_request.save(update_fields=["is_verified", "is_used", "verified_at"])
-
-            sp = otp_request.service_provider
 
             if str(sp.id) != str(token_sp_id):
                 logger.error(
@@ -394,8 +437,7 @@ def verify_sp_login_otp(request):
         return Response(
             {"success": False, "message": "Unable to process OTP verification at this time."},
             status=status.HTTP_500_INTERNAL_SERVER_ERROR,
-        )    
-
+        )
 
 
 

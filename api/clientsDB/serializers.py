@@ -825,9 +825,11 @@ class ClientLoginSerializer(serializers.Serializer):
 
         if is_email:
             query = Q(email_address__iexact=raw_identifier)
+            login_method = "email"
 
         elif normalized_phone:
             query = Q(mobile_number=normalized_phone)
+            login_method = "mobile_number"
 
         else:
             # Prevent invalid identity injection
@@ -923,6 +925,7 @@ class ClientLoginSerializer(serializers.Serializer):
         ])
 
         data["user"] = user
+        data["login_method"] = login_method
         return data
     
 
